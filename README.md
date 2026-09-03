@@ -1,5 +1,7 @@
 # 病程日历 / Health Timeline
 
+[![build-and-test](https://github.com/lemon7500/health-timeline/actions/workflows/ci.yml/badge.svg)](https://github.com/lemon7500/health-timeline/actions/workflows/ci.yml)
+
 一个完全离线、隐私优先的个人病程记录项目，覆盖 Android、iPhone/iPad 与 HarmonyOS NEXT。项目不提供诊断或处方建议，也不连接医院系统。
 
 ## 平台状态
@@ -31,6 +33,8 @@ iOS 与 HarmonyOS NEXT 当前已完成原生工程、加密存储、主要页面
 - `shared/core`：Kotlin Multiplatform 共享业务规则。
 - `shared/spec`：备份 JSON Schema、加密容器说明和黄金测试向量。
 - `docs`：安装、隐私、安全和真机测试文档。
+
+给客户的简明说明见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
 
 ## Android 构建
 
