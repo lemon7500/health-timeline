@@ -9,6 +9,10 @@ import com.healthtimeline.app.data.*
 import com.healthtimeline.app.reminders.AlarmScheduler
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -16,20 +20,37 @@ import java.time.LocalTime
 import com.healthtimeline.shared.BackupImportPreview
 import com.healthtimeline.shared.MergeChoice
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class AppViewModel(
     private val repository: HealthRepository,
     private val scheduler: AlarmScheduler,
-    private val backupService: PortableBackupService
+    private val backupService: PortableBackupService,
+    private val memberSelection: MemberSelectionStore
 ) : ViewModel() {
-    val conditions = repository.conditionFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val records = repository.recordFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val attachments = repository.attachmentFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val followUps = repository.followUpFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val occurrences = repository.occurrenceFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val medications = repository.medicationFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val medicationSchedules = repository.medicationScheduleFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val medicationLogs = repository.medicationLogFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val todayDoses = repository.todayDoses.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val members = repository.memberFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    private val selectedMemberIdMutable = MutableStateFlow(memberSelection.read())
+    val selectedMemberId = selectedMemberIdMutable
+    val selectedMember = combine(members, selectedMemberId) { values, id -> values.firstOrNull { it.id == id } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    val conditions = selectedMemberId.filterNotNull().flatMapLatest(repository::conditionsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val records = selectedMemberId.filterNotNull().flatMapLatest(repository::recordsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val attachments = selectedMemberId.filterNotNull().flatMapLatest(repository::attachmentsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val followUps = selectedMemberId.filterNotNull().flatMapLatest(repository::followUpsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val occurrences = selectedMemberId.filterNotNull().flatMapLatest(repository::occurrencesForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val medications = selectedMemberId.filterNotNull().flatMapLatest(repository::medicationsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val medicationSchedules = selectedMemberId.filterNotNull().flatMapLatest(repository::medicationSchedulesForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val medicationLogs = selectedMemberId.filterNotNull().flatMapLatest(repository::medicationLogsForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val todayDoses = selectedMemberId.filterNotNull().flatMapLatest(repository::todayDosesForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     private val messages = Channel<String>(Channel.BUFFERED)
     val messageFlow = messages.receiveAsFlow()
@@ -39,10 +60,52 @@ class AppViewModel(
     init {
         viewModelScope.launch {
             runCatching {
+                repository.ensureDefaultMember()
                 repository.cleanupOrphanedAttachmentSets()
                 scheduler.rescheduleAll()
             }.onFailure { messages.send(it.userMessage("初始化检查失败")) }
         }
+        viewModelScope.launch {
+            repository.memberFlow.collect { values ->
+                val active = values.filterNot { it.archived }
+                val selected = selectedMemberIdMutable.value
+                if (selected == null || active.none { it.id == selected }) {
+                    active.firstOrNull()?.let { selectMember(it.id) }
+                }
+            }
+        }
+    }
+
+    fun selectMember(memberId: Long) {
+        if (members.value.any { it.id == memberId && !it.archived }) {
+            memberSelection.write(memberId)
+            selectedMemberIdMutable.value = memberId
+        }
+    }
+
+    fun saveMember(value: FamilyMemberEntity, onSaved: () -> Unit = {}, onFailed: () -> Unit = {}) =
+        launch("保存家庭成员", onFailed) {
+            val id = repository.saveMember(value)
+            if (value.id == 0L) selectMember(id)
+            onSaved()
+        }
+
+    fun archiveMember(value: FamilyMemberEntity) = launch("归档家庭成员") {
+        scheduler.cancelAllPersisted()
+        try {
+            repository.archiveMember(value.id)
+        } finally {
+            scheduler.rescheduleAll()
+        }
+    }
+
+    fun restoreMember(value: FamilyMemberEntity) = launch("恢复家庭成员") {
+        repository.restoreMember(value.id)
+        scheduler.rescheduleAll()
+    }
+
+    fun deleteEmptyMember(value: FamilyMemberEntity) = launch("删除家庭成员") {
+        repository.deleteEmptyMember(value.id)
     }
 
     fun saveCondition(value: ConditionEntity, onSaved: (Long) -> Unit = {}, onFailed: () -> Unit = {}) = launch("保存病情分类", onFailed) {
@@ -125,7 +188,7 @@ class AppViewModel(
         busyChannel.value = true
         messages.send("正在验证备份")
         try {
-            backupService.previewImport(uri, password).fold(
+            backupService.previewImport(uri, password, selectedMemberId.value).fold(
                 onSuccess = onReady,
                 onFailure = { onFailed(); messages.send(it.userMessage("备份验证失败")) }
             )
@@ -137,21 +200,37 @@ class AppViewModel(
             scheduler.cancelAllPersisted()
             scheduler.cancelAllNotifications()
             try {
-                backupService.mergeImport(uri, password, decisions).getOrThrow()
+                backupService.mergeImport(uri, password, decisions, selectedMemberId.value).getOrThrow()
             } finally {
                 runCatching { scheduler.rescheduleAll() }
                     .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
             }
         }
 
-    fun restoreBackup(uri: Uri, password: CharArray) = launchResult("正在恢复备份", "备份已恢复") {
-        scheduler.cancelAllPersisted()
-        scheduler.cancelAllNotifications()
-        try {
-            backupService.replaceFromBackup(uri, password).getOrThrow()
-        } finally {
+    fun importLegacyBackupAsNew(uri: Uri, password: CharArray) =
+        launchResult("正在作为新资料导入", "旧版备份已作为新资料导入") {
+            backupService.importLegacyAsNew(uri, password, selectedMemberId.value).getOrThrow()
             runCatching { scheduler.rescheduleAll() }
-                .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
+                .onFailure { messages.send("资料已导入，但部分系统提醒安排失败；请重新打开应用") }
+        }
+
+    fun restoreBackupWithSafetyExport(
+        safetyDestination: Uri,
+        source: Uri,
+        password: CharArray
+    ) = launchResult("正在导出安全备份并恢复", "安全备份已导出，数据已恢复") {
+        try {
+            backupService.export(safetyDestination, password.copyOf()).getOrThrow()
+            scheduler.cancelAllPersisted()
+            scheduler.cancelAllNotifications()
+            try {
+                backupService.replaceFromBackup(source, password, selectedMemberId.value).getOrThrow()
+            } finally {
+                runCatching { scheduler.rescheduleAll() }
+                    .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
+            }
+        } finally {
+            password.fill('\u0000')
         }
     }
 
@@ -183,9 +262,11 @@ class AppViewModel(
     class Factory(
         private val repository: HealthRepository,
         private val scheduler: AlarmScheduler,
-        private val backup: PortableBackupService
+        private val backup: PortableBackupService,
+        private val memberSelection: MemberSelectionStore
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
-        override fun <T : ViewModel> create(modelClass: Class<T>): T = AppViewModel(repository, scheduler, backup) as T
+        override fun <T : ViewModel> create(modelClass: Class<T>): T =
+            AppViewModel(repository, scheduler, backup, memberSelection) as T
     }
 }

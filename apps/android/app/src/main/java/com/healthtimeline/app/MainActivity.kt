@@ -1,7 +1,6 @@
 package com.healthtimeline.app
 
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -24,8 +23,13 @@ import com.healthtimeline.app.ui.HealthTimelineRoot
 import com.healthtimeline.app.ui.theme.HealthTimelineTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import android.widget.Toast
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val app = application as HealthTimelineApplication
@@ -45,9 +49,18 @@ class MainActivity : ComponentActivity() {
                     }
                 } else if (available != null) {
                     val model: AppViewModel = viewModel(
-                        factory = AppViewModel.Factory(available.repository, available.scheduler, available.backup)
+                        factory = AppViewModel.Factory(
+                            available.repository,
+                            available.scheduler,
+                            available.backup,
+                            app.memberSelectionStore
+                        )
                     )
-                    HealthTimelineRoot(model)
+                    HealthTimelineRoot(
+                        viewModel = model,
+                        appLockManager = app.appLockManager,
+                        authenticate = ::authenticate
+                    )
                 } else {
                     Surface {
                         Column(
@@ -66,6 +79,38 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun authenticate(onSuccess: () -> Unit) {
+        val authenticators = BiometricManager.Authenticators.BIOMETRIC_WEAK or
+            BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        if (BiometricManager.from(this).canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
+            Toast.makeText(this, "请先在手机系统中设置指纹、面容或锁屏密码", Toast.LENGTH_LONG).show()
+            return
+        }
+        val prompt = BiometricPrompt(
+            this,
+            ContextCompat.getMainExecutor(this),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    onSuccess()
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    if (errorCode != BiometricPrompt.ERROR_USER_CANCELED &&
+                        errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON
+                    ) {
+                        Toast.makeText(this@MainActivity, errString, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        )
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("验证身份")
+            .setSubtitle("进入病程日历")
+            .setAllowedAuthenticators(authenticators)
+            .build()
+        prompt.authenticate(promptInfo)
     }
 
     private data class AppServices(

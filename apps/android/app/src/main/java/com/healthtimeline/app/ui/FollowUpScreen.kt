@@ -23,20 +23,28 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
     val schedules by viewModel.followUps.collectAsStateWithLifecycle()
     val occurrences by viewModel.occurrences.collectAsStateWithLifecycle()
     val conditions by viewModel.conditions.collectAsStateWithLifecycle()
-    var create by remember { mutableStateOf(false) }
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    var createForMemberId by remember { mutableStateOf<Long?>(null) }
     var editing by remember { mutableStateOf<FollowUpScheduleEntity?>(null) }
     var deleting by remember { mutableStateOf<FollowUpScheduleEntity?>(null) }
     val pendingOccurrences = occurrences.filter { it.status == OccurrenceStatus.PENDING.name }
 
+    LaunchedEffect(selectedMemberId) {
+        createForMemberId = null
+        editing = null
+        deleting = null
+    }
+
     Scaffold(
         modifier = Modifier.padding(padding),
-        floatingActionButton = { FloatingActionButton(onClick = { create = true }) { Icon(Icons.Outlined.Add, "新增复查") } }
+        floatingActionButton = { FloatingActionButton(onClick = { selectedMemberId?.let { createForMemberId = it } }) { Icon(Icons.Outlined.Add, "新增复查") } }
     ) { inner ->
         Column(
             Modifier.padding(inner).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("复查提醒", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            MemberSwitcher(viewModel)
             if (!viewModel.canScheduleExact()) {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
                     Text("尚未允许精确闹钟，提醒可能延迟。请在“设置”页授权。", Modifier.padding(12.dp))
@@ -73,14 +81,15 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
             Spacer(Modifier.height(72.dp))
         }
     }
-    if (create || editing != null) {
+    if (createForMemberId != null || editing != null) {
         FollowUpEditorDialog(
             existing = editing,
+            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
             conditions = conditions.filter { !it.archived },
             onSave = { value, onFailed ->
-                viewModel.saveFollowUp(value, { create = false; editing = null }, onFailed)
+                viewModel.saveFollowUp(value, { createForMemberId = null; editing = null }, onFailed)
             },
-            onDismiss = { create = false; editing = null }
+            onDismiss = { createForMemberId = null; editing = null }
         )
     }
     deleting?.let { target ->
@@ -96,6 +105,7 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
 @Composable
 private fun FollowUpEditorDialog(
     existing: FollowUpScheduleEntity?,
+    memberId: Long,
     conditions: List<ConditionEntity>,
     onSave: (FollowUpScheduleEntity, () -> Unit) -> Unit,
     onDismiss: () -> Unit
@@ -167,7 +177,10 @@ private fun FollowUpEditorDialog(
                                 weekday = if (rule == RecurrenceType.EVERY_N_WEEKS.name) weekday else null,
                                 reminderTime = parsedTime.toString(), leadDays = lead,
                                 nextDueDate = nextDate.toString(), enabled = true,
-                                createdAt = existing?.createdAt ?: now, updatedAt = now
+                                createdAt = existing?.createdAt ?: now,
+                                updatedAt = now,
+                                uuid = existing?.uuid ?: java.util.UUID.randomUUID().toString(),
+                                memberId = memberId
                             )
                         ) { submitting = false }
                     }

@@ -16,8 +16,8 @@ android {
         applicationId = "com.healthtimeline.app"
         minSdk = 26
         targetSdk = 37
-        versionCode = 4
-        versionName = "1.1.0"
+        versionCode = 5
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -92,6 +92,8 @@ dependencies {
     implementation("net.zetetic:sqlcipher-android:4.18.0")
     implementation("androidx.sqlite:sqlite-ktx:2.5.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.8")
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     testImplementation("junit:junit:4.13.2")

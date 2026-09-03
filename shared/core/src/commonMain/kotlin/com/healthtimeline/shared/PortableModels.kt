@@ -3,7 +3,8 @@ package com.healthtimeline.shared
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-const val BACKUP_SCHEMA_VERSION = 2
+const val BACKUP_SCHEMA_VERSION = 3
+const val LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION = 2
 
 @Serializable
 data class PortableSnapshot(
@@ -11,6 +12,7 @@ data class PortableSnapshot(
     val exportedAt: String,
     val sourcePlatform: String,
     val sourceInstallationId: String,
+    val members: List<PortableFamilyMember> = emptyList(),
     val conditions: List<PortableCondition> = emptyList(),
     val records: List<PortableClinicalRecord> = emptyList(),
     val attachments: List<PortableAttachment> = emptyList(),
@@ -22,6 +24,17 @@ data class PortableSnapshot(
 )
 
 @Serializable
+data class PortableFamilyMember(
+    val uuid: String,
+    val name: String,
+    val nickname: String,
+    val relationship: String,
+    val archived: Boolean,
+    val createdAt: String,
+    val updatedAt: String
+)
+
+@Serializable
 data class PortableCondition(
     val uuid: String,
     val name: String,
@@ -29,7 +42,8 @@ data class PortableCondition(
     val notes: String,
     val archived: Boolean,
     val createdAt: String,
-    val updatedAt: String = createdAt
+    val updatedAt: String = createdAt,
+    val memberUuid: String? = null
 )
 
 @Serializable
@@ -47,7 +61,8 @@ data class PortableClinicalRecord(
     val clinician: String,
     val notes: String,
     val createdAt: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val memberUuid: String? = null
 )
 
 @Serializable
@@ -79,7 +94,8 @@ data class PortableFollowUpSchedule(
     val nextDueDate: String,
     val enabled: Boolean,
     val createdAt: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val memberUuid: String? = null
 )
 
 @Serializable
@@ -106,7 +122,8 @@ data class PortableMedication(
     val mode: String,
     val archived: Boolean,
     val createdAt: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val memberUuid: String? = null
 )
 
 @Serializable

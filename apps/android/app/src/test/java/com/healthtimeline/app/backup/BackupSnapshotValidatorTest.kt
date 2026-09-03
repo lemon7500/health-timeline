@@ -4,6 +4,10 @@ import com.healthtimeline.app.data.AttachmentEntity
 import com.healthtimeline.app.data.AttachmentKind
 import com.healthtimeline.app.data.ClinicalRecordEntity
 import com.healthtimeline.app.data.VisitStage
+import com.healthtimeline.app.data.MedicationLogEntity
+import com.healthtimeline.app.data.MedicationLogStatus
+import com.healthtimeline.app.data.MedicationEntity
+import com.healthtimeline.app.data.MedicationMode
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
@@ -51,6 +55,32 @@ class BackupSnapshotValidatorTest {
     @Test fun `malformed record date is rejected before database replacement`() {
         assertThrows(Exception::class.java) {
             BackupSnapshotValidator.validate(empty.copy(records = listOf(record(date = "not-a-date"))))
+        }
+    }
+
+    @Test fun `medication log with missing schedule is rejected before restore`() {
+        val medication = MedicationEntity(
+            id = 1,
+            name = "药物",
+            doseAmount = "1",
+            doseUnit = "片",
+            startDate = "2026-09-01",
+            mode = MedicationMode.SCHEDULED.name,
+            createdAt = NOW,
+            updatedAt = NOW
+        )
+        val log = MedicationLogEntity(
+            id = 1,
+            medicationId = 1,
+            scheduleId = 99,
+            scheduledAt = "2026-09-01T08:00",
+            status = MedicationLogStatus.TAKEN.name,
+            doseAmountSnapshot = "1",
+            doseUnitSnapshot = "片",
+            createdAt = NOW
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            BackupSnapshotValidator.validate(empty.copy(medications = listOf(medication), medicationLogs = listOf(log)))
         }
     }
 

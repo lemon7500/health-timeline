@@ -54,7 +54,7 @@ class BackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun restore(source: Uri, password: CharArray): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun restore(source: Uri, password: CharArray, targetMemberId: Long = 1L): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runCatching {
@@ -74,7 +74,47 @@ class BackupService(
                             throw IllegalArgumentException("密码错误或备份文件已损坏", error)
                         }
                         val snapshot = readAndValidateZip(decryptedZip, stagingRoot)
-                        applySnapshot(snapshot, stagingRoot)
+                        require(database.familyMemberDao().byId(targetMemberId) != null) { "旧版备份的目标家庭成员不存在" }
+                        applySnapshot(
+                            snapshot.copy(
+                                conditions = snapshot.conditions.map { it.copy(memberId = targetMemberId) },
+                                records = snapshot.records.map { it.copy(memberId = targetMemberId) },
+                                followUps = snapshot.followUps.map { it.copy(memberId = targetMemberId) },
+                                medications = snapshot.medications.map { it.copy(memberId = targetMemberId) }
+                            ),
+                            stagingRoot
+                        )
+                    } finally {
+                        decryptedZip.delete()
+                        stagingRoot.deleteRecursively()
+                    }
+                }
+            }
+        } finally { password.fill('\u0000') }
+    }
+
+    suspend fun importAsNew(source: Uri, password: CharArray, targetMemberId: Long): Result<Int> = withContext(Dispatchers.IO) {
+        try {
+            repository.mutationMutex.withLock {
+                runCatching {
+                    val decryptedZip = File.createTempFile("health-import-new-", ".zip", context.cacheDir)
+                    val stagingRoot = File(context.cacheDir, "import-new-${UUID.randomUUID()}")
+                    try {
+                        try {
+                            context.contentResolver.openInputStream(source)?.use { input ->
+                                FileOutputStream(decryptedZip).use { output ->
+                                    BackupCrypto.decrypt(input, output, password)
+                                    output.fd.sync()
+                                }
+                            } ?: error("无法读取备份文件")
+                        } catch (error: IllegalArgumentException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            throw IllegalArgumentException("密码错误或备份文件已损坏", error)
+                        }
+                        val member = requireNotNull(database.familyMemberDao().byId(targetMemberId)) { "目标家庭成员不存在" }
+                        require(!member.archived) { "目标家庭成员已归档" }
+                        appendSnapshotAsNew(readAndValidateZip(decryptedZip, stagingRoot), stagingRoot, targetMemberId)
                     } finally {
                         decryptedZip.delete()
                         stagingRoot.deleteRecursively()
@@ -223,6 +263,115 @@ class BackupService(
         }
     }
 
+    private suspend fun appendSnapshotAsNew(
+        snapshot: BackupSnapshot,
+        stagingRoot: File,
+        targetMemberId: Long
+    ): Int {
+        val staged = File(stagingRoot, "attachments")
+        val importId = UUID.randomUUID().toString()
+        val restoredParent = File(context.filesDir, "restored_attachments")
+        require(restoredParent.isDirectory || restoredParent.mkdirs()) { "无法创建导入目录" }
+        val installed = File(restoredParent, importId)
+        require(staged.renameTo(installed)) { "无法安装已验证的附件" }
+        val relativePrefix = "restored_attachments/$importId"
+        try {
+            database.withTransaction {
+                val conditionIds = mutableMapOf<Long, Long>()
+                snapshot.conditions.forEach { value ->
+                    conditionIds[value.id] = database.conditionDao().insert(
+                        value.copy(id = 0, uuid = UUID.randomUUID().toString(), memberId = targetMemberId)
+                    )
+                }
+
+                val recordIds = mutableMapOf<Long, Long>()
+                snapshot.records.forEach { value ->
+                    recordIds[value.id] = database.clinicalRecordDao().insert(
+                        value.copy(
+                            id = 0,
+                            conditionId = value.conditionId?.let(conditionIds::getValue),
+                            uuid = UUID.randomUUID().toString(),
+                            memberId = targetMemberId
+                        )
+                    )
+                }
+                snapshot.attachments.forEach { value ->
+                    database.attachmentDao().insert(
+                        value.copy(
+                            id = 0,
+                            recordId = recordIds.getValue(value.recordId),
+                            relativePath = "$relativePrefix/${value.relativePath.removePrefix("attachments/")}",
+                            uuid = UUID.randomUUID().toString()
+                        )
+                    )
+                }
+
+                val followUpIds = mutableMapOf<Long, Long>()
+                snapshot.followUps.forEach { value ->
+                    followUpIds[value.id] = database.followUpDao().insertSchedule(
+                        value.copy(
+                            id = 0,
+                            conditionId = value.conditionId?.let(conditionIds::getValue),
+                            uuid = UUID.randomUUID().toString(),
+                            memberId = targetMemberId
+                        )
+                    )
+                }
+                snapshot.occurrences.forEach { value ->
+                    check(
+                        database.followUpDao().insertOccurrence(
+                            value.copy(
+                                id = 0,
+                                scheduleId = followUpIds.getValue(value.scheduleId),
+                                uuid = UUID.randomUUID().toString()
+                            )
+                        ) > 0
+                    ) { "无法导入复查记录" }
+                }
+
+                val medicationIds = mutableMapOf<Long, Long>()
+                snapshot.medications.forEach { value ->
+                    medicationIds[value.id] = database.medicationDao().insertMedication(
+                        value.copy(
+                            id = 0,
+                            conditionId = value.conditionId?.let(conditionIds::getValue),
+                            uuid = UUID.randomUUID().toString(),
+                            memberId = targetMemberId
+                        )
+                    )
+                }
+                val medicationScheduleIds = mutableMapOf<Long, Long>()
+                snapshot.medicationSchedules.forEach { value ->
+                    medicationScheduleIds[value.id] = database.medicationDao().insertSchedule(
+                        value.copy(
+                            id = 0,
+                            medicationId = medicationIds.getValue(value.medicationId),
+                            uuid = UUID.randomUUID().toString()
+                        )
+                    )
+                }
+                snapshot.medicationLogs.forEach { value ->
+                    check(
+                        database.medicationDao().insertLog(
+                            value.copy(
+                                id = 0,
+                                medicationId = medicationIds.getValue(value.medicationId),
+                                scheduleId = value.scheduleId?.let(medicationScheduleIds::getValue),
+                                uuid = UUID.randomUUID().toString()
+                            )
+                        ) > 0
+                    ) { "无法导入用药记录" }
+                }
+            }
+        } catch (error: Throwable) {
+            installed.deleteRecursively()
+            throw error
+        }
+        return snapshot.conditions.size + snapshot.records.size + snapshot.attachments.size +
+            snapshot.followUps.size + snapshot.occurrences.size + snapshot.medications.size +
+            snapshot.medicationSchedules.size + snapshot.medicationLogs.size
+    }
+
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -245,7 +394,8 @@ internal data class BackupSnapshot(
     val occurrences: List<FollowUpOccurrenceEntity>,
     val medications: List<MedicationEntity>,
     val medicationSchedules: List<MedicationScheduleEntity>,
-    val medicationLogs: List<MedicationLogEntity>
+    val medicationLogs: List<MedicationLogEntity>,
+    val members: List<FamilyMemberEntity> = emptyList()
 )
 
 internal object BackupSnapshotValidator {
@@ -272,6 +422,8 @@ internal object BackupSnapshotValidator {
         val recordIds = value.records.mapTo(hashSetOf()) { it.id }
         val followUpIds = value.followUps.mapTo(hashSetOf()) { it.id }
         val medicationIds = value.medications.mapTo(hashSetOf()) { it.id }
+        val medicationScheduleIds = value.medicationSchedules.mapTo(hashSetOf()) { it.id }
+        val scheduleMedications = value.medicationSchedules.associate { it.id to it.medicationId }
 
         value.conditions.forEach {
             require(it.name.isNotBlank() && it.name.length <= 50 && it.notes.length <= 5_000) { "病情分类内容异常" }
@@ -328,8 +480,12 @@ internal object BackupSnapshotValidator {
             require(it.medicationId in medicationIds) { "用药计划引用了不存在的药物" }
             LocalTime.parse(it.localTime)
         }
+        val medicationLogKeys = hashSetOf<String>()
         value.medicationLogs.forEach {
             require(it.medicationId in medicationIds) { "用药记录引用了不存在的药物" }
+            require(it.scheduleId == null || it.scheduleId in medicationScheduleIds) { "用药记录引用了不存在的服药计划" }
+            require(it.scheduleId == null || scheduleMedications[it.scheduleId] == it.medicationId) { "用药记录与服药计划不属于同一药物" }
+            require(medicationLogKeys.add("${it.medicationId}:${it.scheduledAt}")) { "同一剂用药记录重复" }
             LocalDateTime.parse(it.scheduledAt)
             it.actualAt?.let(LocalDateTime::parse)
             require(runCatching { MedicationLogStatus.valueOf(it.status) }.isSuccess) { "用药记录状态异常" }

@@ -9,7 +9,7 @@ Harmony ArkUI ───── shared/spec：相同 JSON Schema 与测试向量
 
 各平台适配：加密数据库 / 安全密钥 / 私有附件 / 本地通知
                          │
-                         └─ .htbackup v2（加密 ZIP）
+                         └─ .htbackup v3（全家庭加密 ZIP，兼容导入 v2）
 ```
 
 Android 和 iOS 链接 Kotlin Multiplatform 共享核心；HarmonyOS NEXT 使用 ArkTS 原生实现同一协议。平台数据库内部可以使用本地数字主键，但导出、导入和合并只能依赖永久 UUID。

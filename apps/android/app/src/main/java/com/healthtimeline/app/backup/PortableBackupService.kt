@@ -6,12 +6,15 @@ import androidx.room.withTransaction
 import com.healthtimeline.app.data.AttachmentEntity
 import com.healthtimeline.app.data.AttachmentStore
 import com.healthtimeline.app.data.HealthRepository
+import com.healthtimeline.app.data.FamilyMemberEntity
+import com.healthtimeline.shared.BACKUP_SCHEMA_VERSION
 import com.healthtimeline.shared.BackupImportPreview
 import com.healthtimeline.shared.MergeChoice
 import com.healthtimeline.shared.MergePlanner
 import com.healthtimeline.shared.PortableAttachment
 import com.healthtimeline.shared.PortableJson
 import com.healthtimeline.shared.PortableSnapshot
+import com.healthtimeline.shared.PortableFamilyMember
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -38,8 +41,8 @@ class PortableBackupService(
             repository.mutationMutex.withLock {
                 runCatching {
                     require(password.size >= 8) { "备份密码至少需要 8 位" }
-                    val zip = File.createTempFile("health-v2-", ".zip", context.cacheDir)
-                    val encrypted = File.createTempFile("health-v2-", ".encrypted", context.cacheDir)
+                    val zip = File.createTempFile("health-v3-", ".zip", context.cacheDir)
+                    val encrypted = File.createTempFile("health-v3-", ".encrypted", context.cacheDir)
                     try {
                         val entities = loadEntities()
                         val portable = PortableSnapshotMapper.toPortable(
@@ -63,7 +66,7 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun previewImport(source: Uri, password: CharArray): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
+    suspend fun previewImport(source: Uri, password: CharArray, targetMemberId: Long?): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runCatching {
@@ -71,10 +74,16 @@ class PortableBackupService(
                         if (prepared.portable == null) {
                             BackupImportPreview(0, 0, 0, emptyList(), legacyReplacementOnly = true)
                         } else {
+                            val current = loadEntities()
                             val local = PortableSnapshotMapper.toPortable(
-                                loadEntities(), InstallationIdentity.getOrCreate(context), Instant.now().toString()
+                                current, InstallationIdentity.getOrCreate(context), Instant.now().toString()
                             )
-                            MergePlanner.preview(local, prepared.portable)
+                            val imported = normalizeForFamily(
+                                prepared.portable,
+                                current.members.firstOrNull { it.id == targetMemberId },
+                                createDefaultMember = false
+                            )
+                            MergePlanner.preview(local, imported)
                         }
                     }
                 }
@@ -85,14 +94,20 @@ class PortableBackupService(
     suspend fun mergeImport(
         source: Uri,
         password: CharArray,
-        decisions: Map<String, MergeChoice>
+        decisions: Map<String, MergeChoice>,
+        targetMemberId: Long?
     ): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runCatching {
                     prepare(source, password).use { prepared ->
-                        val imported = requireNotNull(prepared.portable) { "旧版备份不能与现有数据自动合并，请选择安全替换" }
+                        val rawImported = requireNotNull(prepared.portable) { "旧版备份不能与现有数据自动合并，请选择安全替换" }
                         val currentEntities = loadEntities()
+                        val imported = normalizeForFamily(
+                            rawImported,
+                            currentEntities.members.firstOrNull { it.id == targetMemberId },
+                            createDefaultMember = false
+                        )
                         val local = PortableSnapshotMapper.toPortable(
                             currentEntities, InstallationIdentity.getOrCreate(context), Instant.now().toString()
                         )
@@ -106,24 +121,31 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun replaceFromBackup(source: Uri, password: CharArray): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun replaceFromBackup(source: Uri, password: CharArray, targetMemberId: Long?): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             runCatching {
                 // Determine the manifest version only after authenticating and validating the archive.
                 prepare(source, password).use { prepared ->
                     if (prepared.portable == null) {
-                        repository.mutationMutex.withLock { writeSafetyBackup(password) }
-                        legacy.restore(source, password.copyOf()).getOrThrow()
+                        val target = repository.mutationMutex.withLock {
+                            val current = loadEntities()
+                            writeSafetyBackup(password, current)
+                            current.members.firstOrNull { it.id == targetMemberId && !it.archived }
+                                ?: current.members.firstOrNull { !it.archived }
+                                ?: error("没有可用的家庭成员")
+                        }
+                        legacy.restore(source, password.copyOf(), target.id).getOrThrow()
                     } else {
                         repository.mutationMutex.withLock {
                             val current = loadEntities()
+                            val imported = normalizeForFamily(prepared.portable, null, createDefaultMember = true)
                             writeSafetyBackup(password, current)
                             installPortable(
-                                prepared.portable,
-                                prepared.portable,
+                                imported,
+                                imported,
                                 current,
                                 prepared.root,
-                                prepared.portable.allConflictKeys().associateWith { MergeChoice.USE_IMPORTED }
+                                imported.allConflictKeys().associateWith { MergeChoice.USE_IMPORTED }
                             )
                         }
                     }
@@ -132,12 +154,20 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
+    suspend fun importLegacyAsNew(source: Uri, password: CharArray, targetMemberId: Long?): Result<Int> {
+        val target = targetMemberId ?: run {
+            password.fill('\u0000')
+            return Result.failure(IllegalArgumentException("请选择旧版备份要导入到的家庭成员"))
+        }
+        return legacy.importAsNew(source, password, target)
+    }
+
     private suspend fun loadEntities() = database.withTransaction {
         BackupSnapshot(
             database.conditionDao().all(), database.clinicalRecordDao().all(), database.attachmentDao().all(),
             database.followUpDao().allSchedules(), database.followUpDao().allOccurrences(),
             database.medicationDao().allMedications(), database.medicationDao().allSchedules(),
-            database.medicationDao().allLogs()
+            database.medicationDao().allLogs(), database.familyMemberDao().all()
         )
     }
 
@@ -302,6 +332,8 @@ class PortableBackupService(
             database.medicationDao().clearLogs(); database.medicationDao().clearSchedules(); database.medicationDao().clearMedications()
             database.followUpDao().clearOccurrences(); database.followUpDao().clearSchedules()
             database.attachmentDao().clear(); database.clinicalRecordDao().clear(); database.conditionDao().clear()
+            database.familyMemberDao().clear()
+            database.familyMemberDao().insertAll(snapshot.members)
             database.conditionDao().insertAll(snapshot.conditions)
             database.clinicalRecordDao().insertAll(snapshot.records)
             database.attachmentDao().insertAll(snapshot.attachments)
@@ -311,6 +343,37 @@ class PortableBackupService(
             database.medicationDao().insertSchedules(snapshot.medicationSchedules)
             database.medicationDao().insertLogs(snapshot.medicationLogs)
         }
+    }
+
+    private fun normalizeForFamily(
+        value: PortableSnapshot,
+        targetMember: FamilyMemberEntity?,
+        createDefaultMember: Boolean
+    ): PortableSnapshot {
+        if (value.schemaVersion == BACKUP_SCHEMA_VERSION) return value
+        require(targetMember != null || createDefaultMember) { "请选择旧版备份要导入到的家庭成员" }
+        val member = targetMember?.let {
+            PortableFamilyMember(
+                it.uuid, it.name, it.nickname, it.relationship, it.archived,
+                it.createdAt, it.updatedAt
+            )
+        } ?: PortableFamilyMember(
+            uuid = UUID.nameUUIDFromBytes("health-timeline-v2:${value.sourceInstallationId}".toByteArray()).toString(),
+            name = "本人",
+            nickname = "本人",
+            relationship = "本人",
+            archived = false,
+            createdAt = value.exportedAt,
+            updatedAt = value.exportedAt
+        )
+        return value.copy(
+            schemaVersion = BACKUP_SCHEMA_VERSION,
+            members = listOf(member),
+            conditions = value.conditions.map { it.copy(memberUuid = member.uuid) },
+            records = value.records.map { it.copy(memberUuid = member.uuid) },
+            followUps = value.followUps.map { it.copy(memberUuid = member.uuid) },
+            medications = value.medications.map { it.copy(memberUuid = member.uuid) }
+        ).also(com.healthtimeline.shared.PortableSnapshotValidator::validate)
     }
 
     private fun writeDestination(destination: Uri, encrypted: File) {
@@ -352,6 +415,7 @@ private object InstallationIdentity {
 }
 
 private fun PortableSnapshot.allConflictKeys(): List<String> = buildList {
+    members.forEach { add("member:${it.uuid}") }
     conditions.forEach { add("condition:${it.uuid}") }
     records.forEach { add("record:${it.uuid}") }
     attachments.forEach { add("attachment:${it.uuid}") }

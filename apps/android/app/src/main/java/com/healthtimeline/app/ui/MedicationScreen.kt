@@ -24,19 +24,27 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
     val schedules by viewModel.medicationSchedules.collectAsStateWithLifecycle()
     val logs by viewModel.medicationLogs.collectAsStateWithLifecycle()
     val conditions by viewModel.conditions.collectAsStateWithLifecycle()
-    var create by remember { mutableStateOf(false) }
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    var createForMemberId by remember { mutableStateOf<Long?>(null) }
     var editing by remember { mutableStateOf<MedicationEntity?>(null) }
     var archiveTarget by remember { mutableStateOf<MedicationEntity?>(null) }
 
+    LaunchedEffect(selectedMemberId) {
+        createForMemberId = null
+        editing = null
+        archiveTarget = null
+    }
+
     Scaffold(
         modifier = Modifier.padding(padding),
-        floatingActionButton = { FloatingActionButton(onClick = { create = true }) { Icon(Icons.Outlined.Add, "新增药物") } }
+        floatingActionButton = { FloatingActionButton(onClick = { selectedMemberId?.let { createForMemberId = it } }) { Icon(Icons.Outlined.Add, "新增药物") } }
     ) { inner ->
         Column(
             Modifier.padding(inner).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("用药", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            MemberSwitcher(viewModel)
             Text("今日计划", style = MaterialTheme.typography.titleMedium)
             if (doses.isEmpty()) Text("今天没有待记录的用药", color = MaterialTheme.colorScheme.onSurfaceVariant)
             doses.forEach { dose ->
@@ -84,15 +92,16 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
             Spacer(Modifier.height(72.dp))
         }
     }
-    if (create || editing != null) {
+    if (createForMemberId != null || editing != null) {
         MedicationEditorDialog(
             existing = editing,
+            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
             existingTimes = editing?.let { med -> schedules.filter { it.medicationId == med.id }.map { LocalTime.parse(it.localTime) } }.orEmpty(),
             conditions = conditions.filter { !it.archived },
             onSave = { medication, times, onFailed ->
-                viewModel.saveMedication(medication, times, { create = false; editing = null }, onFailed)
+                viewModel.saveMedication(medication, times, { createForMemberId = null; editing = null }, onFailed)
             },
-            onDismiss = { create = false; editing = null }
+            onDismiss = { createForMemberId = null; editing = null }
         )
     }
     archiveTarget?.let { medication ->
@@ -108,6 +117,7 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
 @Composable
 private fun MedicationEditorDialog(
     existing: MedicationEntity?,
+    memberId: Long,
     existingTimes: List<LocalTime>,
     conditions: List<ConditionEntity>,
     onSave: (MedicationEntity, List<LocalTime>, () -> Unit) -> Unit,
@@ -170,7 +180,11 @@ private fun MedicationEditorDialog(
                             id = existing?.id ?: 0, conditionId = conditionId, name = name.trim(),
                             doseAmount = amount.trim(), doseUnit = unit.trim(), instructions = instructions.trim(),
                             startDate = startDate.toString(), endDate = endDate?.toString(), mode = mode,
-                                archived = false, createdAt = existing?.createdAt ?: now, updatedAt = now
+                                archived = false,
+                                createdAt = existing?.createdAt ?: now,
+                                updatedAt = now,
+                                uuid = existing?.uuid ?: java.util.UUID.randomUUID().toString(),
+                                memberId = memberId
                             ), parsedTimes
                         ) { submitting = false }
                     }

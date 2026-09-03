@@ -5,6 +5,8 @@ import com.healthtimeline.shared.*
 
 internal object PortableSnapshotMapper {
     fun toPortable(snapshot: BackupSnapshot, installationId: String, exportedAt: String): PortableSnapshot {
+        require(snapshot.members.isNotEmpty()) { "缺少家庭成员，无法导出备份" }
+        val members = snapshot.members.associateBy { it.id }
         val conditions = snapshot.conditions.associateBy { it.id }
         val records = snapshot.records.associateBy { it.id }
         val followUps = snapshot.followUps.associateBy { it.id }
@@ -14,14 +16,24 @@ internal object PortableSnapshotMapper {
             exportedAt = exportedAt,
             sourcePlatform = "android",
             sourceInstallationId = installationId,
+            members = snapshot.members.map {
+                PortableFamilyMember(
+                    it.uuid, it.name, it.nickname, it.relationship, it.archived,
+                    it.createdAt, it.updatedAt
+                )
+            },
             conditions = snapshot.conditions.map {
-                PortableCondition(it.uuid, it.name, it.color, it.notes, it.archived, it.createdAt)
+                PortableCondition(
+                    it.uuid, it.name, it.color, it.notes, it.archived, it.createdAt,
+                    memberUuid = requireNotNull(members[it.memberId]).uuid
+                )
             },
             records = snapshot.records.map {
                 PortableClinicalRecord(
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.recordDate, it.title, it.stage,
                     it.symptoms, it.diagnosis, it.treatment, it.medicationNotes, it.hospital, it.clinician,
-                    it.notes, it.createdAt, it.updatedAt
+                    it.notes, it.createdAt, it.updatedAt,
+                    memberUuid = requireNotNull(members[it.memberId]).uuid
                 )
             },
             attachments = snapshot.attachments.map {
@@ -41,7 +53,8 @@ internal object PortableSnapshotMapper {
                 PortableFollowUpSchedule(
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.title, it.recurrenceType,
                     it.interval, it.anchorDate, it.anchorDayOfMonth, it.weekday, it.reminderTime,
-                    it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt
+                    it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt,
+                    memberUuid = requireNotNull(members[it.memberId]).uuid
                 )
             },
             occurrences = snapshot.occurrences.map {
@@ -54,7 +67,8 @@ internal object PortableSnapshotMapper {
                 PortableMedication(
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.name, it.doseAmount,
                     it.doseUnit, it.instructions, it.startDate, it.endDate, it.mode, it.archived,
-                    it.createdAt, it.updatedAt
+                    it.createdAt, it.updatedAt,
+                    memberUuid = requireNotNull(members[it.memberId]).uuid
                 )
             },
             medicationSchedules = snapshot.medicationSchedules.map {
@@ -88,6 +102,8 @@ internal object PortableSnapshotMapper {
             return uuids.associateWith { existing[it] ?: ++next }
         }
 
+        require(portable.schemaVersion == BACKUP_SCHEMA_VERSION) { "备份尚未转换为家庭档案格式" }
+        val memberIds = ids(portable.members.map { it.uuid }, current.members.associate { it.uuid to it.id })
         val conditionIds = ids(portable.conditions.map { it.uuid }, current.conditions.associate { it.uuid to it.id })
         val recordIds = ids(portable.records.map { it.uuid }, current.records.associate { it.uuid to it.id })
         val attachmentIds = ids(portable.attachments.map { it.uuid }, current.attachments.associate { it.uuid to it.id })
@@ -99,14 +115,24 @@ internal object PortableSnapshotMapper {
         val currentAttachments = current.attachments.associateBy { it.uuid }
 
         return BackupSnapshot(
+            members = portable.members.map {
+                FamilyMemberEntity(
+                    memberIds.getValue(it.uuid), it.name, it.nickname, it.relationship, it.archived,
+                    it.createdAt, it.updatedAt, it.uuid
+                )
+            },
             conditions = portable.conditions.map {
-                ConditionEntity(conditionIds.getValue(it.uuid), it.name, it.color, it.notes, it.archived, it.createdAt, it.uuid)
+                ConditionEntity(
+                    conditionIds.getValue(it.uuid), it.name, it.color, it.notes, it.archived,
+                    it.createdAt, it.uuid, memberIds.getValue(requireNotNull(it.memberUuid))
+                )
             },
             records = portable.records.map {
                 ClinicalRecordEntity(
                     recordIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.recordDate,
                     it.title, it.stage, it.symptoms, it.diagnosis, it.treatment, it.medicationNotes,
-                    it.hospital, it.clinician, it.notes, it.createdAt, it.updatedAt, it.uuid
+                    it.hospital, it.clinician, it.notes, it.createdAt, it.updatedAt, it.uuid,
+                    memberIds.getValue(requireNotNull(it.memberUuid))
                 )
             },
             attachments = portable.attachments.map {
@@ -120,7 +146,8 @@ internal object PortableSnapshotMapper {
                 FollowUpScheduleEntity(
                     followUpIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.title,
                     it.recurrenceType, it.interval, it.anchorDate, it.anchorDayOfMonth, it.weekday,
-                    it.reminderTime, it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt, it.uuid
+                    it.reminderTime, it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt, it.uuid,
+                    memberIds.getValue(requireNotNull(it.memberUuid))
                 )
             },
             occurrences = portable.occurrences.map {
@@ -133,7 +160,8 @@ internal object PortableSnapshotMapper {
                 MedicationEntity(
                     medicationIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.name,
                     it.doseAmount, it.doseUnit, it.instructions, it.startDate, it.endDate, it.mode,
-                    it.archived, it.createdAt, it.updatedAt, it.uuid
+                    it.archived, it.createdAt, it.updatedAt, it.uuid,
+                    memberIds.getValue(requireNotNull(it.memberUuid))
                 )
             },
             medicationSchedules = portable.medicationSchedules.map {

@@ -30,20 +30,36 @@ import java.time.LocalDate
 import com.healthtimeline.shared.BackupImportPreview
 import com.healthtimeline.shared.MergeChoice
 import com.healthtimeline.shared.MergeConflict
+import com.healthtimeline.app.data.FamilyMemberEntity
+import java.time.Instant
+import com.healthtimeline.app.HealthTimelineApplication
 
 @Composable
-fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
+fun SettingsScreen(
+    viewModel: AppViewModel,
+    padding: PaddingValues,
+    appLockEnabled: Boolean,
+    onAppLockChange: (Boolean) -> Unit
+) {
     val context = LocalContext.current
+    val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
     var permissionRefresh by remember { mutableIntStateOf(0) }
     val notificationPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     val exactAllowed = viewModel.canScheduleExact()
+    val members by viewModel.members.collectAsState()
+    var createMember by remember { mutableStateOf(false) }
+    var editingMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
+    var archiveMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
+    var deleteMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
     var exportPassword by remember { mutableStateOf<CharArray?>(null) }
     var passwordMode by remember { mutableStateOf<String?>(null) }
     var restoreUri by remember { mutableStateOf<Uri?>(null) }
     var confirmRestore by remember { mutableStateOf(false) }
     var importPassword by remember { mutableStateOf<CharArray?>(null) }
     var importPreview by remember { mutableStateOf<BackupImportPreview?>(null) }
+    var replacementSource by remember { mutableStateOf<Uri?>(null) }
+    var replacementPassword by remember { mutableStateOf<CharArray?>(null) }
     val importedChoices = remember { mutableStateMapOf<String, Boolean>() }
 
     fun clearPendingImport() {
@@ -54,8 +70,12 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
         importedChoices.clear()
     }
 
-    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { permissionRefresh++ }
+    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        appLockManager.endExternalActivity()
+        permissionRefresh++
+    }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        appLockManager.endExternalActivity()
         val password = exportPassword
         if (uri != null && password != null) {
             viewModel.exportBackup(uri, password)
@@ -65,7 +85,22 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
         exportPassword = null
     }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        appLockManager.endExternalActivity()
         if (uri != null) { restoreUri = uri; passwordMode = "restore" }
+    }
+    val safetyExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        appLockManager.endExternalActivity()
+        val source = replacementSource
+        val password = replacementPassword
+        replacementSource = null
+        replacementPassword = null
+        if (uri != null && source != null && password != null) {
+            viewModel.restoreBackupWithSafetyExport(uri, source, password)
+        } else {
+            password?.fill('\u0000')
+        }
     }
 
     Column(
@@ -73,13 +108,48 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         Text("设置", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        Text("家庭档案", style = MaterialTheme.typography.titleMedium)
+        Text("日历、复查和用药会跟随当前成员切换；所有未归档成员的系统提醒都会继续生效。")
+        Button(onClick = { createMember = true }) { Text("添加家庭成员") }
+        members.forEach { member ->
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(member.nickname, fontWeight = FontWeight.SemiBold)
+                    Text("${member.name} · ${member.relationship}${if (member.archived) " · 已归档" else ""}")
+                    Row {
+                        TextButton(onClick = { editingMember = member }) { Text("编辑") }
+                        if (member.archived) {
+                            TextButton(onClick = { viewModel.restoreMember(member) }) { Text("恢复") }
+                        } else {
+                            TextButton(onClick = { archiveMember = member }) { Text("归档") }
+                        }
+                        TextButton(onClick = { deleteMember = member }) { Text("删除空档案") }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider()
+        Text("隐私保护", style = MaterialTheme.typography.titleMedium)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Column(Modifier.weight(1f)) {
+                Text("进入应用时验证身份", fontWeight = FontWeight.SemiBold)
+                Text("离开应用约 30 秒或手机锁屏后，使用系统指纹、面容或锁屏密码验证。", style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = appLockEnabled, onCheckedChange = onAppLockChange)
+        }
+
+        HorizontalDivider()
         Text("提醒权限", style = MaterialTheme.typography.titleMedium)
         PermissionCard(
             "通知权限",
             if (notificationPermission) "已允许" else "未允许：不会显示任何复查或用药通知",
             notificationPermission
         ) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appLockManager.beginExternalActivity()
+                notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
             else safeStartSettings(context, Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
         }
         PermissionCard(
@@ -101,7 +171,10 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
         Button(onClick = { passwordMode = "export" }) {
             Icon(Icons.Outlined.Download, null); Spacer(Modifier.width(8.dp)); Text("导出加密备份")
         }
-        OutlinedButton(onClick = { importLauncher.launch(arrayOf("application/octet-stream", "*/*")) }) {
+        OutlinedButton(onClick = {
+            appLockManager.beginExternalActivity()
+            importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
+        }) {
             Icon(Icons.Outlined.Restore, null); Spacer(Modifier.width(8.dp)); Text("导入或恢复备份")
         }
 
@@ -119,6 +192,7 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onConfirm = { password ->
                 if (passwordMode == "export") {
                     exportPassword = password
+                    appLockManager.beginExternalActivity()
                     exportLauncher.launch("病程日历-${LocalDate.now()}.htbackup")
                 } else {
                     importPassword?.fill('\u0000')
@@ -144,6 +218,31 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onDismiss = { passwordMode = null; clearPendingImport() }
         )
     }
+    if (createMember || editingMember != null) {
+        FamilyMemberEditorDialog(
+            existing = editingMember,
+            onSave = { value, onFailed ->
+                viewModel.saveMember(value, { createMember = false; editingMember = null }, onFailed)
+            },
+            onDismiss = { createMember = false; editingMember = null }
+        )
+    }
+    archiveMember?.let { member ->
+        ConfirmDialog(
+            "归档${member.nickname}？",
+            "档案和历史资料会保留，但该成员的复查和用药提醒将暂停。",
+            { viewModel.archiveMember(member); archiveMember = null },
+            { archiveMember = null }
+        )
+    }
+    deleteMember?.let { member ->
+        ConfirmDialog(
+            "删除空档案？",
+            "只有完全没有病历、分类、复查和用药资料的成员才能删除；有历史资料的成员请使用归档。",
+            { viewModel.deleteEmptyMember(member); deleteMember = null },
+            { deleteMember = null }
+        )
+    }
     importPreview?.let { preview ->
         ImportPreviewDialog(
             preview = preview,
@@ -155,6 +254,13 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
                 clearPendingImport()
                 if (uri != null && password != null) viewModel.mergeBackup(uri, password, decisions)
             },
+            onImportLegacyAsNew = {
+                val uri = restoreUri
+                val password = importPassword?.copyOf()
+                clearPendingImport()
+                if (uri != null && password != null) viewModel.importLegacyBackupAsNew(uri, password)
+                else password?.fill('\u0000')
+            },
             onReplace = {
                 importPreview = null
                 confirmRestore = true
@@ -165,12 +271,19 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
     if (confirmRestore) {
         ConfirmDialog(
             "整体替换当前数据？",
-            "这会删除本机独有的资料并改用备份内容。仅在确定不需要合并时使用；验证或写入失败不会改变现有数据。",
+            "这会删除本机独有的资料并改用备份内容。下一步必须先选择位置导出当前数据的安全备份；导出、验证或写入失败都不会改变现有数据。",
             onConfirm = {
                 val uri = restoreUri
                 val password = importPassword?.copyOf()
                 clearPendingImport()
-                if (uri != null && password != null) viewModel.restoreBackup(uri, password)
+                if (uri != null && password != null) {
+                    replacementSource = uri
+                    replacementPassword = password
+                    appLockManager.beginExternalActivity()
+                    safetyExportLauncher.launch("病程日历-替换前安全备份-${LocalDate.now()}.htbackup")
+                } else {
+                    password?.fill('\u0000')
+                }
                 confirmRestore = false
             },
             onDismiss = { confirmRestore = false; clearPendingImport() }
@@ -179,10 +292,63 @@ fun SettingsScreen(viewModel: AppViewModel, padding: PaddingValues) {
 }
 
 @Composable
+private fun FamilyMemberEditorDialog(
+    existing: FamilyMemberEntity?,
+    onSave: (FamilyMemberEntity, () -> Unit) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var name by remember(existing) { mutableStateOf(existing?.name.orEmpty()) }
+    var nickname by remember(existing) { mutableStateOf(existing?.nickname.orEmpty()) }
+    var relationship by remember(existing) { mutableStateOf(existing?.relationship.orEmpty()) }
+    var error by remember(existing) { mutableStateOf<String?>(null) }
+    var submitting by remember(existing) { mutableStateOf(false) }
+    val now = Instant.now().toString()
+
+    AlertDialog(
+        onDismissRequest = { if (!submitting) onDismiss() },
+        title = { Text(if (existing == null) "添加家庭成员" else "编辑家庭成员") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(name, { name = it.take(50) }, label = { Text("姓名 *") }, singleLine = true)
+                OutlinedTextField(nickname, { nickname = it.take(30) }, label = { Text("称呼 *") }, placeholder = { Text("例如：妈妈") }, singleLine = true)
+                OutlinedTextField(relationship, { relationship = it.take(30) }, label = { Text("关系 *") }, placeholder = { Text("例如：母亲") }, singleLine = true)
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !submitting,
+                onClick = {
+                    if (name.isBlank() || nickname.isBlank() || relationship.isBlank()) {
+                        error = "请完整填写姓名、称呼和关系"
+                    } else {
+                        submitting = true
+                        onSave(
+                            FamilyMemberEntity(
+                                id = existing?.id ?: 0,
+                                name = name.trim(),
+                                nickname = nickname.trim(),
+                                relationship = relationship.trim(),
+                                archived = existing?.archived ?: false,
+                                createdAt = existing?.createdAt ?: now,
+                                updatedAt = now,
+                                uuid = existing?.uuid ?: java.util.UUID.randomUUID().toString()
+                            )
+                        ) { submitting = false }
+                    }
+                }
+            ) { Text(if (submitting) "保存中…" else "保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !submitting) { Text("取消") } }
+    )
+}
+
+@Composable
 private fun ImportPreviewDialog(
     preview: BackupImportPreview,
     importedChoices: MutableMap<String, Boolean>,
     onMerge: () -> Unit,
+    onImportLegacyAsNew: () -> Unit,
     onReplace: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -195,7 +361,8 @@ private fun ImportPreviewDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 if (preview.legacyReplacementOnly) {
-                    Text("该备份来自 1.x 版本，没有跨设备 UUID，无法可靠去重合并。只能经过再次确认后整体替换。")
+                    Text("该备份来自旧 v1 格式，没有稳定 UUID，无法可靠去重。可作为新资料导入当前成员（不会覆盖本机资料，但重复导入会产生重复），或经过安全备份后整体替换。")
+                    TextButton(onClick = onReplace) { Text("高级：整体替换") }
                 } else {
                     Text("新增 ${preview.additions} 项 · 可更新 ${preview.updates} 项 · 重复 ${preview.duplicates} 项")
                     if (preview.conflicts.isEmpty()) {
@@ -221,7 +388,7 @@ private fun ImportPreviewDialog(
             }
         },
         confirmButton = {
-            if (preview.legacyReplacementOnly) TextButton(onClick = onReplace) { Text("继续整体替换") }
+            if (preview.legacyReplacementOnly) TextButton(onClick = onImportLegacyAsNew) { Text("作为新资料导入") }
             else TextButton(onClick = onMerge) { Text("安全合并") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
@@ -230,6 +397,7 @@ private fun ImportPreviewDialog(
 
 private fun conflictLabel(value: MergeConflict): String {
     val type = when (value.entityType) {
+        "member" -> "家庭成员"
         "condition" -> "病情分类"
         "record" -> "病历"
         "attachment" -> "附件"

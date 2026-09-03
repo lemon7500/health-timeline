@@ -3,9 +3,37 @@ package com.healthtimeline.app.ui
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+
+@Composable
+fun MemberSwitcher(viewModel: AppViewModel, modifier: Modifier = Modifier) {
+    val members by viewModel.members.collectAsStateWithLifecycle()
+    val selectedId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val active = members.filterNot { it.archived }
+    if (active.isEmpty()) return
+    Card(modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+            Text(
+                "当前档案",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            LabeledDropdown(
+                label = "家庭成员",
+                value = selectedId?.toString().orEmpty(),
+                options = active.map { it.id.toString() to "${it.nickname} · ${it.name}（${it.relationship}）" },
+                onSelect = { it.toLongOrNull()?.let(viewModel::selectMember) },
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
 
 @Composable
 fun LabeledDropdown(

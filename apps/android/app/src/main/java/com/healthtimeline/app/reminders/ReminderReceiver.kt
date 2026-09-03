@@ -45,7 +45,8 @@ class ReminderReceiver : BroadcastReceiver() {
         val due = intent.getStringExtra(EXTRA_DUE)?.let(LocalDate::parse) ?: return
         if (id < 0) return
         app.repository.processDueFollowUp(id, due) ?: return
-        showFollowUpNotification(context, id, due)
+        val member = app.repository.memberForFollowUp(id)?.takeUnless { it.archived } ?: return
+        showFollowUpNotification(context, id, due, member.nickname)
     }
 
     private suspend fun handleMedication(context: Context, app: HealthTimelineApplication, intent: Intent) {
@@ -54,26 +55,28 @@ class ReminderReceiver : BroadcastReceiver() {
         val scheduledAt = intent.getStringExtra(EXTRA_SCHEDULED_AT) ?: LocalDateTime.now().toString()
         if (scheduleId < 0 || medicationId < 0) return
         val medication = app.repository.medicationById(medicationId) ?: return
+        val member = app.repository.memberForMedication(medicationId)?.takeUnless { it.archived } ?: return
         val scheduledDate = runCatching { LocalDateTime.parse(scheduledAt).toLocalDate() }.getOrNull() ?: return
         if (medication.archived || scheduledDate.isBefore(LocalDate.parse(medication.startDate)) ||
             medication.endDate?.let { scheduledDate.isAfter(LocalDate.parse(it)) } == true
         ) return
-        showMedicationNotification(context, medicationId, scheduleId, scheduledAt)
+        showMedicationNotification(context, medicationId, scheduleId, scheduledAt, member.nickname)
         app.repository.enabledMedicationSchedules().firstOrNull { it.id == scheduleId }?.let { schedule ->
             app.alarmScheduler.scheduleMedication(schedule)
         }
     }
 
-    private fun showFollowUpNotification(context: Context, scheduleId: Long, due: LocalDate) {
+    private fun showFollowUpNotification(context: Context, scheduleId: Long, due: LocalDate, nickname: String) {
         if (!canNotify(context)) return
         val notification = NotificationCompat.Builder(context, NotificationChannels.FOLLOW_UP)
             .setSmallIcon(R.drawable.ic_app)
-            .setContentTitle("复查提醒")
+            .setContentTitle("${nickname}的复查提醒")
             .setContentText("有一项复查计划需要关注（${due}）")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(openAppIntent(context))
+            .setPublicVersion(publicNotification(context, NotificationChannels.FOLLOW_UP))
             .build()
         context.getSystemService(NotificationManager::class.java)
             .notify((scheduleId % Int.MAX_VALUE).toInt(), notification)
@@ -83,7 +86,8 @@ class ReminderReceiver : BroadcastReceiver() {
         context: Context,
         medicationId: Long,
         scheduleId: Long,
-        scheduledAt: String
+        scheduledAt: String,
+        nickname: String
     ) {
         if (!canNotify(context)) return
         val actionIntent = Intent(context, ReminderActionReceiver::class.java).apply {
@@ -100,17 +104,27 @@ class ReminderReceiver : BroadcastReceiver() {
         )
         val notification = NotificationCompat.Builder(context, NotificationChannels.MEDICATION)
             .setSmallIcon(R.drawable.ic_app)
-            .setContentTitle("用药提醒")
+            .setContentTitle("${nickname}的用药提醒")
             .setContentText("到服药时间了")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
             .setContentIntent(openAppIntent(context))
+            .setPublicVersion(publicNotification(context, NotificationChannels.MEDICATION))
             .addAction(0, "已服", action)
             .build()
         context.getSystemService(NotificationManager::class.java)
             .notify((scheduleId % Int.MAX_VALUE).toInt() + 500_000, notification)
     }
+
+    private fun publicNotification(context: Context, channelId: String) =
+        NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.drawable.ic_app)
+            .setContentTitle("病程日历提醒")
+            .setContentText("打开应用查看提醒内容")
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(openAppIntent(context))
+            .build()
 
     private fun openAppIntent(context: Context): PendingIntent = PendingIntent.getActivity(
         context,

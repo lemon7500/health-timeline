@@ -5,6 +5,7 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -69,6 +70,57 @@ class DatabaseMigrationTest {
                 assertTrue(cursor.moveToFirst())
                 assertEquals(1, cursor.getInt(0))
                 assertEquals(36, cursor.getInt(1))
+            }
+        }
+    }
+
+    @Test fun migrationFrom3To4CreatesDefaultMemberAndPreservesCompleteGraph() {
+        helper.createDatabase(NAME, 3).apply {
+            execSQL("INSERT INTO conditions VALUES(1, '乳腺', 1, '', 0, '2026-09-01T00:00:00Z', '11111111-1111-4111-8111-111111111111')")
+            execSQL(
+                "INSERT INTO clinical_records VALUES(1, 1, '2026-09-03', '复查', 'CHECKUP', '', '', '', '', '', '', '', " +
+                    "'2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '22222222-2222-4222-8222-222222222222')"
+            )
+            execSQL("INSERT INTO attachments VALUES(1, 1, 'PDF', '报告.pdf', 'application/pdf', 'attachments/1/a.pdf', 4, '${"a".repeat(64)}', '2026-09-01T00:00:00Z', '33333333-3333-4333-8333-333333333333')")
+            execSQL(
+                "INSERT INTO follow_up_schedules VALUES(1, 1, '三个月复查', 'EVERY_N_MONTHS', 3, '2026-07-09', 9, NULL, '09:00', 0, " +
+                    "'2026-10-09', 1, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '44444444-4444-4444-8444-444444444444')"
+            )
+            execSQL("INSERT INTO follow_up_occurrences VALUES(1, 1, '2026-07-09', 'DONE', '2026-07-09T01:00:00Z', '2026-07-09T00:00:00Z', '55555555-5555-4555-8555-555555555555')")
+            execSQL(
+                "INSERT INTO medications VALUES(1, 1, '药物', '1', '片', '', '2026-09-01', NULL, 'SCHEDULED', 0, " +
+                    "'2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', '66666666-6666-4666-8666-666666666666')"
+            )
+            execSQL("INSERT INTO medication_schedules VALUES(1, 1, '08:00', 1, '77777777-7777-4777-8777-777777777777')")
+            execSQL("INSERT INTO medication_logs VALUES(1, 1, 1, '2026-09-03T08:00', '2026-09-03T08:01', 'TAKEN', '1', '片', '2026-09-03T00:00:00Z', '88888888-8888-4888-8888-888888888888')")
+            close()
+        }
+
+        helper.runMigrationsAndValidate(NAME, 4, true, AppDatabase.MIGRATION_3_4).use { database ->
+            database.query("SELECT id, name, nickname, relationship, archived FROM family_members").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(1L, cursor.getLong(0))
+                assertEquals("本人", cursor.getString(1))
+                assertEquals("本人", cursor.getString(2))
+                assertEquals("本人", cursor.getString(3))
+                assertEquals(0, cursor.getInt(4))
+            }
+            listOf("conditions", "clinical_records", "follow_up_schedules", "medications").forEach { table ->
+                database.query("SELECT COUNT(*), MIN(memberId), MAX(memberId) FROM $table").use { cursor ->
+                    assertTrue(cursor.moveToFirst())
+                    assertEquals(1, cursor.getInt(0))
+                    assertEquals(1L, cursor.getLong(1))
+                    assertEquals(1L, cursor.getLong(2))
+                }
+            }
+            listOf("attachments", "follow_up_occurrences", "medication_schedules", "medication_logs").forEach { table ->
+                database.query("SELECT COUNT(*) FROM $table").use { cursor ->
+                    assertTrue(cursor.moveToFirst())
+                    assertEquals(1, cursor.getInt(0))
+                }
+            }
+            database.query("PRAGMA foreign_key_check").use { cursor ->
+                assertFalse(cursor.moveToFirst())
             }
         }
     }

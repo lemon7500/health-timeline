@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/lemon7500/health-timeline/blob/main/shared/spec/backup-v3.schema.json",
+  "title": "Health Timeline backup manifest v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "exportedAt", "sourcePlatform", "sourceInstallationId", "members", "conditions", "records", "attachments", "followUps", "occurrences", "medications", "medicationSchedules", "medicationLogs"],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "exportedAt": { "$ref": "#/$defs/instant" },
+    "sourcePlatform": { "enum": ["android", "ios", "harmony", "test"] },
+    "sourceInstallationId": { "$ref": "#/$defs/uuid" },
+    "members": { "type": "array", "minItems": 1, "maxItems": 100000, "items": { "$ref": "#/$defs/member" } },
+    "conditions": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/condition" } },
+    "records": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/record" } },
+    "attachments": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/attachment" } },
+    "followUps": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/followUp" } },
+    "occurrences": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/occurrence" } },
+    "medications": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/medication" } },
+    "medicationSchedules": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/medicationSchedule" } },
+    "medicationLogs": { "type": "array", "maxItems": 100000, "items": { "$ref": "#/$defs/medicationLog" } }
+  },
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid" },
+    "instant": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "date": { "type": "string", "format": "date" },
+    "time": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" },
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "name", "nickname", "relationship", "archived", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 50 },
+        "nickname": { "type": "string", "minLength": 1, "maxLength": 30 },
+        "relationship": { "type": "string", "minLength": 1, "maxLength": 30 },
+        "archived": { "type": "boolean" },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "memberUuid", "name", "color", "notes", "archived", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "memberUuid": { "$ref": "#/$defs/uuid" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 50 },
+        "color": { "type": "integer" },
+        "notes": { "type": "string", "maxLength": 5000 },
+        "archived": { "type": "boolean" },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "memberUuid", "recordDate", "title", "stage", "symptoms", "diagnosis", "treatment", "medicationNotes", "hospital", "clinician", "notes", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "memberUuid": { "$ref": "#/$defs/uuid" },
+        "conditionUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "recordDate": { "$ref": "#/$defs/date" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "stage": { "enum": ["BEFORE_VISIT", "AFTER_VISIT", "CHECKUP", "SURGERY", "OTHER"] },
+        "symptoms": { "type": "string", "maxLength": 20000 },
+        "diagnosis": { "type": "string", "maxLength": 20000 },
+        "treatment": { "type": "string", "maxLength": 20000 },
+        "medicationNotes": { "type": "string", "maxLength": 20000 },
+        "hospital": { "type": "string", "maxLength": 200 },
+        "clinician": { "type": "string", "maxLength": 100 },
+        "notes": { "type": "string", "maxLength": 20000 },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "recordUuid", "kind", "displayName", "mimeType", "archivePath", "sizeBytes", "sha256", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "recordUuid": { "$ref": "#/$defs/uuid" },
+        "kind": { "enum": ["IMAGE", "PDF"] },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "mimeType": { "type": "string" },
+        "archivePath": { "type": "string", "pattern": "^files/[0-9a-fA-F-]{36}$" },
+        "sizeBytes": { "type": "integer", "minimum": 0, "maximum": 104857600 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "followUp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "memberUuid", "title", "recurrenceType", "interval", "anchorDate", "anchorDayOfMonth", "reminderTime", "leadDays", "nextDueDate", "enabled", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "memberUuid": { "$ref": "#/$defs/uuid" },
+        "conditionUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "recurrenceType": { "enum": ["ONCE", "EVERY_N_DAYS", "EVERY_N_WEEKS", "EVERY_N_MONTHS"] },
+        "interval": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "anchorDate": { "$ref": "#/$defs/date" },
+        "anchorDayOfMonth": { "type": "integer", "minimum": 1, "maximum": 31 },
+        "weekday": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 7 }, { "type": "null" }] },
+        "reminderTime": { "$ref": "#/$defs/time" },
+        "leadDays": { "type": "integer", "minimum": 0, "maximum": 365 },
+        "nextDueDate": { "$ref": "#/$defs/date" },
+        "enabled": { "type": "boolean" },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "occurrence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "scheduleUuid", "dueDate", "status", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "scheduleUuid": { "$ref": "#/$defs/uuid" },
+        "dueDate": { "$ref": "#/$defs/date" },
+        "status": { "enum": ["PENDING", "DONE", "SKIPPED"] },
+        "completedAt": { "anyOf": [{ "$ref": "#/$defs/instant" }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "medication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "memberUuid", "name", "doseAmount", "doseUnit", "instructions", "startDate", "mode", "archived", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "memberUuid": { "$ref": "#/$defs/uuid" },
+        "conditionUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "doseAmount": { "type": "string", "minLength": 1, "maxLength": 30 },
+        "doseUnit": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "instructions": { "type": "string", "maxLength": 5000 },
+        "startDate": { "$ref": "#/$defs/date" },
+        "endDate": { "anyOf": [{ "$ref": "#/$defs/date" }, { "type": "null" }] },
+        "mode": { "enum": ["SCHEDULED", "AS_NEEDED"] },
+        "archived": { "type": "boolean" },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "medicationSchedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "medicationUuid", "localTime", "enabled", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "medicationUuid": { "$ref": "#/$defs/uuid" },
+        "localTime": { "$ref": "#/$defs/time" },
+        "enabled": { "type": "boolean" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    },
+    "medicationLog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uuid", "medicationUuid", "scheduledAt", "status", "doseAmountSnapshot", "doseUnitSnapshot", "createdAt", "updatedAt"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "medicationUuid": { "$ref": "#/$defs/uuid" },
+        "scheduleUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "scheduledAt": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\\.[0-9]+)?)?$" },
+        "actualAt": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\\.[0-9]+)?)?$" }, { "type": "null" }] },
+        "status": { "enum": ["TAKEN", "SKIPPED"] },
+        "doseAmountSnapshot": { "type": "string", "maxLength": 30 },
+        "doseUnitSnapshot": { "type": "string", "maxLength": 20 },
+        "createdAt": { "$ref": "#/$defs/instant" },
+        "updatedAt": { "$ref": "#/$defs/instant" }
+      }
+    }
+  }
+}

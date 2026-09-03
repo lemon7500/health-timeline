@@ -13,7 +13,31 @@ enum class OccurrenceStatus { PENDING, DONE, SKIPPED }
 enum class MedicationMode { SCHEDULED, AS_NEEDED }
 enum class MedicationLogStatus { TAKEN, SKIPPED }
 
-@Entity(tableName = "conditions", indices = [Index(value = ["uuid"], unique = true)])
+@Entity(
+    tableName = "family_members",
+    indices = [Index(value = ["uuid"], unique = true), Index("archived")]
+)
+data class FamilyMemberEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val nickname: String,
+    val relationship: String,
+    val archived: Boolean = false,
+    val createdAt: String,
+    val updatedAt: String,
+    val uuid: String = UUID.randomUUID().toString()
+)
+
+@Entity(
+    tableName = "conditions",
+    foreignKeys = [ForeignKey(
+        entity = FamilyMemberEntity::class,
+        parentColumns = ["id"],
+        childColumns = ["memberId"],
+        onDelete = ForeignKey.RESTRICT
+    )],
+    indices = [Index("memberId"), Index(value = ["uuid"], unique = true)]
+)
 data class ConditionEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
@@ -21,18 +45,27 @@ data class ConditionEntity(
     val notes: String = "",
     val archived: Boolean = false,
     val createdAt: String,
-    val uuid: String = UUID.randomUUID().toString()
+    val uuid: String = UUID.randomUUID().toString(),
+    val memberId: Long = 1L
 )
 
 @Entity(
     tableName = "clinical_records",
-    foreignKeys = [ForeignKey(
-        entity = ConditionEntity::class,
-        parentColumns = ["id"],
-        childColumns = ["conditionId"],
-        onDelete = ForeignKey.SET_NULL
-    )],
-    indices = [Index("conditionId"), Index("recordDate"), Index(value = ["uuid"], unique = true)]
+    foreignKeys = [
+        ForeignKey(
+            entity = ConditionEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conditionId"],
+            onDelete = ForeignKey.SET_NULL
+        ),
+        ForeignKey(
+            entity = FamilyMemberEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["memberId"],
+            onDelete = ForeignKey.RESTRICT
+        )
+    ],
+    indices = [Index("conditionId"), Index("memberId"), Index("recordDate"), Index(value = ["uuid"], unique = true)]
 )
 data class ClinicalRecordEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -49,7 +82,8 @@ data class ClinicalRecordEntity(
     val notes: String = "",
     val createdAt: String,
     val updatedAt: String,
-    val uuid: String = UUID.randomUUID().toString()
+    val uuid: String = UUID.randomUUID().toString(),
+    val memberId: Long = 1L
 )
 
 @Entity(
@@ -77,13 +111,21 @@ data class AttachmentEntity(
 
 @Entity(
     tableName = "follow_up_schedules",
-    foreignKeys = [ForeignKey(
-        entity = ConditionEntity::class,
-        parentColumns = ["id"],
-        childColumns = ["conditionId"],
-        onDelete = ForeignKey.SET_NULL
-    )],
-    indices = [Index("conditionId"), Index("nextDueDate"), Index(value = ["uuid"], unique = true)]
+    foreignKeys = [
+        ForeignKey(
+            entity = ConditionEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conditionId"],
+            onDelete = ForeignKey.SET_NULL
+        ),
+        ForeignKey(
+            entity = FamilyMemberEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["memberId"],
+            onDelete = ForeignKey.RESTRICT
+        )
+    ],
+    indices = [Index("conditionId"), Index("memberId"), Index("nextDueDate"), Index(value = ["uuid"], unique = true)]
 )
 data class FollowUpScheduleEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -100,7 +142,8 @@ data class FollowUpScheduleEntity(
     val enabled: Boolean = true,
     val createdAt: String,
     val updatedAt: String,
-    val uuid: String = UUID.randomUUID().toString()
+    val uuid: String = UUID.randomUUID().toString(),
+    val memberId: Long = 1L
 )
 
 @Entity(
@@ -125,13 +168,21 @@ data class FollowUpOccurrenceEntity(
 
 @Entity(
     tableName = "medications",
-    foreignKeys = [ForeignKey(
-        entity = ConditionEntity::class,
-        parentColumns = ["id"],
-        childColumns = ["conditionId"],
-        onDelete = ForeignKey.SET_NULL
-    )],
-    indices = [Index("conditionId"), Index("startDate"), Index(value = ["uuid"], unique = true)]
+    foreignKeys = [
+        ForeignKey(
+            entity = ConditionEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["conditionId"],
+            onDelete = ForeignKey.SET_NULL
+        ),
+        ForeignKey(
+            entity = FamilyMemberEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["memberId"],
+            onDelete = ForeignKey.RESTRICT
+        )
+    ],
+    indices = [Index("conditionId"), Index("memberId"), Index("startDate"), Index(value = ["uuid"], unique = true)]
 )
 data class MedicationEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -146,7 +197,8 @@ data class MedicationEntity(
     val archived: Boolean = false,
     val createdAt: String,
     val updatedAt: String,
-    val uuid: String = UUID.randomUUID().toString()
+    val uuid: String = UUID.randomUUID().toString(),
+    val memberId: Long = 1L
 )
 
 @Entity(

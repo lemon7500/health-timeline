@@ -38,6 +38,7 @@ object MergePlanner {
             }
         }
 
+        inspect("member", local.members, imported.members, { it.uuid }, { it.updatedAt })
         inspect("condition", local.conditions, imported.conditions, { it.uuid }, { it.updatedAt })
         inspect("record", local.records, imported.records, { it.uuid }, { it.updatedAt })
         inspect("attachment", local.attachments, imported.attachments, { it.uuid }, { it.updatedAt })
@@ -69,6 +70,7 @@ object MergePlanner {
 
         val result = local.copy(
             exportedAt = imported.exportedAt,
+            members = mergeList("member", local.members, imported.members) { it.uuid },
             conditions = mergeList("condition", local.conditions, imported.conditions) { it.uuid },
             records = mergeList("record", local.records, imported.records) { it.uuid },
             attachments = mergeList("attachment", local.attachments, imported.attachments) { it.uuid },

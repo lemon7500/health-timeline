@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.healthtimeline.app.data.*
+import com.healthtimeline.app.HealthTimelineApplication
 import java.io.File
 import java.time.Instant
 import java.time.LocalDate
@@ -44,13 +45,14 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
     val records by viewModel.records.collectAsStateWithLifecycle()
     val conditions by viewModel.conditions.collectAsStateWithLifecycle()
     val attachments by viewModel.attachments.collectAsStateWithLifecycle()
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
     var month by rememberSaveable { mutableStateOf(YearMonth.now().toString()) }
     var selectedDate by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
     var filterCondition by rememberSaveable { mutableStateOf<Long?>(null) }
     var editing by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var createNew by remember { mutableStateOf(false) }
+    var createForMemberId by remember { mutableStateOf<Long?>(null) }
     var details by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var manageConditions by remember { mutableStateOf(false) }
+    var manageConditionsForMemberId by remember { mutableStateOf<Long?>(null) }
     var deleteTarget by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
 
@@ -62,10 +64,19 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
         searchCalendarRecords(records, conditions, searchQuery)
     }
 
+    LaunchedEffect(selectedMemberId) {
+        filterCondition = null
+        searchQuery = ""
+        editing = null
+        details = null
+        createForMemberId = null
+        manageConditionsForMemberId = null
+    }
+
     Scaffold(
         modifier = Modifier.padding(padding),
         floatingActionButton = {
-            FloatingActionButton(onClick = { createNew = true }) { Icon(Icons.Outlined.Add, "新增病历") }
+            FloatingActionButton(onClick = { selectedMemberId?.let { createForMemberId = it } }) { Icon(Icons.Outlined.Add, "新增病历") }
         }
     ) { inner ->
         Column(
@@ -73,6 +84,7 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("病程日历", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            MemberSwitcher(viewModel)
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it.take(100) },
@@ -126,7 +138,7 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
                         label = { Text(condition.name) }
                     )
                 }
-                AssistChip(onClick = { manageConditions = true }, label = { Text("管理分类") })
+                AssistChip(onClick = { selectedMemberId?.let { manageConditionsForMemberId = it } }, label = { Text("管理分类") })
             }
             MonthGrid(
                 month = currentMonth,
@@ -156,15 +168,16 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
         }
     }
 
-    if (createNew || editing != null) {
+    if (createForMemberId != null || editing != null) {
         RecordEditorDialog(
             initialDate = selectedDate,
             record = editing,
+            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
             conditions = conditions.filter { !it.archived },
             onSave = { value, onFailed ->
-                viewModel.saveRecord(value, { createNew = false; editing = null }, onFailed)
+                viewModel.saveRecord(value, { createForMemberId = null; editing = null }, onFailed)
             },
-            onDismiss = { createNew = false; editing = null }
+            onDismiss = { createForMemberId = null; editing = null }
         )
     }
     details?.let { record ->
@@ -178,8 +191,8 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onDismiss = { details = null }
         )
     }
-    if (manageConditions) {
-        ConditionManagerDialog(conditions, viewModel, onDismiss = { manageConditions = false })
+    manageConditionsForMemberId?.let { memberId ->
+        ConditionManagerDialog(conditions, memberId, viewModel, onDismiss = { manageConditionsForMemberId = null })
     }
     deleteTarget?.let { target ->
         ConfirmDialog(
@@ -301,6 +314,7 @@ private fun MonthGrid(
 private fun RecordEditorDialog(
     initialDate: String,
     record: ClinicalRecordEntity?,
+    memberId: Long,
     conditions: List<ConditionEntity>,
     onSave: (ClinicalRecordEntity, () -> Unit) -> Unit,
     onDismiss: () -> Unit
@@ -366,7 +380,10 @@ private fun RecordEditorDialog(
                             stage = stage,
                             symptoms = symptoms.trim(), diagnosis = diagnosis.trim(), treatment = treatment.trim(),
                             medicationNotes = medicationNotes.trim(), hospital = hospital.trim(), clinician = clinician.trim(), notes = notes.trim(),
-                                createdAt = record?.createdAt ?: now, updatedAt = now
+                                createdAt = record?.createdAt ?: now,
+                                updatedAt = now,
+                                uuid = record?.uuid ?: java.util.UUID.randomUUID().toString(),
+                                memberId = memberId
                             )
                         ) { submitting = false }
                     }
@@ -402,10 +419,13 @@ private fun RecordDetailDialog(
     var viewer by remember { mutableStateOf<AttachmentEntity?>(null) }
     var cameraUriText by rememberSaveable { mutableStateOf<String?>(null) }
     val context = LocalContext.current
+    val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        appLockManager.endExternalActivity()
         if (uris.isNotEmpty()) viewModel.importAttachments(record.id, uris)
     }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+        appLockManager.endExternalActivity()
         if (success) cameraUriText?.let { viewModel.importAttachments(record.id, listOf(Uri.parse(it))) }
         cameraUriText = null
     }
@@ -421,12 +441,16 @@ private fun RecordDetailDialog(
                 HorizontalDivider()
                 Text("检查报告（${attachments.size}）", fontWeight = FontWeight.SemiBold)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { documentPicker.launch(arrayOf("image/*", "application/pdf")) }) {
+                    OutlinedButton(onClick = {
+                        appLockManager.beginExternalActivity()
+                        documentPicker.launch(arrayOf("image/*", "application/pdf"))
+                    }) {
                         Icon(Icons.Outlined.AttachFile, null); Text("选择文件")
                     }
                     OutlinedButton(onClick = {
                         val uri = createCameraUri(context)
                         cameraUriText = uri.toString()
+                        appLockManager.beginExternalActivity()
                         camera.launch(uri)
                     }) { Icon(Icons.Outlined.CameraAlt, null); Text("拍照") }
                 }
@@ -453,7 +477,7 @@ private fun DetailLine(label: String, value: String) {
 }
 
 @Composable
-private fun ConditionManagerDialog(conditions: List<ConditionEntity>, viewModel: AppViewModel, onDismiss: () -> Unit) {
+private fun ConditionManagerDialog(conditions: List<ConditionEntity>, memberId: Long, viewModel: AppViewModel, onDismiss: () -> Unit) {
     var name by remember { mutableStateOf("") }
     var adding by remember { mutableStateOf(false) }
     AlertDialog(
@@ -468,7 +492,7 @@ private fun ConditionManagerDialog(conditions: List<ConditionEntity>, viewModel:
                         if (name.isNotBlank()) {
                             adding = true
                             viewModel.saveCondition(
-                                ConditionEntity(name = name.trim(), createdAt = Instant.now().toString()),
+                                ConditionEntity(name = name.trim(), createdAt = Instant.now().toString(), memberId = memberId),
                                 { name = ""; adding = false },
                                 { adding = false }
                             )

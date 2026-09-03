@@ -56,14 +56,89 @@ class SharedCoreTest {
         assertEquals(0, MergePlanner.preview(merged, imported).additions)
     }
 
+    @Test
+    fun legacyV2PortableBackupStillDecodesBeforeMemberMapping() {
+        val current = snapshot(recordTitle = "旧版记录")
+        val legacy = current.copy(
+            schemaVersion = LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION,
+            members = emptyList(),
+            conditions = current.conditions.map { it.copy(memberUuid = null) },
+            records = current.records.map { it.copy(memberUuid = null) }
+        )
+        assertEquals(LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION, PortableJson.decode(PortableJson.encode(legacy)).schemaVersion)
+    }
+
+    @Test
+    fun crossMemberConditionReferenceIsRejected() {
+        val current = snapshot(recordTitle = "复查")
+        val other = PortableFamilyMember(
+            "44444444-4444-4444-8444-444444444444", "李先生", "爸爸", "父亲", false,
+            "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z"
+        )
+        val invalid = current.copy(
+            members = current.members + other,
+            records = current.records.map { it.copy(memberUuid = other.uuid) }
+        )
+        assertFails { PortableSnapshotValidator.validate(invalid) }
+    }
+
+    @Test
+    fun backupWithOnlyArchivedMembersIsRejected() {
+        val invalid = snapshot(recordTitle = "复查").let { value ->
+            value.copy(members = value.members.map { it.copy(archived = true) })
+        }
+        assertFails { PortableSnapshotValidator.validate(invalid) }
+    }
+
+    @Test
+    fun duplicateMedicationSlotsAreRejectedBeforeDatabaseWrite() {
+        val current = snapshot(recordTitle = "复查")
+        val memberId = current.members.single().uuid
+        val medicationId = "55555555-5555-4555-8555-555555555555"
+        val medication = PortableMedication(
+            uuid = medicationId,
+            name = "药物",
+            doseAmount = "1",
+            doseUnit = "片",
+            instructions = "",
+            startDate = "2026-09-01",
+            mode = "SCHEDULED",
+            archived = false,
+            createdAt = "2026-09-01T00:00:00Z",
+            updatedAt = "2026-09-01T00:00:00Z",
+            memberUuid = memberId
+        )
+        fun log(uuid: String) = PortableMedicationLog(
+            uuid = uuid,
+            medicationUuid = medicationId,
+            scheduledAt = "2026-09-03T08:00",
+            status = "TAKEN",
+            doseAmountSnapshot = "1",
+            doseUnitSnapshot = "片",
+            createdAt = "2026-09-03T00:00:00Z"
+        )
+        val invalid = current.copy(
+            medications = listOf(medication),
+            medicationLogs = listOf(
+                log("66666666-6666-4666-8666-666666666666"),
+                log("77777777-7777-4777-8777-777777777777")
+            )
+        )
+        assertFails { PortableSnapshotValidator.validate(invalid) }
+    }
+
     private fun snapshot(recordTitle: String, exportedAt: String = "2026-09-03T00:00:00Z"): PortableSnapshot {
         val conditionId = "11111111-1111-4111-8111-111111111111"
+        val memberId = "33333333-3333-4333-8333-333333333333"
         return PortableSnapshot(
             exportedAt = exportedAt,
             sourcePlatform = "test",
             sourceInstallationId = "00000000-0000-4000-8000-000000000001",
+            members = listOf(
+                PortableFamilyMember(memberId, "张女士", "妈妈", "母亲", false, "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z")
+            ),
             conditions = listOf(
-                PortableCondition(conditionId, "乳腺", 0, "", false, "2026-09-01T00:00:00Z")
+                PortableCondition(conditionId, "乳腺", 0, "", false, "2026-09-01T00:00:00Z", memberUuid = memberId)
             ),
             records = listOf(
                 PortableClinicalRecord(
@@ -80,7 +155,8 @@ class SharedCoreTest {
                     clinician = "",
                     notes = "",
                     createdAt = "2026-09-03T00:00:00Z",
-                    updatedAt = "2026-09-03T00:00:00Z"
+                    updatedAt = "2026-09-03T00:00:00Z",
+                    memberUuid = memberId
                 )
             )
         )
