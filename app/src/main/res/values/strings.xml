@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">病程日历</string>
+    <string name="follow_up_channel">复查提醒</string>
+    <string name="medication_channel">用药提醒</string>
+</resources>
