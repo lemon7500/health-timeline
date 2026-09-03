@@ -1,0 +1,26 @@
+[
+  {
+    "name": "three months from July 9",
+    "rule": { "type": "EVERY_N_MONTHS", "interval": 3, "anchorDate": "2026-07-09", "anchorDayOfMonth": 9 },
+    "after": "2026-07-09",
+    "expected": "2026-10-09"
+  },
+  {
+    "name": "January 31 clamps to February",
+    "rule": { "type": "EVERY_N_MONTHS", "interval": 1, "anchorDate": "2025-01-31", "anchorDayOfMonth": 31 },
+    "after": "2025-01-31",
+    "expected": "2025-02-28"
+  },
+  {
+    "name": "anchor returns after short month",
+    "rule": { "type": "EVERY_N_MONTHS", "interval": 1, "anchorDate": "2025-01-31", "anchorDayOfMonth": 31 },
+    "after": "2025-02-28",
+    "expected": "2025-03-31"
+  },
+  {
+    "name": "weekly Thursday crosses year",
+    "rule": { "type": "EVERY_N_WEEKS", "interval": 1, "anchorDate": "2026-12-31", "anchorDayOfMonth": 31, "weekday": 4 },
+    "after": "2026-12-31",
+    "expected": "2027-01-07"
+  }
+]

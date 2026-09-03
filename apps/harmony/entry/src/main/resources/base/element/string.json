@@ -1,0 +1,7 @@
+{
+  "string": [
+    { "name": "app_name", "value": "病程日历" },
+    { "name": "module_desc", "value": "离线病程记录与提醒" },
+    { "name": "ability_desc", "value": "病程日历主界面" }
+  ]
+}

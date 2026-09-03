@@ -15,4 +15,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "HealthTimeline"
-include(":app")
+include(":androidApp")
+project(":androidApp").projectDir = file("apps/android/app")
+include(":shared:core")

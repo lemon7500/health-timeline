@@ -1,53 +1,64 @@
-# 病程日历
+# 病程日历 / Health Timeline
 
-一款完全离线的个人病程记录 Android 应用，适用于支持安装 Android APK 的华为、荣耀、Redmi、小米及其他 Android 手机。最低 Android 8.0，不支持 HarmonyOS NEXT 原生系统。
+[![build-and-test](https://github.com/lemon7500/health-timeline/actions/workflows/ci.yml/badge.svg)](https://github.com/lemon7500/health-timeline/actions/workflows/ci.yml)
 
-## 已实现功能
+一个完全离线、隐私优先的个人病程记录项目，覆盖 Android、iPhone/iPad 与 HarmonyOS NEXT。项目不提供诊断或处方建议，也不连接医院系统。
 
-- 月历中的每条病历使用独立浅色圆角标签，标题最多显示两行；每天最多显示两条和 `+N`。
-- 日历支持按标题、分类、症状、诊断、治疗、用药、医院、医生和备注搜索，点击结果可定位日期。
-- 记录就诊前后病情、诊断、治疗、医院、医生、用药和备注。
-- 每份病历可保存多张图片和多个 PDF，并在应用内查看。
-- 一次性、每 N 天、每 N 周指定星期、每 N 月锚点复查提醒。
-- 每日多个服药时间、通知快捷打卡、已服/跳过记录和剂量历史快照。
-- 数据库 SQLCipher 加密，密钥由 Android Keystore 保护。
-- 无网络权限；附件位于应用私有目录，锁屏通知隐藏医疗详情。
-- 密码加密的完整备份与事务式恢复，包含附件校验。
+## 平台状态
 
-## 工程结构
+| 平台 | 技术 | 当前状态 |
+|---|---|---|
+| Android 8+ | Kotlin、Jetpack Compose、Room、SQLCipher | 1.1.0 可构建；原 1.0.2 数据使用正式迁移保留 |
+| iOS/iPadOS 16+ | SwiftUI、SQLCipher、Keychain、PDFKit | 功能原型源码；尚未达到客户发布标准，需 macOS CI 与真机继续开发验证 |
+| HarmonyOS NEXT | ArkTS、ArkUI、加密 RDB | 功能原型源码；尚未达到客户发布标准，需 DevEco Studio、账号和设备继续开发验证 |
+| 共享核心 | Kotlin Multiplatform | 数据模型、校验、搜索、复查计算、合并规则已接入 Android |
 
-- `data/`：Room 实体、DAO、SQLCipher 数据库、附件存储和统一仓库。
-- `domain/`：复查重复规则与月末锚点计算。
-- `reminders/`：精确/降级闹钟、通知、开机与时区恢复。
-- `backup/`：AES-256-GCM 备份、PBKDF2 密钥派生、JSON 清单和附件校验。
-- `ui/`：日历、复查、用药、设置四个 Compose 页面。
+## Android 现有功能
 
-应用没有医疗决策能力，不提供诊断、处方、药物相互作用或剂量建议。
+- 月历标题显示两行、独立浅色圆角标签，每天最多两条和 `+N`。
+- 按标题、病情分类、症状、诊断、治疗、用药、医院、医生和备注搜索。
+- 保存就诊记录、多张图片和多个 PDF。
+- 一次性、每 N 天、每 N 周和每 N 月锚点复查提醒。
+- 每日多个服药时间、已服/跳过打卡和历史剂量快照。
+- 本地加密存储、锁屏隐私通知和无网络权限。
+- `.htbackup` v2 加密备份，导入前完整验证、按 UUID 去重并预览冲突。
 
-## 构建
+iOS 与 HarmonyOS NEXT 当前已完成原生工程、加密存储、主要页面和提醒原型；跨平台备份、完整附件流程、自动化测试和真机验收仍是待完成工作，不能把当前源码当作正式客户安装包。
 
-推荐用 Android Studio 打开本目录，使用 JDK 17 和 Android SDK 37 构建。
+## 仓库结构
 
-命令行：
+- `apps/android/app`：已发布 Android 客户端。
+- `apps/ios`：SwiftUI iPhone/iPad 客户端。
+- `apps/harmony`：HarmonyOS NEXT 原生客户端。
+- `shared/core`：Kotlin Multiplatform 共享业务规则。
+- `shared/spec`：备份 JSON Schema、加密容器说明和黄金测试向量。
+- `docs`：安装、隐私、安全和真机测试文档。
+
+给客户的简明说明见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
+
+## Android 构建
+
+使用 JDK 17 与 Android SDK 37：
 
 ```powershell
-./gradlew.bat testDebugUnitTest
-./gradlew.bat assembleDebug
-./gradlew.bat assembleRelease
+./gradlew.bat :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest
+./gradlew.bat :androidApp:assembleDebug
+./gradlew.bat :androidApp:assembleRelease
 ```
 
-自行发布签名版本时，可运行 `scripts/generate-release-keystore.ps1` 生成 `release-private/keystore.properties`。`release-private/` 已被 `.gitignore` 排除；发布密钥绝不能提交到 GitHub，并且必须单独安全备份。
+Windows 环境若遇到 Java loopback/pipe 错误，可运行 `scripts/test-windows.ps1`。自行发布时使用 `scripts/generate-release-keystore.ps1`；`release-private/` 不得提交，且必须单独安全备份。
+
+iOS 与鸿蒙构建方式分别见 `apps/ios/README.md` 和 `apps/harmony/README.md`。
+
+## 数据安全原则
+
+- 三端不申请网络权限，不包含账号、广告、统计或云同步。
+- Android 保持 `applicationId=com.healthtimeline.app` 和原发布签名；数据库禁止破坏性迁移。
+- 写入附件时先落临时文件、同步并校验 SHA-256，成功后才提交数据库引用。
+- 导入备份必须先验证密码、版本、空间、引用关系和全部附件；失败不得改变当前数据。
+- 合并冲突默认保留本机。整体替换属于高级操作，Android 会先保留自动安全备份。
+- 卸载应用会删除应用私有数据，卸载前必须导出备份。
 
 ## 开源许可
 
-本项目采用 [Apache License 2.0](LICENSE) 开源。欢迎学习、修改和提交改进；使用本项目时请遵守许可证及所在地适用的法律法规。
-
-## 隐私和数据安全
-
-- 不声明 `INTERNET` 权限，不进行账号登录、云同步、统计或崩溃上报。
-- Android 应用沙箱和 SQLCipher 共同保护本地数据。
-- 数据库使用 WAL 与 `synchronous=FULL`，启动时执行完整性检查；不使用任何破坏性迁移或自动清库策略。
-- 附件先写入临时文件、同步到存储并校验格式与 SHA-256，成功后才建立数据库引用。
-- 恢复备份先完成全部验证，再安装到独立附件目录，最后用单个数据库事务切换；中断不会让当前数据引用半成品。
-- 加密备份密码不会保存，也无法找回。
-- 卸载应用会删除数据库和私有附件；卸载前必须导出备份。
+本项目采用 [Apache License 2.0](LICENSE)。
