@@ -1,0 +1,28 @@
+name: HealthTimeline
+options:
+  bundleIdPrefix: com.healthtimeline
+settings:
+  base:
+    SWIFT_VERSION: 5.10
+    IPHONEOS_DEPLOYMENT_TARGET: 16.0
+    CODE_SIGN_STYLE: Automatic
+packages:
+  ZIPFoundation:
+    url: https://github.com/weichsel/ZIPFoundation.git
+    from: 0.9.19
+targets:
+  HealthTimeline:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.healthtimeline.app.ios
+        INFOPLIST_FILE: Config/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Config/HealthTimeline-Bridging-Header.h
+        FRAMEWORK_SEARCH_PATHS: "$(inherited) ../../shared/core/build/bin/iosSimulatorArm64/debugFramework"
+    dependencies:
+      - package: ZIPFoundation
+      - framework: ../../shared/core/build/bin/iosSimulatorArm64/debugFramework/HealthTimelineCore.framework
+        embed: false

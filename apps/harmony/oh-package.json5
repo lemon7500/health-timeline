@@ -1,0 +1,9 @@
+{
+  name: 'health-timeline-harmony',
+  version: '1.1.0',
+  description: '病程日历 HarmonyOS NEXT 客户端',
+  main: '',
+  author: 'health-timeline contributors',
+  license: 'Apache-2.0',
+  dependencies: {}
+}
