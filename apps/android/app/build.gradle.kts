@@ -60,6 +60,9 @@ android {
         compose = true
         buildConfig = true
     }
+    sourceSets {
+        getByName("androidTest").assets.srcDir("$projectDir/schemas")
+    }
     packaging.resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
 }
 
