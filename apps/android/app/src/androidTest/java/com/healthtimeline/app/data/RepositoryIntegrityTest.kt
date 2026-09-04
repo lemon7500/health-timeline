@@ -169,6 +169,7 @@ class RepositoryIntegrityTest {
         assertEquals(2, conditions.map { it.uuid }.toSet().size)
         assertTrue(conditions.all { it.memberId == self.id })
         source.delete()
+        Unit
     }
 
     private companion object { const val NOW = "2026-09-01T00:00:00Z" }

@@ -210,9 +210,13 @@ abstract class AppDatabase : RoomDatabase() {
                 oldCounts.forEach { (table, count) ->
                     check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
                 }
+                val violations = mutableListOf<String>()
                 db.query("PRAGMA foreign_key_check").use { cursor ->
-                    check(!cursor.moveToFirst()) { "迁移后数据引用关系异常" }
+                    while (cursor.moveToNext()) {
+                        violations += "table=${cursor.getString(0)},rowId=${cursor.getLong(1)},parent=${cursor.getString(2)},fk=${cursor.getInt(3)}"
+                    }
                 }
+                check(violations.isEmpty()) { "迁移后数据引用关系异常：${violations.joinToString()}" }
             }
         }
 
