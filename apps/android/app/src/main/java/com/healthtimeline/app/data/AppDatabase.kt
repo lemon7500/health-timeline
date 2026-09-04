@@ -137,50 +137,53 @@ abstract class AppDatabase : RoomDatabase() {
                         "uuid TEXT NOT NULL, memberId INTEGER NOT NULL, " +
                         "FOREIGN KEY(memberId) REFERENCES family_members(id) ON UPDATE NO ACTION ON DELETE RESTRICT)"
                 )
+                // Child tables deliberately reference the final table names. Android's SQLite
+                // migration connection can use legacy ALTER TABLE behavior, which does not
+                // reliably rewrite foreign-key targets when the _new_* tables are renamed.
                 db.execSQL(
                     "CREATE TABLE _new_clinical_records (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, conditionId INTEGER, " +
                         "recordDate TEXT NOT NULL, title TEXT NOT NULL, stage TEXT NOT NULL, symptoms TEXT NOT NULL, " +
                         "diagnosis TEXT NOT NULL, treatment TEXT NOT NULL, medicationNotes TEXT NOT NULL, hospital TEXT NOT NULL, " +
                         "clinician TEXT NOT NULL, notes TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES _new_conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
+                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
                         "FOREIGN KEY(memberId) REFERENCES family_members(id) ON UPDATE NO ACTION ON DELETE RESTRICT)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_attachments (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, recordId INTEGER NOT NULL, " +
                         "kind TEXT NOT NULL, displayName TEXT NOT NULL, mimeType TEXT NOT NULL, relativePath TEXT NOT NULL, " +
                         "sizeBytes INTEGER NOT NULL, sha256 TEXT NOT NULL, createdAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "FOREIGN KEY(recordId) REFERENCES _new_clinical_records(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
+                        "FOREIGN KEY(recordId) REFERENCES clinical_records(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_follow_up_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, conditionId INTEGER, " +
                         "title TEXT NOT NULL, recurrenceType TEXT NOT NULL, interval INTEGER NOT NULL, anchorDate TEXT NOT NULL, " +
                         "anchorDayOfMonth INTEGER NOT NULL, weekday INTEGER, reminderTime TEXT NOT NULL, leadDays INTEGER NOT NULL, " +
                         "nextDueDate TEXT NOT NULL, enabled INTEGER NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES _new_conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
+                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
                         "FOREIGN KEY(memberId) REFERENCES family_members(id) ON UPDATE NO ACTION ON DELETE RESTRICT)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_follow_up_occurrences (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, scheduleId INTEGER NOT NULL, " +
                         "dueDate TEXT NOT NULL, status TEXT NOT NULL, completedAt TEXT, createdAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "FOREIGN KEY(scheduleId) REFERENCES _new_follow_up_schedules(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
+                        "FOREIGN KEY(scheduleId) REFERENCES follow_up_schedules(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_medications (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, conditionId INTEGER, name TEXT NOT NULL, " +
                         "doseAmount TEXT NOT NULL, doseUnit TEXT NOT NULL, instructions TEXT NOT NULL, startDate TEXT NOT NULL, endDate TEXT, " +
                         "mode TEXT NOT NULL, archived INTEGER NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES _new_conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
+                        "memberId INTEGER NOT NULL, FOREIGN KEY(conditionId) REFERENCES conditions(id) ON UPDATE NO ACTION ON DELETE SET NULL, " +
                         "FOREIGN KEY(memberId) REFERENCES family_members(id) ON UPDATE NO ACTION ON DELETE RESTRICT)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_medication_schedules (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, medicationId INTEGER NOT NULL, " +
                         "localTime TEXT NOT NULL, enabled INTEGER NOT NULL, uuid TEXT NOT NULL, " +
-                        "FOREIGN KEY(medicationId) REFERENCES _new_medications(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
+                        "FOREIGN KEY(medicationId) REFERENCES medications(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
                 )
                 db.execSQL(
                     "CREATE TABLE _new_medication_logs (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, medicationId INTEGER NOT NULL, " +
                         "scheduleId INTEGER, scheduledAt TEXT NOT NULL, actualAt TEXT, status TEXT NOT NULL, doseAmountSnapshot TEXT NOT NULL, " +
                         "doseUnitSnapshot TEXT NOT NULL, createdAt TEXT NOT NULL, uuid TEXT NOT NULL, " +
-                        "FOREIGN KEY(medicationId) REFERENCES _new_medications(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
+                        "FOREIGN KEY(medicationId) REFERENCES medications(id) ON UPDATE NO ACTION ON DELETE CASCADE)"
                 )
 
                 db.execSQL("INSERT INTO _new_conditions SELECT id,name,color,notes,archived,createdAt,uuid,1 FROM conditions")
