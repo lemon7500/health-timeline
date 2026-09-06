@@ -2,6 +2,7 @@ package com.healthtimeline.app.data
 
 import android.net.Uri
 import androidx.room.withTransaction
+import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.RecurrenceCalculator
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -12,6 +13,17 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
+
+sealed interface RecordConditionResolution {
+    data object Selected : RecordConditionResolution
+    data class Create(val name: String) : RecordConditionResolution
+    data class Restore(val conditionId: Long) : RecordConditionResolution
+}
+
+data class ClinicalRecordSaveRequest(
+    val record: ClinicalRecordEntity,
+    val conditionResolution: RecordConditionResolution = RecordConditionResolution.Selected
+)
 
 class HealthRepository(
     val database: AppDatabase,
@@ -143,16 +155,64 @@ class HealthRepository(
 
     suspend fun archiveCondition(id: Long) = mutationMutex.withLock { conditions.archive(id) }
 
-    suspend fun saveRecord(value: ClinicalRecordEntity): Long = mutationMutex.withLock {
+    suspend fun saveRecord(
+        value: ClinicalRecordEntity,
+        conditionResolution: RecordConditionResolution = RecordConditionResolution.Selected
+    ): Long = mutationMutex.withLock {
         database.withTransaction {
-            requireActiveMember(value.memberId)
-            requireConditionForMember(value.conditionId, value.memberId)
-            if (value.id == 0L) records.insert(value) else {
-                val existing = requireNotNull(records.byId(value.id)) { "病历不存在" }
-                require(existing.memberId == value.memberId) { "不能更改病历所属成员" }
-                require(existing.uuid == value.uuid) { "不能更改病历永久标识" }
-                records.update(value); value.id
+            saveRecordInTransaction(value, conditionResolution)
+        }
+    }
+
+    suspend fun saveRecords(requests: List<ClinicalRecordSaveRequest>): List<Long> = mutationMutex.withLock {
+        require(requests.isNotEmpty()) { "没有可保存的病历" }
+        require(requests.size <= ClinicalRecordQuickParser.MAX_BATCH_RECORDS) { "一次保存的病历过多" }
+        database.withTransaction {
+            requests.map { saveRecordInTransaction(it.record, it.conditionResolution) }
+        }
+    }
+
+    private suspend fun saveRecordInTransaction(
+        value: ClinicalRecordEntity,
+        conditionResolution: RecordConditionResolution
+    ): Long {
+        requireActiveMember(value.memberId)
+        val resolvedConditionId = when (conditionResolution) {
+            RecordConditionResolution.Selected -> value.conditionId
+            is RecordConditionResolution.Create -> {
+                val name = conditionResolution.name.trim()
+                require(name.isNotBlank() && name.length <= 50) { "病情分类须为 1 至 50 个字符" }
+                val normalizedName = ClinicalRecordQuickParser.normalizeConditionName(name)
+                val existing = conditions.all().firstOrNull {
+                    it.memberId == value.memberId &&
+                        ClinicalRecordQuickParser.normalizeConditionName(it.name) == normalizedName
+                }
+                require(existing?.archived != true) { "同名病情分类已归档，请先选择恢复并使用" }
+                existing?.id ?: conditions.insert(
+                    ConditionEntity(
+                        name = name,
+                        createdAt = Instant.now().toString(),
+                        memberId = value.memberId
+                    )
+                )
             }
+            is RecordConditionResolution.Restore -> {
+                val condition = requireNotNull(conditions.byId(conditionResolution.conditionId)) {
+                    "要恢复的病情分类不存在"
+                }
+                require(condition.memberId == value.memberId) { "不能使用其他成员的病情分类" }
+                if (condition.archived) conditions.update(condition.copy(archived = false))
+                condition.id
+            }
+        }
+        requireConditionForMember(resolvedConditionId, value.memberId)
+        val resolvedValue = value.copy(conditionId = resolvedConditionId)
+        return if (resolvedValue.id == 0L) records.insert(resolvedValue) else {
+            val existing = requireNotNull(records.byId(value.id)) { "病历不存在" }
+            require(existing.memberId == resolvedValue.memberId) { "不能更改病历所属成员" }
+            require(existing.uuid == resolvedValue.uuid) { "不能更改病历永久标识" }
+            records.update(resolvedValue)
+            resolvedValue.id
         }
     }
 

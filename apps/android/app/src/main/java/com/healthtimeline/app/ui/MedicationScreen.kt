@@ -1,13 +1,20 @@
 package com.healthtimeline.app.ui
 
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -16,6 +23,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 
 @Composable
 fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
@@ -130,7 +138,11 @@ private fun MedicationEditorDialog(
     var start by remember(existing) { mutableStateOf(existing?.startDate ?: LocalDate.now().toString()) }
     var end by remember(existing) { mutableStateOf(existing?.endDate.orEmpty()) }
     var mode by remember(existing) { mutableStateOf(existing?.mode ?: MedicationMode.SCHEDULED.name) }
-    var times by remember(existing) { mutableStateOf((existingTimes.ifEmpty { listOf(LocalTime.of(8, 0), LocalTime.of(20, 0)) }).joinToString(",") { it.toString() }) }
+    var times by remember(existing, existingTimes) {
+        mutableStateOf(existingTimes.ifEmpty { listOf(LocalTime.of(8, 0), LocalTime.of(20, 0)) }.distinct().sorted())
+    }
+    var timePickerTarget by remember(existing) { mutableStateOf<Int?>(null) }
+    var addingTime by remember(existing) { mutableStateOf(false) }
     var conditionId by remember(existing) { mutableStateOf(existing?.conditionId) }
     var error by remember { mutableStateOf<String?>(null) }
     var submitting by remember(existing) { mutableStateOf(false) }
@@ -153,7 +165,44 @@ private fun MedicationEditorDialog(
                 }
                 LabeledDropdown("记录方式", mode, listOf(MedicationMode.SCHEDULED.name to "每日定时", MedicationMode.AS_NEEDED.name to "按需记录"), { mode = it })
                 if (mode == MedicationMode.SCHEDULED.name) {
-                    OutlinedTextField(times, { times = it.take(100) }, label = { Text("时间，用逗号分隔（如 08:00,20:00）") }, modifier = Modifier.fillMaxWidth())
+                    Text("每日提醒时间", style = MaterialTheme.typography.labelLarge)
+                    times.forEachIndexed { index, time ->
+                        OutlinedCard(
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                timePickerTarget = index
+                                addingTime = false
+                            }
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(time.format(TIME_FORMATTER), fontWeight = FontWeight.SemiBold)
+                                Row {
+                                    TextButton(onClick = {
+                                        timePickerTarget = index
+                                        addingTime = false
+                                    }) { Text("修改") }
+                                    TextButton(onClick = { times = times.filterIndexed { itemIndex, _ -> itemIndex != index } }) {
+                                        Text("删除", color = MaterialTheme.colorScheme.error)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            addingTime = true
+                            timePickerTarget = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("+ 添加提醒时间") }
+                    Text(
+                        "上下滑动选择时间，分钟以 5 分钟为间隔",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
                 OutlinedTextField(instructions, { instructions = it.take(1000) }, label = { Text("服用说明") }, minLines = 2, modifier = Modifier.fillMaxWidth())
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
@@ -164,14 +213,12 @@ private fun MedicationEditorDialog(
                 if (submitting) return@save
                 val startDate = runCatching { LocalDate.parse(start) }.getOrNull()
                 val endDate = if (end.isBlank()) null else runCatching { LocalDate.parse(end) }.getOrNull()
-                val timeTokens = if (mode == MedicationMode.AS_NEEDED.name) emptyList() else times.split(',', '，').map { it.trim() }.filter { it.isNotEmpty() }
-                val parsedTimes = timeTokens.mapNotNull { runCatching { LocalTime.parse(it) }.getOrNull() }
+                val parsedTimes = if (mode == MedicationMode.AS_NEEDED.name) emptyList() else times.distinct().sorted()
                 when {
                     name.isBlank() || amount.isBlank() || unit.isBlank() -> error = "请填写药名、剂量和单位"
                     startDate == null -> error = "开始日期格式不正确"
                     end.isNotBlank() && endDate == null -> error = "结束日期格式不正确"
                     endDate != null && endDate.isBefore(startDate) -> error = "结束日期不能早于开始日期"
-                    parsedTimes.size != timeTokens.size -> error = "存在无效时间，请使用 HH:mm 格式"
                     mode == MedicationMode.SCHEDULED.name && parsedTimes.isEmpty() -> error = "至少填写一个有效时间"
                     else -> {
                         submitting = true
@@ -193,4 +240,147 @@ private fun MedicationEditorDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !submitting) { Text("取消") } }
     )
+
+    if (addingTime || timePickerTarget != null) {
+        val initial = timePickerTarget?.let { times[it] } ?: roundToFiveMinutes(LocalTime.now())
+        MedicationTimePickerDialog(
+            initial = initial,
+            onConfirm = { selected ->
+                val duplicate = times.withIndex().any { (index, value) ->
+                    value == selected && index != timePickerTarget
+                }
+                if (duplicate) {
+                    error = "这个提醒时间已经添加"
+                } else {
+                    times = if (timePickerTarget == null) {
+                        (times + selected).distinct().sorted()
+                    } else {
+                        times.mapIndexed { index, value -> if (index == timePickerTarget) selected else value }
+                            .distinct().sorted()
+                    }
+                }
+                addingTime = false
+                timePickerTarget = null
+            },
+            onDismiss = {
+                addingTime = false
+                timePickerTarget = null
+            }
+        )
+    }
+}
+
+private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+internal val MEDICATION_MINUTE_OPTIONS: List<Int> = (0..55 step 5).toList()
+
+internal fun roundToFiveMinutes(time: LocalTime): LocalTime {
+    val roundedMinute = ((time.minute + 2) / 5) * 5
+    return if (roundedMinute == 60) {
+        LocalTime.of((time.hour + 1) % 24, 0)
+    } else {
+        LocalTime.of(time.hour, roundedMinute)
+    }
+}
+
+@Composable
+private fun MedicationTimePickerDialog(
+    initial: LocalTime,
+    onConfirm: (LocalTime) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var hour by remember(initial) { mutableIntStateOf(initial.hour) }
+    var minute by remember(initial) { mutableIntStateOf((initial.minute / 5) * 5) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择提醒时间") },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    "%02d:%02d".format(hour, minute),
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    WheelPicker(
+                        values = (0..23).toList(),
+                        selected = hour,
+                        suffix = "时",
+                        onSelected = { hour = it },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text("：", style = MaterialTheme.typography.headlineSmall)
+                    WheelPicker(
+                        values = MEDICATION_MINUTE_OPTIONS,
+                        selected = minute,
+                        suffix = "分",
+                        onSelected = { minute = it },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    "上下滑动，分钟间隔为 5 分钟",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onConfirm(LocalTime.of(hour, minute)) }) { Text("确定") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun WheelPicker(
+    values: List<Int>,
+    selected: Int,
+    suffix: String,
+    onSelected: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val initialIndex = values.indexOf(selected).coerceAtLeast(0)
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = initialIndex)
+    val flingBehavior = rememberSnapFlingBehavior(listState)
+    LaunchedEffect(listState, values) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) {
+                val layout = listState.layoutInfo
+                val center = (layout.viewportStartOffset + layout.viewportEndOffset) / 2
+                val closest = layout.visibleItemsInfo.minByOrNull { item ->
+                    abs(item.offset + item.size / 2 - center)
+                }
+                closest?.index?.let { index -> values.getOrNull(index)?.let(onSelected) }
+            }
+        }
+    }
+    Box(modifier.height(144.dp)) {
+        LazyColumn(
+            state = listState,
+            flingBehavior = flingBehavior,
+            contentPadding = PaddingValues(vertical = 48.dp),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            itemsIndexed(values, key = { _, value -> value }) { index, value ->
+                Text(
+                    text = "%02d $suffix".format(value),
+                    textAlign = TextAlign.Center,
+                    style = if (value == selected) MaterialTheme.typography.titleLarge else MaterialTheme.typography.bodyLarge,
+                    color = if (value == selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().height(48.dp).wrapContentHeight(Alignment.CenterVertically)
+                        .clickable {
+                            onSelected(value)
+                        }
+                )
+            }
+        }
+        Column(Modifier.matchParentSize(), verticalArrangement = Arrangement.Center) {
+            HorizontalDivider()
+            Spacer(Modifier.height(48.dp))
+            HorizontalDivider()
+        }
+    }
 }

@@ -152,6 +152,141 @@ class RepositoryIntegrityTest {
         assertEquals(self.uuid, database.familyMemberDao().byId(self.id)!!.uuid)
     }
 
+    @Test fun quickEntryCreatesConditionAndRecordInOneSave() = runBlocking {
+        val self = repository.ensureDefaultMember()
+        val recordId = repository.saveRecord(
+            ClinicalRecordEntity(
+                memberId = self.id,
+                recordDate = "2026-09-06",
+                title = "上颌窦炎术后复查",
+                createdAt = NOW,
+                updatedAt = NOW
+            ),
+            RecordConditionResolution.Create("上颌窦炎")
+        )
+
+        val condition = database.conditionDao().all().single()
+        assertEquals("上颌窦炎", condition.name)
+        assertEquals(condition.id, database.clinicalRecordDao().byId(recordId)?.conditionId)
+        assertEquals(self.id, condition.memberId)
+    }
+
+    @Test fun quickEntryReusesNormalizedActiveCondition() = runBlocking {
+        val self = repository.ensureDefaultMember()
+        val conditionId = repository.saveCondition(
+            ConditionEntity(name = " 上颌 窦炎 ", createdAt = NOW, memberId = self.id)
+        )
+        val recordId = repository.saveRecord(
+            ClinicalRecordEntity(
+                memberId = self.id,
+                recordDate = "2026-09-06",
+                title = "复查",
+                createdAt = NOW,
+                updatedAt = NOW
+            ),
+            RecordConditionResolution.Create("上颌窦炎")
+        )
+
+        assertEquals(1, database.conditionDao().all().size)
+        assertEquals(conditionId, database.clinicalRecordDao().byId(recordId)?.conditionId)
+    }
+
+    @Test fun quickEntryRestoresArchivedConditionWithRecord() = runBlocking {
+        val self = repository.ensureDefaultMember()
+        val conditionId = repository.saveCondition(
+            ConditionEntity(name = "乳腺复查", createdAt = NOW, memberId = self.id)
+        )
+        repository.archiveCondition(conditionId)
+
+        val recordId = repository.saveRecord(
+            ClinicalRecordEntity(
+                memberId = self.id,
+                recordDate = "2026-09-06",
+                title = "定期复查",
+                createdAt = NOW,
+                updatedAt = NOW
+            ),
+            RecordConditionResolution.Restore(conditionId)
+        )
+
+        assertFalse(database.conditionDao().byId(conditionId)!!.archived)
+        assertEquals(conditionId, database.clinicalRecordDao().byId(recordId)?.conditionId)
+    }
+
+    @Test fun failedQuickEntryRecordSaveRollsBackNewCondition() = runBlocking {
+        val self = repository.ensureDefaultMember()
+        val duplicateUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        repository.saveRecord(
+            ClinicalRecordEntity(
+                memberId = self.id,
+                recordDate = "2026-09-05",
+                title = "已有记录",
+                createdAt = NOW,
+                updatedAt = NOW,
+                uuid = duplicateUuid
+            )
+        )
+
+        val result = runCatching {
+            repository.saveRecord(
+                ClinicalRecordEntity(
+                    memberId = self.id,
+                    recordDate = "2026-09-06",
+                    title = "重复 UUID",
+                    createdAt = NOW,
+                    updatedAt = NOW,
+                    uuid = duplicateUuid
+                ),
+                RecordConditionResolution.Create("不应留下的分类")
+            )
+        }
+
+        assertTrue(result.isFailure)
+        assertTrue(database.conditionDao().all().isEmpty())
+        assertEquals(1, database.clinicalRecordDao().all().size)
+    }
+
+    @Test fun failedBatchQuickEntryRollsBackEveryRecordAndCondition() = runBlocking {
+        val self = repository.ensureDefaultMember()
+        val duplicateUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        repository.saveRecord(
+            ClinicalRecordEntity(
+                memberId = self.id,
+                recordDate = "2026-09-01",
+                title = "原记录",
+                createdAt = NOW,
+                updatedAt = NOW,
+                uuid = duplicateUuid
+            )
+        )
+        val requests = listOf(
+            ClinicalRecordSaveRequest(
+                ClinicalRecordEntity(
+                    memberId = self.id,
+                    recordDate = "2026-09-06",
+                    title = "第一条",
+                    createdAt = NOW,
+                    updatedAt = NOW
+                ),
+                RecordConditionResolution.Create("批量分类")
+            ),
+            ClinicalRecordSaveRequest(
+                ClinicalRecordEntity(
+                    memberId = self.id,
+                    recordDate = "2026-09-07",
+                    title = "第二条失败",
+                    createdAt = NOW,
+                    updatedAt = NOW,
+                    uuid = duplicateUuid
+                )
+            )
+        )
+
+        assertTrue(runCatching { repository.saveRecords(requests) }.isFailure)
+        assertTrue(database.conditionDao().all().isEmpty())
+        assertEquals(listOf("原记录"), database.clinicalRecordDao().all().map { it.title })
+    }
+
     @Test fun legacyBackupCanBeAppendedAsNewWithoutOverwritingLocalData() = runBlocking {
         val self = repository.ensureDefaultMember()
         val originalId = repository.saveCondition(

@@ -1,6 +1,7 @@
 package com.healthtimeline.app.ui
 
 import android.content.Context
+import android.content.ClipboardManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,6 +35,10 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.HealthTimelineApplication
+import com.healthtimeline.app.domain.ClinicalRecordQuickParser
+import com.healthtimeline.app.domain.IssueSeverity
+import com.healthtimeline.app.domain.ParsedClinicalRecordDraft
+import com.healthtimeline.app.domain.QuickEntryIssue
 import java.io.File
 import java.time.Instant
 import java.time.LocalDate
@@ -173,9 +178,21 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
             initialDate = selectedDate,
             record = editing,
             memberId = editing?.memberId ?: requireNotNull(createForMemberId),
-            conditions = conditions.filter { !it.archived },
-            onSave = { value, onFailed ->
-                viewModel.saveRecord(value, { createForMemberId = null; editing = null }, onFailed)
+            conditions = conditions,
+            onSave = { value, conditionResolution, onFailed ->
+                viewModel.saveRecord(
+                    value = value,
+                    conditionResolution = conditionResolution,
+                    onSaved = { createForMemberId = null; editing = null },
+                    onFailed = onFailed
+                )
+            },
+            onSaveBatch = { requests, onFailed ->
+                viewModel.saveRecords(
+                    requests = requests,
+                    onSaved = { createForMemberId = null; editing = null },
+                    onFailed = onFailed
+                )
             },
             onDismiss = { createForMemberId = null; editing = null }
         )
@@ -316,7 +333,8 @@ private fun RecordEditorDialog(
     record: ClinicalRecordEntity?,
     memberId: Long,
     conditions: List<ConditionEntity>,
-    onSave: (ClinicalRecordEntity, () -> Unit) -> Unit,
+    onSave: (ClinicalRecordEntity, RecordConditionResolution, () -> Unit) -> Unit,
+    onSaveBatch: (List<ClinicalRecordSaveRequest>, () -> Unit) -> Unit,
     onDismiss: () -> Unit
 ) {
     var date by remember(record) { mutableStateOf(record?.recordDate ?: initialDate) }
@@ -332,21 +350,315 @@ private fun RecordEditorDialog(
     var notes by remember(record) { mutableStateOf(record?.notes.orEmpty()) }
     var error by remember { mutableStateOf<String?>(null) }
     var submitting by remember(record) { mutableStateOf(false) }
+    var quickExpanded by remember(record) { mutableStateOf(record == null) }
+    var quickInput by remember(record) { mutableStateOf("") }
+    var quickIssues by remember(record) { mutableStateOf<List<QuickEntryIssue>>(emptyList()) }
+    var unrecognizedSegments by remember(record) { mutableStateOf<List<String>>(emptyList()) }
+    var quickApplied by remember(record) { mutableStateOf(false) }
+    var batchDrafts by remember(record) { mutableStateOf<List<ParsedClinicalRecordDraft>>(emptyList()) }
+    var appendBatchUnknownToNotes by remember(record) { mutableStateOf(false) }
+    var confirmBatchSave by remember(record) { mutableStateOf(false) }
+    var conditionResolution by remember(record) {
+        mutableStateOf<RecordConditionResolution>(RecordConditionResolution.Selected)
+    }
+    var pendingNewCondition by remember(record) { mutableStateOf<String?>(null) }
+    var pendingArchivedCondition by remember(record) { mutableStateOf<ConditionEntity?>(null) }
     val now = Instant.now().toString()
+    val context = LocalContext.current
+    val selectableConditions = conditions.filter { !it.archived || it.id == record?.conditionId }
 
     AlertDialog(
         onDismissRequest = { if (!submitting) onDismiss() },
         title = { Text(if (record == null) "新增病情记录" else "编辑病情记录") },
         text = {
             Column(Modifier.fillMaxWidth().heightIn(max = 560.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (record == null) {
+                    ElevatedCard(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                Modifier.fillMaxWidth().clickable { quickExpanded = !quickExpanded },
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("快速录入", fontWeight = FontWeight.SemiBold)
+                                    Text(
+                                        "粘贴带字段标签的文字，解析后请核对再保存",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Text(if (quickExpanded) "收起" else "展开", color = MaterialTheme.colorScheme.primary)
+                            }
+                            if (quickExpanded) {
+                                OutlinedTextField(
+                                    value = quickInput,
+                                    onValueChange = {
+                                        quickInput = it
+                                        quickApplied = false
+                                        batchDrafts = emptyList()
+                                    },
+                                    label = { Text("病历文字（最多 50,000 字）") },
+                                    minLines = 5,
+                                    maxLines = 10,
+                                    supportingText = { Text("${quickInput.length} / ${ClinicalRecordQuickParser.MAX_INPUT_LENGTH}") },
+                                    isError = quickInput.length > ClinicalRecordQuickParser.MAX_INPUT_LENGTH,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            val clipboard = context.getSystemService(ClipboardManager::class.java)
+                                            val text = clipboard?.primaryClip
+                                                ?.takeIf { it.itemCount > 0 }
+                                                ?.getItemAt(0)
+                                                ?.coerceToText(context)
+                                                ?.toString()
+                                                .orEmpty()
+                                            if (text.isBlank()) {
+                                                quickIssues = listOf(
+                                                    QuickEntryIssue(
+                                                        IssueSeverity.ERROR,
+                                                        null,
+                                                        "EMPTY_CLIPBOARD",
+                                                        "剪贴板中没有可粘贴的文字"
+                                                    )
+                                                )
+                                            } else {
+                                                quickInput = text
+                                                quickIssues = emptyList()
+                                                unrecognizedSegments = emptyList()
+                                                quickApplied = false
+                                                batchDrafts = emptyList()
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("从剪贴板粘贴") }
+                                    OutlinedButton(
+                                        onClick = {
+                                            val templateDate = runCatching { LocalDate.parse(date) }
+                                                .getOrDefault(LocalDate.now())
+                                            quickInput = ClinicalRecordQuickParser.templateFor(templateDate)
+                                            quickIssues = emptyList()
+                                            unrecognizedSegments = emptyList()
+                                            quickApplied = false
+                                            batchDrafts = emptyList()
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("插入模板") }
+                                }
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = {
+                                            val batch = ClinicalRecordQuickParser.parseMany(quickInput)
+                                            val draft = batch.records.singleOrNull()
+                                            quickIssues = batch.issues + (draft?.issues ?: emptyList())
+                                            unrecognizedSegments = draft?.unrecognizedSegments.orEmpty()
+                                            quickApplied = false
+                                            batchDrafts = emptyList()
+                                            appendBatchUnknownToNotes = false
+                                            pendingNewCondition = null
+                                            pendingArchivedCondition = null
+                                            if (batch.records.size > 1) {
+                                                batchDrafts = batch.records
+                                            } else if (draft != null && !draft.hasErrors) {
+                                                date = requireNotNull(draft.recordDate).toString()
+                                                title = requireNotNull(draft.title).trim()
+                                                stage = draft.stage?.name ?: VisitStage.OTHER.name
+                                                symptoms = draft.symptoms
+                                                diagnosis = draft.diagnosis
+                                                treatment = draft.treatment
+                                                medicationNotes = draft.medicationNotes
+                                                hospital = draft.hospital
+                                                clinician = draft.clinician
+                                                notes = draft.notes
+                                                conditionResolution = RecordConditionResolution.Selected
+                                                val requestedCondition = draft.conditionName?.trim().orEmpty()
+                                                val matched = requestedCondition.takeIf { it.isNotBlank() }?.let { requested ->
+                                                    val normalized = ClinicalRecordQuickParser.normalizeConditionName(requested)
+                                                    conditions.firstOrNull {
+                                                        ClinicalRecordQuickParser.normalizeConditionName(it.name) == normalized
+                                                    }
+                                                }
+                                                when {
+                                                    requestedCondition.isBlank() -> conditionId = null
+                                                    matched == null -> {
+                                                        conditionId = null
+                                                        pendingNewCondition = requestedCondition
+                                                    }
+                                                    matched.archived -> {
+                                                        conditionId = null
+                                                        pendingArchivedCondition = matched
+                                                    }
+                                                    else -> conditionId = matched.id
+                                                }
+                                                quickApplied = true
+                                                error = null
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("解析并填入") }
+                                    TextButton(
+                                        onClick = {
+                                            quickInput = ""
+                                            quickIssues = emptyList()
+                                            unrecognizedSegments = emptyList()
+                                            quickApplied = false
+                                            batchDrafts = emptyList()
+                                            appendBatchUnknownToNotes = false
+                                            pendingNewCondition = null
+                                            pendingArchivedCondition = null
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("清空") }
+                                }
+                                quickIssues.forEach { issue ->
+                                    Text(
+                                        text = buildString {
+                                            if (!issue.field.isNullOrBlank()) append("${issue.field}：")
+                                            append(issue.message)
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (issue.severity == IssueSeverity.ERROR) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.tertiary
+                                        }
+                                    )
+                                }
+                                if (unrecognizedSegments.isNotEmpty()) {
+                                    Text("未识别内容：", style = MaterialTheme.typography.labelMedium)
+                                    Text(
+                                        unrecognizedSegments.joinToString("\n"),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    TextButton(onClick = {
+                                        val addition = unrecognizedSegments.joinToString("\n")
+                                        val combined = listOf(notes, addition).filter { it.isNotBlank() }.joinToString("\n")
+                                        if (combined.length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH) {
+                                            quickIssues = quickIssues + QuickEntryIssue(
+                                                IssueSeverity.ERROR,
+                                                "其他备注",
+                                                "NOTES_TOO_LONG",
+                                                "追加后其他备注将超过 10,000 个字符"
+                                            )
+                                        } else {
+                                            notes = combined
+                                            unrecognizedSegments = emptyList()
+                                            quickIssues = quickIssues.filterNot { it.code == "UNRECOGNIZED_CONTENT" }
+                                        }
+                                    }) { Text("追加到其他备注") }
+                                }
+                                if (quickApplied) {
+                                    Text(
+                                        "已填入表单，请逐项核对；当前尚未保存。",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                if (batchDrafts.isNotEmpty()) {
+                                    val batchAppendTooLong = appendBatchUnknownToNotes && batchDrafts.any { draft ->
+                                        val addition = draft.unrecognizedSegments.joinToString("\n")
+                                        listOf(draft.notes, addition).filter { it.isNotBlank() }
+                                            .joinToString("\n").length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH
+                                    }
+                                    val batchHasErrors = batchDrafts.any { it.hasErrors } ||
+                                        quickIssues.any { it.severity == IssueSeverity.ERROR } || batchAppendTooLong
+                                    Text(
+                                        "已识别 ${batchDrafts.size} 条记录，请核对每条内容",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    batchDrafts.forEachIndexed { index, draft ->
+                                        OutlinedCard(Modifier.fillMaxWidth()) {
+                                            Column(
+                                                Modifier.fillMaxWidth().padding(10.dp),
+                                                verticalArrangement = Arrangement.spacedBy(3.dp)
+                                            ) {
+                                                Text(
+                                                    "${index + 1}. ${draft.recordDate ?: "日期有误"} · ${draft.title ?: "标题未填"}",
+                                                    fontWeight = FontWeight.SemiBold
+                                                )
+                                                draft.conditionName?.takeIf { it.isNotBlank() }?.let { Text("分类：$it") }
+                                                draft.symptoms.takeIf { it.isNotBlank() }?.let { Text("病情：$it", maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                                                draft.diagnosis.takeIf { it.isNotBlank() }?.let { Text("诊断：$it", maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                                                draft.issues.forEach { issue ->
+                                                    Text(
+                                                        issue.message,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = if (issue.severity == IssueSeverity.ERROR) {
+                                                            MaterialTheme.colorScheme.error
+                                                        } else {
+                                                            MaterialTheme.colorScheme.tertiary
+                                                        }
+                                                    )
+                                                }
+                                                if (draft.unrecognizedSegments.isNotEmpty()) {
+                                                    Text(
+                                                        "未识别：${draft.unrecognizedSegments.joinToString("；")}",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.tertiary
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (batchDrafts.any { it.unrecognizedSegments.isNotEmpty() }) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Checkbox(
+                                                checked = appendBatchUnknownToNotes,
+                                                onCheckedChange = { appendBatchUnknownToNotes = it }
+                                            )
+                                            Text("把每条未识别内容追加到该条的其他备注")
+                                        }
+                                    }
+                                    Button(
+                                        onClick = { confirmBatchSave = true },
+                                        enabled = !batchHasErrors && !submitting,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) { Text("核对并保存 ${batchDrafts.size} 条记录") }
+                                    if (batchHasErrors) {
+                                        Text(
+                                            if (batchAppendTooLong) "追加未识别内容后备注超过 10,000 字，请缩短原文"
+                                            else "请先修改有错误的原文并重新解析",
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 OutlinedTextField(date, { date = it.take(10) }, label = { Text("日期（YYYY-MM-DD）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(title, { title = it.take(100) }, label = { Text("小标题 *") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 LabeledDropdown(
                     "病情分类",
                     conditionId?.toString().orEmpty(),
-                    listOf("" to "未分类") + conditions.map { it.id.toString() to it.name },
-                    { conditionId = it.toLongOrNull() }
+                    listOf("" to "未分类") + selectableConditions.map { it.id.toString() to it.name },
+                    {
+                        conditionId = it.toLongOrNull()
+                        conditionResolution = RecordConditionResolution.Selected
+                        pendingNewCondition = null
+                        pendingArchivedCondition = null
+                    }
                 )
+                when (val resolution = conditionResolution) {
+                    is RecordConditionResolution.Create -> Text(
+                        "保存时将新建分类：${resolution.name}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    is RecordConditionResolution.Restore -> Text(
+                        "保存时将恢复分类：${conditions.firstOrNull { it.id == resolution.conditionId }?.name.orEmpty()}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    RecordConditionResolution.Selected -> Unit
+                }
                 LabeledDropdown(
                     "记录类型", stage,
                     VisitStage.entries.map { it.name to visitStageLabel(it.name) },
@@ -384,13 +696,164 @@ private fun RecordEditorDialog(
                                 updatedAt = now,
                                 uuid = record?.uuid ?: java.util.UUID.randomUUID().toString(),
                                 memberId = memberId
-                            )
+                            ),
+                            conditionResolution
                         ) { submitting = false }
                     }
                 }
-            }, enabled = !submitting) { Text(if (submitting) "保存中…" else "保存") }
+            }, enabled = !submitting && batchDrafts.isEmpty()) {
+                Text(
+                    when {
+                        submitting -> "保存中…"
+                        batchDrafts.isNotEmpty() -> "请在上方批量保存"
+                        else -> "保存"
+                    }
+                )
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !submitting) { Text("取消") } }
+    )
+
+    pendingNewCondition?.let { name ->
+        AlertDialog(
+            onDismissRequest = {
+                pendingNewCondition = null
+                conditionResolution = RecordConditionResolution.Selected
+            },
+            title = { Text("新建病情分类？") },
+            text = { Text("当前成员没有“$name”分类。确认后会在保存病历时一并新建；取消则按未分类保存。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    conditionResolution = RecordConditionResolution.Create(name)
+                    pendingNewCondition = null
+                }) { Text("保存时新建并使用") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    conditionId = null
+                    conditionResolution = RecordConditionResolution.Selected
+                    pendingNewCondition = null
+                }) { Text("不分类") }
+            }
+        )
+    }
+
+    pendingArchivedCondition?.let { archivedCondition ->
+        AlertDialog(
+            onDismissRequest = {
+                pendingArchivedCondition = null
+                conditionResolution = RecordConditionResolution.Selected
+            },
+            title = { Text("分类已归档") },
+            text = { Text("“${archivedCondition.name}”已经归档。可以在保存病历时恢复并使用，或将本条病历保存为未分类。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    conditionId = archivedCondition.id
+                    conditionResolution = RecordConditionResolution.Restore(archivedCondition.id)
+                    pendingArchivedCondition = null
+                }) { Text("恢复并使用") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    conditionId = null
+                    conditionResolution = RecordConditionResolution.Selected
+                    pendingArchivedCondition = null
+                }) { Text("不分类") }
+            }
+        )
+    }
+
+    if (confirmBatchSave && batchDrafts.isNotEmpty()) {
+        val requests = prepareQuickBatchRequests(
+            drafts = batchDrafts,
+            conditions = conditions,
+            memberId = memberId,
+            appendUnknownToNotes = appendBatchUnknownToNotes,
+            timestamp = now
+        )
+        val createNames = requests.mapNotNull {
+            (it.conditionResolution as? RecordConditionResolution.Create)?.name
+        }.distinct()
+        val restoreNames = requests.mapNotNull { request ->
+            (request.conditionResolution as? RecordConditionResolution.Restore)?.conditionId?.let { id ->
+                conditions.firstOrNull { it.id == id }?.name
+            }
+        }.distinct()
+        AlertDialog(
+            onDismissRequest = { if (!submitting) confirmBatchSave = false },
+            title = { Text("确认批量保存？") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("将为当前成员一次保存 ${requests.size} 条病历。全部成功才会写入；任意一条失败会整体回滚。")
+                    if (createNames.isNotEmpty()) Text("同时新建分类：${createNames.joinToString("、")}")
+                    if (restoreNames.isNotEmpty()) Text("同时恢复分类：${restoreNames.joinToString("、")}")
+                    Text("保存后仍可逐条编辑。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (!submitting) {
+                            submitting = true
+                            onSaveBatch(requests) {
+                                submitting = false
+                                confirmBatchSave = false
+                            }
+                        }
+                    },
+                    enabled = !submitting
+                ) { Text(if (submitting) "保存中…" else "确认保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmBatchSave = false }, enabled = !submitting) { Text("返回核对") }
+            }
+        )
+    }
+}
+
+private fun prepareQuickBatchRequests(
+    drafts: List<ParsedClinicalRecordDraft>,
+    conditions: List<ConditionEntity>,
+    memberId: Long,
+    appendUnknownToNotes: Boolean,
+    timestamp: String
+): List<ClinicalRecordSaveRequest> = drafts.map { draft ->
+    val conditionName = draft.conditionName?.trim().orEmpty()
+    val matched = conditionName.takeIf { it.isNotBlank() }?.let { requested ->
+        val normalized = ClinicalRecordQuickParser.normalizeConditionName(requested)
+        conditions.firstOrNull { ClinicalRecordQuickParser.normalizeConditionName(it.name) == normalized }
+    }
+    val resolution = when {
+        conditionName.isBlank() -> RecordConditionResolution.Selected
+        matched == null -> RecordConditionResolution.Create(conditionName)
+        matched.archived -> RecordConditionResolution.Restore(matched.id)
+        else -> RecordConditionResolution.Selected
+    }
+    val notes = if (appendUnknownToNotes) {
+        listOf(draft.notes, draft.unrecognizedSegments.joinToString("\n"))
+            .filter { it.isNotBlank() }
+            .joinToString("\n")
+    } else {
+        draft.notes
+    }
+    ClinicalRecordSaveRequest(
+        record = ClinicalRecordEntity(
+            conditionId = matched?.id,
+            recordDate = requireNotNull(draft.recordDate).toString(),
+            title = requireNotNull(draft.title).trim(),
+            stage = draft.stage?.name ?: VisitStage.OTHER.name,
+            symptoms = draft.symptoms.trim(),
+            diagnosis = draft.diagnosis.trim(),
+            treatment = draft.treatment.trim(),
+            medicationNotes = draft.medicationNotes.trim(),
+            hospital = draft.hospital.trim(),
+            clinician = draft.clinician.trim(),
+            notes = notes.trim(),
+            createdAt = timestamp,
+            updatedAt = timestamp,
+            memberId = memberId
+        ),
+        conditionResolution = resolution
     )
 }
 

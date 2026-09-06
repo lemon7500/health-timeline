@@ -114,8 +114,21 @@ class AppViewModel(
 
     fun archiveCondition(id: Long) = launch("归档病情分类") { repository.archiveCondition(id) }
 
-    fun saveRecord(value: ClinicalRecordEntity, onSaved: (Long) -> Unit = {}, onFailed: () -> Unit = {}) = launch("保存病历", onFailed) {
-        onSaved(repository.saveRecord(value))
+    fun saveRecord(
+        value: ClinicalRecordEntity,
+        conditionResolution: RecordConditionResolution = RecordConditionResolution.Selected,
+        onSaved: (Long) -> Unit = {},
+        onFailed: () -> Unit = {}
+    ) = launch("保存病历", onFailed) {
+        onSaved(repository.saveRecord(value, conditionResolution))
+    }
+
+    fun saveRecords(
+        requests: List<ClinicalRecordSaveRequest>,
+        onSaved: (List<Long>) -> Unit = {},
+        onFailed: () -> Unit = {}
+    ) = launch("批量保存病历", onFailed) {
+        onSaved(repository.saveRecords(requests))
     }
 
     fun deleteRecord(value: ClinicalRecordEntity) = launch("删除病历") { repository.deleteRecord(value) }
