@@ -386,7 +386,7 @@ private fun RecordEditorDialog(
                                 Column(Modifier.weight(1f)) {
                                     Text("快速录入", fontWeight = FontWeight.SemiBold)
                                     Text(
-                                        "粘贴带字段标签的文字，解析后请核对再保存",
+                                        "可直接粘贴自然叙述，也可使用字段模板；解析后请核对再保存",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -453,7 +453,8 @@ private fun RecordEditorDialog(
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(
                                         onClick = {
-                                            val batch = ClinicalRecordQuickParser.parseMany(quickInput)
+                                            val referenceDate = runCatching { LocalDate.parse(date) }.getOrDefault(LocalDate.now())
+                                            val batch = ClinicalRecordQuickParser.parseMany(quickInput, referenceDate)
                                             val draft = batch.records.singleOrNull()
                                             quickIssues = batch.issues + (draft?.issues ?: emptyList())
                                             unrecognizedSegments = draft?.unrecognizedSegments.orEmpty()
@@ -634,7 +635,14 @@ private fun RecordEditorDialog(
                     }
                 }
                 OutlinedTextField(date, { date = it.take(10) }, label = { Text("日期（YYYY-MM-DD）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(title, { title = it.take(100) }, label = { Text("小标题 *") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    title,
+                    { title = it.take(100) },
+                    label = { Text("小标题 *") },
+                    supportingText = { Text("选择病情分类后，保存时会自动补上病名") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
                 LabeledDropdown(
                     "病情分类",
                     conditionId?.toString().orEmpty(),
@@ -678,8 +686,15 @@ private fun RecordEditorDialog(
             TextButton(onClick = save@{
                 if (submitting) return@save
                 val validDate = runCatching { LocalDate.parse(date) }.getOrNull()
+                val titleConditionName = when (val resolution = conditionResolution) {
+                    is RecordConditionResolution.Create -> resolution.name
+                    is RecordConditionResolution.Restore -> conditions.firstOrNull { it.id == resolution.conditionId }?.name
+                    RecordConditionResolution.Selected -> conditions.firstOrNull { it.id == conditionId }?.name
+                }
+                val completedTitle = ClinicalRecordQuickParser.titleWithCondition(title, titleConditionName)
                 when {
                     title.isBlank() -> error = "请填写小标题"
+                    completedTitle.length > 100 -> error = "补上病名后小标题超过 100 个字符，请缩短"
                     validDate == null -> error = "日期格式不正确"
                     else -> {
                         submitting = true
@@ -688,7 +703,7 @@ private fun RecordEditorDialog(
                             id = record?.id ?: 0,
                             conditionId = conditionId,
                             recordDate = validDate.toString(),
-                            title = title.trim(),
+                            title = completedTitle,
                             stage = stage,
                             symptoms = symptoms.trim(), diagnosis = diagnosis.trim(), treatment = treatment.trim(),
                             medicationNotes = medicationNotes.trim(), hospital = hospital.trim(), clinician = clinician.trim(), notes = notes.trim(),

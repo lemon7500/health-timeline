@@ -119,6 +119,59 @@ class ClinicalRecordQuickParserTest {
         )
     }
 
+    @Test fun `template title is automatically prefixed with condition name`() {
+        val result = ClinicalRecordQuickParser.parse(
+            "日期：2026-09-06\n标题：复查\n病情分类：上颌窦炎"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals("上颌窦炎复查", result.title)
+    }
+
+    @Test fun `natural Chinese narrative is organized locally and keeps original text`() {
+        val input = """
+            8月29日再次去见了关丽梅医生，头颈部CT报告出来了，关医生意见
+            1）牙骨髓炎，有可能是下颌骨坏死，目前的状况不能判断病情是否还在进展，现在如果手术，之后还会继续出现问题，就无法一次性解决问题。
+            2）按照6月17日才打地舒单抗，正常也需要3～6个月才能手术取坏的牙根，不然担心伤口不能愈合。
+            3）判定目前不是进行手术的好时机。等12月份再来找她，需要手术去除牙根，也有可能不需要手术。
+            4）目前先每天保持好口腔卫生，控制住炎症。有开了药，如果口腔炎症严重，再吃。
+        """.trimIndent()
+
+        val result = ClinicalRecordQuickParser.parse(input, LocalDate.of(2026, 9, 6))
+
+        assertFalse(result.hasErrors)
+        assertEquals(LocalDate.of(2026, 8, 29), result.recordDate)
+        assertEquals("牙骨髓炎", result.conditionName)
+        assertEquals("牙骨髓炎头颈部CT复查", result.title)
+        assertEquals(VisitStage.CHECKUP, result.stage)
+        assertEquals("关丽梅医生", result.clinician)
+        assertTrue(result.diagnosis.contains("牙骨髓炎"))
+        assertTrue(result.diagnosis.contains("下颌骨坏死"))
+        assertTrue(result.treatment.contains("手术"))
+        assertTrue(result.medicationNotes.contains("地舒单抗"))
+        assertTrue(result.medicationNotes.contains("开了药"))
+        assertEquals(input, result.notes)
+        assertTrue(result.unrecognizedSegments.isEmpty())
+        assertTrue(result.issues.any { it.code == "INFERRED_YEAR" })
+        assertTrue(result.issues.any { it.code == "NARRATIVE_MODE" })
+    }
+
+    @Test fun `several natural dated paragraphs become separate records`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            """
+                8月29日复查上颌窦炎，鼻塞减轻。
+                9月3日再次复查上颌窦炎，医生建议继续冲洗。
+            """.trimIndent(),
+            LocalDate.of(2026, 9, 6)
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals(LocalDate.of(2026, 8, 29), result.records[0].recordDate)
+        assertEquals(LocalDate.of(2026, 9, 3), result.records[1].recordDate)
+        assertTrue(result.records.all { it.title?.contains("上颌窦炎") == true })
+    }
+
     @Test fun `long entry is split into several dated records`() {
         val result = ClinicalRecordQuickParser.parseMany(
             """

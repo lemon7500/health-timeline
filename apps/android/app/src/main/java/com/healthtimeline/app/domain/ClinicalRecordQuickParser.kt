@@ -88,7 +88,7 @@ object ClinicalRecordQuickParser {
         aliases(Field.NOTES, "其他备注", "备注", "其他")
     }
 
-    fun parse(input: String): ParsedClinicalRecordDraft {
+    fun parse(input: String, referenceDate: LocalDate = LocalDate.now()): ParsedClinicalRecordDraft {
         val issues = mutableListOf<QuickEntryIssue>()
         if (input.isBlank()) {
             issues.error(null, "EMPTY_INPUT", "请先输入或粘贴病历文字")
@@ -126,9 +126,13 @@ object ClinicalRecordQuickParser {
                 }
             }
 
+        if (values.isEmpty()) {
+            return parseNaturalNarrative(input, referenceDate, issues)
+        }
+
         val dateText = scalar(Field.DATE, values, issues)
-        val title = scalar(Field.TITLE, values, issues)
         val condition = scalar(Field.CONDITION, values, issues)
+        val title = titleWithCondition(scalar(Field.TITLE, values, issues).orEmpty(), condition)
         val stageText = scalar(Field.STAGE, values, issues)
         val hospital = scalar(Field.HOSPITAL, values, issues).orEmpty()
         val clinician = scalar(Field.CLINICIAN, values, issues).orEmpty()
@@ -136,7 +140,7 @@ object ClinicalRecordQuickParser {
         if (dateText.isNullOrBlank()) issues.error(Field.DATE.label, "MISSING_DATE", "请在快速录入文字中填写日期")
         if (title.isNullOrBlank()) issues.error(Field.TITLE.label, "MISSING_TITLE", "请在快速录入文字中填写标题")
 
-        val date = dateText?.takeIf { it.isNotBlank() }?.let { parseDate(it) }
+        val date = dateText?.takeIf { it.isNotBlank() }?.let { parseDate(it, referenceDate) }
         if (!dateText.isNullOrBlank() && date == null) {
             issues.error(Field.DATE.label, "INVALID_DATE", "日期须使用 2026-09-06、2026/9/6 或 2026年9月6日")
         }
@@ -180,9 +184,9 @@ object ClinicalRecordQuickParser {
      * Splits a long entry whenever a new labelled date starts, then parses every block independently.
      * This keeps the single-record parser strict while allowing several days to be reviewed and saved together.
      */
-    fun parseMany(input: String): ParsedClinicalRecordBatch {
+    fun parseMany(input: String, referenceDate: LocalDate = LocalDate.now()): ParsedClinicalRecordBatch {
         if (input.length > MAX_INPUT_LENGTH || input.isBlank()) {
-            return ParsedClinicalRecordBatch(listOf(parse(input)))
+            return ParsedClinicalRecordBatch(listOf(parse(input, referenceDate)))
         }
         val normalized = input.replace("\r\n", "\n").replace('\r', '\n')
             .replace('；', '\n').replace(';', '\n')
@@ -190,11 +194,20 @@ object ClinicalRecordQuickParser {
             .findAll(normalized)
             .map { it.range.first }
             .toList()
-        if (dateStarts.size <= 1) return ParsedClinicalRecordBatch(listOf(parse(normalized)))
+        val starts = if (dateStarts.size > 1) {
+            dateStarts
+        } else {
+            Regex("(?m)^\\s*(?=(?:(?:\\d{4}年)?\\d{1,2}月\\d{1,2}[日号]|\\d{4}[-/]\\d{1,2}[-/]\\d{1,2})(?!\\d))")
+                .findAll(normalized)
+                .map { it.range.first }
+                .distinct()
+                .toList()
+        }
+        if (starts.size <= 1) return ParsedClinicalRecordBatch(listOf(parse(normalized, referenceDate)))
 
-        val blocks = dateStarts.mapIndexed { index, start ->
+        val blocks = starts.mapIndexed { index, start ->
             val blockStart = if (index == 0) 0 else start
-            val blockEnd = dateStarts.getOrNull(index + 1) ?: normalized.length
+            val blockEnd = starts.getOrNull(index + 1) ?: normalized.length
             normalized.substring(blockStart, blockEnd).trim()
         }.filter { it.isNotBlank() }
         if (blocks.size > MAX_BATCH_RECORDS) {
@@ -210,7 +223,7 @@ object ClinicalRecordQuickParser {
                 )
             )
         }
-        return ParsedClinicalRecordBatch(blocks.map(::parse))
+        return ParsedClinicalRecordBatch(blocks.map { parse(it, referenceDate) })
     }
 
     fun templateFor(date: LocalDate): String = template.replace(TEMPLATE_DATE_TOKEN, date.toString())
@@ -246,12 +259,14 @@ object ClinicalRecordQuickParser {
         return entries.joinToString("\n").also { validateLength(field, it, MAX_NARRATIVE_LENGTH, issues) }
     }
 
-    private fun parseDate(value: String): LocalDate? {
+    private fun parseDate(value: String, referenceDate: LocalDate): LocalDate? {
         val match = when {
             Regex("^\\d{4}-\\d{1,2}-\\d{1,2}$").matches(value) -> value.split('-')
             Regex("^\\d{4}/\\d{1,2}/\\d{1,2}$").matches(value) -> value.split('/')
             Regex("^\\d{4}年\\d{1,2}月\\d{1,2}日$").matches(value) ->
                 Regex("(\\d+)").findAll(value).map { it.value }.toList()
+            Regex("^\\d{1,2}月\\d{1,2}[日号]$").matches(value) ->
+                listOf(referenceDate.year.toString()) + Regex("(\\d+)").findAll(value).map { it.value }.toList()
             else -> return null
         }
         return try {
@@ -274,6 +289,163 @@ object ClinicalRecordQuickParser {
         if (value.length > limit) {
             issues.error(field.label, "${field.name}_TOO_LONG", "${field.label}不能超过 $limit 个字符")
         }
+    }
+
+    private fun parseNaturalNarrative(
+        input: String,
+        referenceDate: LocalDate,
+        issues: MutableList<QuickEntryIssue>
+    ): ParsedClinicalRecordDraft {
+        val text = input.replace("\r\n", "\n").replace('\r', '\n').trim()
+        val dateMatch = findNarrativeDate(text, referenceDate)
+        if (dateMatch == null) {
+            issues.error(Field.DATE.label, "MISSING_DATE", "未找到明确日期，请写成“2026年8月29日”或“8月29日”")
+        } else if (dateMatch.inferredYear) {
+            issues.warning(Field.DATE.label, "INFERRED_YEAR", "未写年份，已按 ${referenceDate.year} 年填写，请核对")
+        }
+
+        val diseaseNames = extractDiseaseNames(text)
+        val condition = diseaseNames.firstOrNull()
+        val clinician = extractClinician(text)
+        val hospital = extractHospital(text)
+        val examination = extractExamination(text)
+        val stage = inferStage(text)
+        val titleContext = when {
+            text.contains("术后复查") -> "术后复查"
+            stage == VisitStage.CHECKUP -> examination?.let { "${it}复查" } ?: "复查"
+            stage == VisitStage.SURGERY -> "手术记录"
+            stage == VisitStage.AFTER_VISIT -> "就诊记录"
+            else -> "病情记录"
+        }
+        val generatedTitleCore = if (stage == VisitStage.CHECKUP && examination != null) "${examination}复查" else titleContext
+        val generatedTitle = titleWithCondition(generatedTitleCore, condition)
+
+        val clauses = narrativeClauses(text)
+        val symptoms = clauses.filter { clause ->
+            SYMPTOM_WORDS.any(clause::contains)
+        }.distinct().joinToString("\n")
+        val diagnosisParts = buildList {
+            addAll(diseaseNames)
+            addAll(clauses.filter { clause -> DIAGNOSIS_WORDS.any(clause::contains) })
+        }.map(::cleanClause).filter(String::isNotBlank).distinct().joinToString("\n")
+        val treatment = clauses.filter { clause ->
+            TREATMENT_WORDS.any(clause::contains)
+        }.map(::cleanClause).filter(String::isNotBlank).distinct().joinToString("\n")
+        val medication = clauses.filter { clause ->
+            MEDICATION_WORDS.any(clause::contains)
+        }.map(::cleanClause).filter(String::isNotBlank).distinct().joinToString("\n")
+
+        validateLength(Field.TITLE, generatedTitle.orEmpty(), MAX_TITLE_LENGTH, issues)
+        validateLength(Field.CONDITION, condition.orEmpty(), 50, issues)
+        validateLength(Field.HOSPITAL, hospital, 100, issues)
+        validateLength(Field.CLINICIAN, clinician, 100, issues)
+        validateLength(Field.SYMPTOMS, symptoms, MAX_NARRATIVE_LENGTH, issues)
+        validateLength(Field.DIAGNOSIS, diagnosisParts, MAX_NARRATIVE_LENGTH, issues)
+        validateLength(Field.TREATMENT, treatment, MAX_NARRATIVE_LENGTH, issues)
+        validateLength(Field.MEDICATION, medication, MAX_NARRATIVE_LENGTH, issues)
+        validateLength(Field.NOTES, text, MAX_NARRATIVE_LENGTH, issues)
+        issues.warning(null, "NARRATIVE_MODE", "已按自然叙述自动整理，并在备注中保留原文；请核对后再保存")
+
+        return ParsedClinicalRecordDraft(
+            recordDate = dateMatch?.date,
+            title = generatedTitle,
+            conditionName = condition,
+            stage = stage,
+            symptoms = symptoms,
+            diagnosis = diagnosisParts,
+            treatment = treatment,
+            medicationNotes = medication,
+            hospital = hospital,
+            clinician = clinician,
+            notes = text,
+            issues = issues,
+            unrecognizedSegments = emptyList()
+        )
+    }
+
+    private data class NarrativeDate(val date: LocalDate, val start: Int, val inferredYear: Boolean)
+
+    private fun findNarrativeDate(text: String, referenceDate: LocalDate): NarrativeDate? {
+        val candidates = mutableListOf<NarrativeDate>()
+        Regex("(?<!\\d)(\\d{4})[-/](\\d{1,2})[-/](\\d{1,2})(?!\\d)").findAll(text).forEach { match ->
+            safeDate(match.groupValues[1], match.groupValues[2], match.groupValues[3])
+                ?.let { candidates += NarrativeDate(it, match.range.first, false) }
+        }
+        Regex("(?<!\\d)(?:(\\d{4})年)?(\\d{1,2})月(\\d{1,2})[日号]").findAll(text).forEach { match ->
+            val inferred = match.groupValues[1].isBlank()
+            val year = match.groupValues[1].ifBlank { referenceDate.year.toString() }
+            safeDate(year, match.groupValues[2], match.groupValues[3])
+                ?.let { candidates += NarrativeDate(it, match.range.first, inferred) }
+        }
+        return candidates.minByOrNull { it.start }
+    }
+
+    private fun safeDate(year: String, month: String, day: String): LocalDate? = try {
+        LocalDate.of(year.toInt(), month.toInt(), day.toInt())
+    } catch (_: DateTimeException) {
+        null
+    }
+
+    private fun extractClinician(text: String): String {
+        val match = Regex("(?:见了|找了|咨询了|由|请|给|让)\\s*([\\u4e00-\\u9fff·]{1,4})医生")
+            .find(text)
+            ?: Regex("(?:主治医生|就诊医生|医生)\\s*[是为：:]\\s*([\\u4e00-\\u9fff·]{1,4})")
+                .find(text)
+        return match?.groupValues?.get(1)?.let { "${it}医生" }.orEmpty()
+    }
+
+    private fun extractHospital(text: String): String =
+        Regex("([\\u4e00-\\u9fffA-Za-z0-9·]{2,30}(?:医院|门诊部|诊所|医疗中心))")
+            .find(text)?.groupValues?.get(1).orEmpty()
+
+    private fun extractExamination(text: String): String? =
+        Regex("([\\u4e00-\\u9fffA-Za-z0-9]{1,12}(?:CT|MRI|MR|B超|彩超|核磁|X线))(?=报告|检查|结果)", RegexOption.IGNORE_CASE)
+            .find(text)?.groupValues?.get(1)
+
+    private fun extractDiseaseNames(text: String): List<String> {
+        val cueRegex = Regex("(?:诊断为|诊断是|确诊为|确诊|考虑为|考虑|疑似|有可能是|可能是|判断为|判定为)")
+        val diseaseRegex = Regex("([\\u4e00-\\u9fff]{2,14}(?:综合征|坏死|骨折|感染|结节|囊肿|炎|癌|瘤|病|症))(?![\\u4e00-\\u9fff])")
+        val withoutDates = text
+            .replace(Regex("(?<!\\d)\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}(?!\\d)"), "")
+            .replace(Regex("(?<!\\d)(?:\\d{4}年)?\\d{1,2}月\\d{1,2}[日号]"), "")
+        return withoutDates.split(Regex("[，,。；;：:\\n]+"))
+            .asSequence()
+            .map(::cleanClause)
+            .flatMap { clause ->
+                val cue = cueRegex.find(clause)
+                val searchable = if (cue == null) clause else clause.substring(cue.range.last + 1)
+                diseaseRegex.findAll(searchable).map { it.groupValues[1] }
+            }
+            .map { candidate ->
+                DISEASE_LEADING_WORDS.fold(candidate) { value, prefix -> value.removePrefix(prefix) }
+            }
+            .filter { it.length in 2..16 && it !in DISEASE_FALSE_POSITIVES }
+            .distinct()
+            .toList()
+    }
+
+    private fun inferStage(text: String): VisitStage = when {
+        Regex("术后.{0,8}(复查|检查|就诊)").containsMatchIn(text) -> VisitStage.CHECKUP
+        listOf("复查", "再次去见", "再次就诊", "报告出来", "检查结果").any(text::contains) -> VisitStage.CHECKUP
+        listOf("接受手术", "进行了手术", "完成手术").any(text::contains) -> VisitStage.SURGERY
+        listOf("就诊", "看医生", "见了", "找了").any(text::contains) -> VisitStage.AFTER_VISIT
+        else -> VisitStage.OTHER
+    }
+
+    private fun narrativeClauses(text: String): List<String> =
+        text.split(Regex("[。！？!?\\n]+"))
+            .map(::cleanClause)
+            .filter(String::isNotBlank)
+
+    private fun cleanClause(value: String): String =
+        value.trim().replace(Regex("^[（(]?\\d+[）).、]\\s*"), "").trim('，', ',', '；', ';', ' ')
+
+    fun titleWithCondition(title: String, condition: String?): String {
+        val cleanTitle = title.trim()
+        val cleanCondition = condition?.trim().orEmpty()
+        if (cleanTitle.isBlank()) return cleanCondition.takeIf(String::isNotBlank)?.let { "${it}病情记录" }.orEmpty()
+        if (cleanCondition.isBlank() || cleanTitle.contains(cleanCondition, ignoreCase = true)) return cleanTitle
+        return "$cleanCondition$cleanTitle"
     }
 
     private fun normalizeLabel(value: String): String =
@@ -306,4 +478,22 @@ object ClinicalRecordQuickParser {
         issues = issues,
         unrecognizedSegments = emptyList()
     )
+
+    private const val MAX_TITLE_LENGTH = 100
+    private val SYMPTOM_WORDS = listOf(
+        "疼", "痛", "肿", "发热", "发烧", "鼻塞", "咳", "出血", "麻木", "头晕", "恶心", "炎症严重", "不适"
+    )
+    private val DIAGNOSIS_WORDS = listOf(
+        "诊断", "确诊", "疑似", "可能是", "考虑", "判断病情", "判定"
+    )
+    private val TREATMENT_WORDS = listOf(
+        "手术", "治疗", "复查", "再来", "观察", "去除", "取出", "保持", "控制", "清洗", "冲洗", "处理"
+    )
+    private val MEDICATION_WORDS = listOf(
+        "用药", "服药", "吃药", "开了药", "药物", "口服", "注射", "打地舒单抗", "再吃"
+    )
+    private val DISEASE_LEADING_WORDS = listOf(
+        "医生认为", "医生意见", "检查发现", "再次复查", "复查", "目前是", "目前为", "患有", "存在", "发现"
+    )
+    private val DISEASE_FALSE_POSITIVES = setOf("病情", "炎症", "症状")
 }

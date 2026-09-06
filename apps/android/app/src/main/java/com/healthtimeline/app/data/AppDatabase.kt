@@ -198,6 +198,9 @@ abstract class AppDatabase : RoomDatabase() {
                 NEW_TABLES.forEach { (oldName, newName) ->
                     check(rowCount(db, oldName) == rowCount(db, newName)) { "迁移前后记录数量不一致：$oldName" }
                 }
+                CONTENT_COMPARE_COLUMNS.forEach { (table, columns) ->
+                    checkTablesContainSameValues(db, table, "_new_$table", columns)
+                }
 
                 listOf(
                     "attachments", "follow_up_occurrences", "medication_logs", "medication_schedules",
@@ -228,6 +231,20 @@ abstract class AppDatabase : RoomDatabase() {
             "follow_up_occurrences", "medications", "medication_schedules", "medication_logs"
         )
         private val NEW_TABLES = ROOT_AND_CHILD_TABLES.associateWith { "_new_$it" }
+        private val CONTENT_COMPARE_COLUMNS = mapOf(
+            "conditions" to "id,name,color,notes,archived,createdAt,uuid",
+            "clinical_records" to
+                "id,conditionId,recordDate,title,stage,symptoms,diagnosis,treatment,medicationNotes,hospital,clinician,notes,createdAt,updatedAt,uuid",
+            "attachments" to "id,recordId,kind,displayName,mimeType,relativePath,sizeBytes,sha256,createdAt,uuid",
+            "follow_up_schedules" to
+                "id,conditionId,title,recurrenceType,interval,anchorDate,anchorDayOfMonth,weekday,reminderTime,leadDays,nextDueDate,enabled,createdAt,updatedAt,uuid",
+            "follow_up_occurrences" to "id,scheduleId,dueDate,status,completedAt,createdAt,uuid",
+            "medications" to
+                "id,conditionId,name,doseAmount,doseUnit,instructions,startDate,endDate,mode,archived,createdAt,updatedAt,uuid",
+            "medication_schedules" to "id,medicationId,localTime,enabled,uuid",
+            "medication_logs" to
+                "id,medicationId,scheduleId,scheduledAt,actualAt,status,doseAmountSnapshot,doseUnitSnapshot,createdAt,uuid"
+        )
         private val INDEX_SQL = listOf(
             "CREATE UNIQUE INDEX index_family_members_uuid ON family_members(uuid)",
             "CREATE INDEX index_family_members_archived ON family_members(archived)",
@@ -262,6 +279,18 @@ abstract class AppDatabase : RoomDatabase() {
                 check(cursor.moveToFirst())
                 cursor.getLong(0)
             }
+
+        private fun checkTablesContainSameValues(
+            db: SupportSQLiteDatabase,
+            oldTable: String,
+            newTable: String,
+            columns: String
+        ) {
+            val oldOnly = "SELECT $columns FROM $oldTable EXCEPT SELECT $columns FROM $newTable"
+            val newOnly = "SELECT $columns FROM $newTable EXCEPT SELECT $columns FROM $oldTable"
+            check(!db.query(oldOnly).use { it.moveToFirst() }) { "迁移后字段内容不一致：$oldTable" }
+            check(!db.query(newOnly).use { it.moveToFirst() }) { "迁移后出现意外内容：$oldTable" }
+        }
     }
 }
 
