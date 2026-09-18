@@ -8,7 +8,7 @@ jobs:
   harmony-protocol:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -19,13 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - uses: android-actions/setup-android@v3
       - run: chmod +x gradlew
       - run: ./gradlew :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintRelease :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
       - uses: actions/upload-artifact@v4
@@ -37,13 +36,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - uses: android-actions/setup-android@v3
       - run: chmod +x gradlew
       - name: Enable KVM
         run: |
@@ -62,8 +60,8 @@ jobs:
   ios-simulator:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -75,7 +73,33 @@ jobs:
         working-directory: apps/ios
       - run: pod install
         working-directory: apps/ios
-      - run: xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - name: Build iOS simulator
+        id: ios-build
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build 2>&1 | tee "$RUNNER_TEMP/ios-build.log"
         working-directory: apps/ios
+      - name: Publish iOS compiler errors
+        if: failure() && steps.ios-build.outcome == 'failure'
+        shell: bash
+        run: |
+          error_lines="$(grep -E '(^|[[:space:]])(error|fatal error):' "$RUNNER_TEMP/ios-build.log" | tail -n 50 || true)"
+          if [[ -z "$error_lines" ]]; then
+            echo '::error::xcodebuild failed without a compiler error line; inspect the uploaded ios-build-log artifact.'
+          else
+            while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              line="${line//$'\r'/'%0D'}"
+              line="${line//$'\n'/'%0A'}"
+              echo "::error::$line"
+            done <<< "$error_lines"
+          fi
+      - name: Upload iOS build log
+        if: failure() && steps.ios-build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: ${{ runner.temp }}/ios-build.log
       - run: xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' CODE_SIGNING_ALLOWED=NO test
         working-directory: apps/ios
