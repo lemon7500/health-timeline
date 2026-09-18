@@ -6,11 +6,18 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>病程日历</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1.0</string>
-  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>1.2.4</string>
+  <key>CFBundleVersion</key><string>9</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIApplicationSupportsIndirectInputEvents</key><true/>
   <key>NSPhotoLibraryUsageDescription</key><string>用于选择并保存检查报告图片。</string>
+  <key>NSFaceIDUsageDescription</key><string>用于在打开病程日历时保护本机医疗记录。</string>
+  <key>UTExportedTypeDeclarations</key><array><dict>
+    <key>UTTypeIdentifier</key><string>com.healthtimeline.backup</string>
+    <key>UTTypeDescription</key><string>病程日历加密备份</string>
+    <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+    <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>htbackup</string></array></dict>
+  </dict></array>
   <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
   <key>UISupportedInterfaceOrientations~ipad</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
 </dict></plist>

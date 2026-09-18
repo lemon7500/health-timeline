@@ -94,8 +94,8 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
     }
     deleting?.let { target ->
         ConfirmDialog(
-            "删除复查计划？",
-            "未来提醒会停止，已经产生的历史状态会随计划删除。",
+            "将复查计划移入回收站？",
+            "未来提醒会立即停止，计划和已经产生的历史状态会保留 30 天，期间可以恢复。",
             { viewModel.deleteFollowUp(target); deleting = null },
             { deleting = null }
         )
@@ -117,7 +117,7 @@ private fun FollowUpEditorDialog(
     var anchor by remember(existing) { mutableStateOf(existing?.anchorDate ?: LocalDate.now().toString()) }
     var weekday by remember(existing) { mutableStateOf(existing?.weekday ?: LocalDate.now().dayOfWeek.value) }
     var time by remember(existing) { mutableStateOf(existing?.reminderTime ?: "09:00") }
-    var lead by remember(existing) { mutableIntStateOf(existing?.leadDays ?: 0) }
+    var lead by remember(existing) { mutableIntStateOf(existing?.leadDays ?: 3) }
     var error by remember { mutableStateOf<String?>(null) }
     var submitting by remember(existing) { mutableStateOf(false) }
     val now = Instant.now().toString()

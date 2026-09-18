@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / "dist" / "病程日历-客户使用指南.docx"
+OUTPUT = ROOT / "dist" / "病程日历-1.3.0-客户使用指南.docx"
 
 BLUE = "2E74B5"
 DARK_BLUE = "1F4D78"
@@ -78,21 +78,14 @@ def add_page_field(paragraph) -> None:
 
 
 def add_callout(doc: Document, title: str, body: str, fill=PALE_YELLOW) -> None:
-    table = doc.add_table(rows=1, cols=1)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = False
-    cell = table.cell(0, 0)
-    cell.width = Inches(6.35)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-    set_cell_shading(cell, fill)
-    set_cell_margins(cell, top=150, start=180, bottom=150, end=180)
-    p = cell.paragraphs[0]
-    p.paragraph_format.space_after = Pt(2)
-    r = p.add_run(title)
-    set_run_font(r, 10.5, True, DARK_BLUE)
-    r = p.add_run("\n" + body)
-    set_run_font(r, 10.5)
-    doc.add_paragraph().paragraph_format.space_after = Pt(0)
+    heading = doc.add_paragraph()
+    heading.paragraph_format.space_before = Pt(7)
+    heading.paragraph_format.space_after = Pt(2)
+    heading.paragraph_format.keep_with_next = True
+    r = heading.add_run(title)
+    set_run_font(r, 10.5, True, "000000")
+    body_paragraph = doc.add_paragraph(body)
+    body_paragraph.paragraph_format.space_after = Pt(7)
 
 
 def add_bullets(doc: Document, items: list[str]) -> None:
@@ -213,11 +206,11 @@ def style_document(doc: Document) -> None:
     normal.paragraph_format.line_spacing = 1.2
 
     settings = {
-        "Title": (26, DARK_BLUE, 0, 8),
-        "Subtitle": (12, "657786", 0, 14),
-        "Heading 1": (16, BLUE, 16, 7),
-        "Heading 2": (13, BLUE, 12, 6),
-        "Heading 3": (11.5, DARK_BLUE, 9, 4),
+        "Title": (26, "000000", 0, 8),
+        "Subtitle": (12, "000000", 0, 14),
+        "Heading 1": (16, "000000", 16, 7),
+        "Heading 2": (13, "000000", 12, 6),
+        "Heading 3": (11.5, "000000", 9, 4),
     }
     for name, (size, color, before, after) in settings.items():
         style = doc.styles[name]
@@ -229,6 +222,10 @@ def style_document(doc: Document) -> None:
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.keep_with_next = True
+        p_pr = style._element.get_or_add_pPr()
+        border = p_pr.find(qn("w:pBdr"))
+        if border is not None:
+            p_pr.remove(border)
 
     for name in ("List Bullet", "List Number"):
         style = doc.styles[name]
@@ -255,17 +252,8 @@ def add_header_footer(doc: Document) -> None:
     p = header.paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.space_after = Pt(2)
-    r = p.add_run("病程日历 1.2.0  |  客户使用指南")
-    set_run_font(r, 8.5, False, "657786")
-    p_pr = p._p.get_or_add_pPr()
-    borders = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "4")
-    bottom.set(qn("w:space"), "3")
-    bottom.set(qn("w:color"), PALE_BLUE)
-    borders.append(bottom)
-    p_pr.append(borders)
+    r = p.add_run("病程日历 1.3.0  |  客户使用指南")
+    set_run_font(r, 8.5, False, "000000")
 
     for footer in (section.footer, section.first_page_footer):
         p = footer.paragraphs[0]
@@ -289,7 +277,7 @@ def build() -> None:
     add_kv_table(
         doc,
         [
-            ("适用版本", "1.2.0"),
+            ("适用版本", "1.3.0"),
             ("适用设备", "Android 8.0 及以上的华为、荣耀、Redmi/小米及其他 Android 手机"),
             ("不支持", "HarmonyOS NEXT 原生系统"),
             ("数据方式", "完全离线，本地加密存储"),
@@ -309,11 +297,14 @@ def build() -> None:
         [
             "为本人和家人分别建立档案，并在各页面切换当前成员。",
             "按日历查看每次就诊、病情变化、诊断、治疗和备注。",
+            "使用快速录入整理单条或多日期病程，并在保存前逐条核对。",
             "保存每次检查报告的多张图片和多个 PDF。",
             "设置定期复查提醒，例如“每 3 个月一次”或“每周四”。",
             "登记药物疗程、每日服药时间，并记录“已服”或“跳过”。",
             "使用系统指纹、面容或锁屏密码保护应用。",
             "导出全家庭密码加密备份，在换机或重新安装后恢复。",
+            "检查通知、闹钟、电池优化、最近备份和数据库/附件完整性。",
+            "误删病历、报告、复查或药物后，可在 30 天回收站恢复。",
         ],
     )
     add_callout(doc, "医疗提示", "本应用只用于记录和提醒，不能替代医生诊断、处方或用药指导。", PALE_GREEN)
@@ -322,7 +313,7 @@ def build() -> None:
     add_steps(
         doc,
         [
-            "从 GitHub Releases 下载“HealthTimeline-1.2.0.apk”并保存到手机。",
+            "从 GitHub Releases 下载“HealthTimeline-1.3.0.apk”并保存到手机。",
             "在“文件管理”中点击 APK。",
             "首次安装时，按系统提示允许当前文件管理器“安装未知应用”。",
             "安装完成后，可关闭“安装未知应用”权限。",
@@ -337,7 +328,7 @@ def build() -> None:
         doc,
         [
             "通知权限：允许“病程日历”发送通知。",
-            "精确闹钟：在应用“设置”页按提示允许精确提醒；拒绝后仍可提醒，但可能延迟。",
+            "精确闹钟：在“设置 → 安全与提醒检查”按提示允许精确提醒；拒绝后仍可提醒，但可能延迟。",
             "后台运行：允许应用后台活动和自动启动。",
             "电池管理：将应用设为“不限制”或“不优化”。",
         ],
@@ -355,6 +346,8 @@ def build() -> None:
     table.columns[0].width = Inches(1.25)
     table.columns[1].width = Inches(5.1)
     hdr = table.rows[0].cells
+    hdr[0].width = Inches(1.25)
+    hdr[1].width = Inches(5.1)
     hdr[0].text = "页面"
     hdr[1].text = "用途"
     set_repeat_table_header(table.rows[0])
@@ -367,9 +360,11 @@ def build() -> None:
         ("日历", "切换家庭成员；查看、搜索、新增和修改病历"),
         ("复查", "切换成员；设置一次性或周期性复查，处理待复查事项"),
         ("用药", "切换成员；登记药物、疗程和每日服药记录"),
-        ("设置", "管理家庭档案和应用锁，查看权限，导出或恢复全家庭备份"),
+        ("设置", "管理家庭档案和应用锁，运行安全检查，导出或恢复全家庭备份"),
     ]:
         cells = table.add_row().cells
+        cells[0].width = Inches(1.25)
+        cells[1].width = Inches(5.1)
         cells[0].text = name
         cells[1].text = purpose
         for cell in cells:
@@ -389,6 +384,18 @@ def build() -> None:
         ],
     )
     add_body(doc, "日历中每个日期最多显示两个标题；当天记录更多时会显示“+N”。点击日期即可查看全部记录。已有历史记录引用的病情分类只能归档，不能直接删除。")
+    add_heading(doc, "快速录入", 2)
+    add_body(doc, "新增病历时可展开“快速录入”。简单内容可直接在手机本地解析；复杂长文或跨多日内容，可先复制应用提供的 AI 整理提示词，自行选择外部 AI，删除姓名、身份证号、电话等敏感信息后再整理。应用不会自动发送病历，也不申请网络权限。")
+    add_steps(
+        doc,
+        [
+            "粘贴原始文字，或粘贴外部 AI 按模板整理后的结果。",
+            "点击解析，逐条展开核对日期、标题、病名、医生、诊断、治疗、用药和备注。",
+            "确认标题以病名开头，并确认备注中的“原文记录”完整且顺序正确。",
+            "删除不需要的草稿或修改错误内容，最后点击批量保存。",
+        ],
+    )
+    add_callout(doc, "必须核对", "快速录入只帮助整理资料，不提供诊断或治疗建议。保存前请逐条核对；关闭页面或取消时不会写入正式病历。", PALE_YELLOW)
 
     add_heading(doc, "6. 保存和查看检查报告", 1)
     add_steps(
@@ -401,13 +408,14 @@ def build() -> None:
         ],
     )
     add_callout(doc, "附件限制", "每条病历可保存多张图片和多个 PDF。单个文件不能超过 100 MB。文件损坏、格式不支持或手机空间不足时，应用会取消本次导入，不会保留半份附件。", PALE_BLUE)
+    add_body(doc, "删除单个报告时，点击附件旁或查看页中的删除按钮，核对文件名并再次确认。只删除所选图片或 PDF，不会删除病历；删除后先进入 30 天回收站。")
 
     add_heading(doc, "7. 设置复查提醒", 1)
     add_steps(
         doc,
         [
             "打开“复查”，点击新增。",
-            "填写复查名称、首次日期、提醒时间和提前天数。",
+            "填写复查名称、首次日期、提醒时间和提前天数；新建计划默认提前 3 天，可改为 0、1、3 或 7 天。",
             "选择重复方式：一次性、每 N 天、每 N 周指定星期，或每 N 月指定日期。",
             "保存后，系统会安排下一次提醒。",
             "完成复查后标记“已完成”；不需要本次复查时可标记“已跳过”。",
@@ -431,13 +439,31 @@ def build() -> None:
             "打开“用药”，点击新增药物。",
             "填写药名、剂量、单位、开始日期、结束日期和服用说明。",
             "选择“按需服用”，或设置每天一个或多个服药时间，例如 08:00、20:00。",
-            "在“今日用药”中选择“已服”或“跳过”；也可在通知中快捷标记“已服”。",
-            "修改药物剂量只影响之后的计划，过去的用药记录会保留当时的剂量。",
+            "在用药月历中选择日期，再在下方切换“当日用药、用药疗程、已结束用药”查看相应信息。",
+            "今天或过去日期可补记“已服”或“跳过”，实际时间使用每 5 分钟一档的时间选择器；未来日期只读。",
+            "已服与跳过可以在二次确认后互相修正，也可修改实际服用时间。",
+            "修改药物时间、剂量或计划模式时选择生效日期；过去的计划和打卡继续保留当时的时间与剂量。",
         ],
     )
-    add_body(doc, "未点击“已服”或“跳过”的项目保持“未记录”，应用不会自动认定为漏服。疗程结束后不再产生新的提醒，历史记录仍然保留。")
+    add_body(doc, "未点击“已服”或“跳过”的项目保持“未记录”，应用不会自动认定为漏服。点击“结束疗程”会记录结束日期和时间并停止后续提醒，当天及此前历史记录仍然保留；如果误点，可在“已结束用药”点击“恢复疗程”，恢复原计划和后续提醒。")
 
-    add_heading(doc, "9. 导出加密备份", 1)
+    add_heading(doc, "9. 安全与提醒检查", 1)
+    add_steps(
+        doc,
+        [
+            "打开“设置 → 安全与提醒检查”。",
+            "确认通知总开关、复查/用药提醒类别、精确闹钟和电池优化状态。",
+            "点击“发送 10 秒测试提醒”，确认手机可以收到通知。",
+            "点击“检查数据库和全部附件”，等待检查完成。",
+            "需要技术协助时导出本地诊断报告；报告不包含医疗正文、姓名、药名、附件名称或路径。",
+        ],
+    )
+    add_body(doc, "华为、荣耀和 Redmi 还有厂商自己的自启动及后台开关，Android 无法自动读取，请按本指南前面的品牌说明人工确认。")
+
+    add_heading(doc, "回收站", 2)
+    add_body(doc, "误删病历、单个检查报告、复查计划或药物后，打开“设置 → 回收站”，确认当前家庭成员并点击“恢复”。资料保留 30 天；到期会自动清理。“永久删除”不可撤销，操作前请先导出备份。")
+
+    add_heading(doc, "10. 导出加密备份", 1)
     add_callout(doc, "建议频率", "至少每周备份一次，并在添加重要检查报告、换手机或更新应用前额外备份。", PALE_GREEN)
     add_steps(
         doc,
@@ -449,9 +475,9 @@ def build() -> None:
             "备份文件和密码请分开保管。",
         ],
     )
-    add_callout(doc, "密码无法找回", "v3 备份包含全部家庭成员的病历、复查、用药记录和附件。密码不会保存在应用中，忘记后无法恢复该备份。", PALE_YELLOW)
+    add_callout(doc, "密码无法找回", "v5 备份包含全部家庭成员的病历、复查、历史用药计划、用药记录、附件和回收站。密码不会保存在应用中，忘记后无法恢复该备份。", PALE_YELLOW)
 
-    add_heading(doc, "10. 恢复备份或更换手机", 1)
+    add_heading(doc, "11. 恢复备份或更换手机", 1)
     add_steps(
         doc,
         [
@@ -464,12 +490,12 @@ def build() -> None:
     )
     add_callout(doc, "整体替换前先备份", "整体替换会删除本机独有资料，因此应用会先强制导出当前数据安全备份。导出或验证失败时，现有数据不会被修改。", PALE_BLUE)
 
-    add_heading(doc, "11. 更新应用", 1)
-    add_body(doc, "如果手机已经安装旧版本，请从 GitHub 下载新版 APK 后直接覆盖安装。不要先卸载旧版，也不要清除应用数据。1.1.0 升级到 1.2.0 后原资料会归入“本人”；如果系统提示签名不一致，请停止操作并联系软件提供方。")
+    add_heading(doc, "12. 更新应用", 1)
+    add_body(doc, "如果手机已经安装旧版本，请从 GitHub 下载新版 APK 后直接覆盖安装。不要先卸载旧版，也不要清除应用数据。1.3.0 使用正式数据库迁移保留旧资料并增加回收站；如果系统提示签名不一致，请停止操作并联系软件提供方。")
 
-    add_heading(doc, "12. 常见问题", 1)
+    add_heading(doc, "13. 常见问题", 1)
     questions = [
-        ("收不到提醒或提醒延迟", "检查通知权限、精确闹钟、自动启动、后台活动和电池“不限制”设置。系统省电模式可能延迟通知；修改设置后，可重新打开应用让提醒重新安排。"),
+        ("收不到提醒或提醒延迟", "先进入“安全与提醒检查”查看状态并发送测试提醒，再检查自动启动、后台活动和电池“不限制”设置；需要协助时可导出不含医疗正文的诊断报告。"),
         ("Redmi/小米手机锁屏后不提醒", "打开本应用的“自启动”，将省电策略设为“无限制”，并确认通知允许显示。HyperOS/MIUI 更新后，建议再次检查这些设置。"),
         ("华为/荣耀手机锁屏后不提醒", "在“应用启动管理”中改为手动管理，并允许自动启动、关联启动和后台活动；同时关闭对本应用的电池优化。"),
         ("报告无法导入", "请确认文件是常见图片或 PDF、单个文件不超过 100 MB、文件没有损坏，并且手机剩余空间充足。"),
@@ -480,7 +506,7 @@ def build() -> None:
         add_heading(doc, question, 2)
         add_body(doc, answer)
 
-    add_heading(doc, "13. 隐私与安全说明", 1)
+    add_heading(doc, "14. 隐私与安全说明", 1)
     add_bullets(
         doc,
         [
@@ -491,19 +517,19 @@ def build() -> None:
         ],
     )
 
-    doc.add_page_break()
-    add_heading(doc, "14. 交付客户前快速检查", 1)
+    add_heading(doc, "15. 交付客户前快速检查", 1)
     add_steps(
         doc,
         [
             "能正常打开应用并新增一条测试病历。",
             "已允许通知、精确闹钟和后台运行。",
-            "已设置一条近期测试提醒并确认能够收到。",
+            "已在安全检查中心发送 10 秒测试提醒并确认能够收到。",
+            "数据库和全部附件完整性检查通过。",
             "已成功导出一次加密备份，并确认记得密码。",
             "已把备份复制到手机之外的安全位置。",
         ],
     )
-    add_callout(doc, "需要技术支持时", "请联系软件提供方，并说明手机品牌、型号、系统版本和遇到问题的具体步骤。", PALE_GREEN)
+    add_callout(doc, "需要技术支持时", "请联系软件提供方，并说明问题步骤；可同时提供安全检查中心导出的本地诊断报告。", PALE_GREEN)
 
     core_props = doc.core_properties
     core_props.title = "病程日历使用指南"

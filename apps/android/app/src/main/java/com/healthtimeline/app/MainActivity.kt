@@ -37,7 +37,14 @@ class MainActivity : FragmentActivity() {
             HealthTimelineTheme {
                 val services by produceState<Result<AppServices>?>(initialValue = null) {
                     value = withContext(Dispatchers.IO) {
-                        runCatching { AppServices(app.repository, app.alarmScheduler, app.backupService) }
+                        runCatching {
+                            AppServices(
+                                app.repository,
+                                app.alarmScheduler,
+                                app.backupService,
+                                app.safetyCenterService
+                            )
+                        }
                     }
                 }
                 val available = services?.getOrNull()
@@ -53,7 +60,8 @@ class MainActivity : FragmentActivity() {
                             available.repository,
                             available.scheduler,
                             available.backup,
-                            app.memberSelectionStore
+                            app.memberSelectionStore,
+                            available.safetyCenter
                         )
                     )
                     HealthTimelineRoot(
@@ -116,6 +124,7 @@ class MainActivity : FragmentActivity() {
     private data class AppServices(
         val repository: com.healthtimeline.app.data.HealthRepository,
         val scheduler: com.healthtimeline.app.reminders.AlarmScheduler,
-        val backup: com.healthtimeline.app.backup.PortableBackupService
+        val backup: com.healthtimeline.app.backup.PortableBackupService,
+        val safetyCenter: com.healthtimeline.app.data.SafetyCenterService
     )
 }

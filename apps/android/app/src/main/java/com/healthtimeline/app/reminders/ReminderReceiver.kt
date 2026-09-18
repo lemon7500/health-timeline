@@ -31,6 +31,7 @@ class ReminderReceiver : BroadcastReceiver() {
                 when (intent.action) {
                     ACTION_FOLLOW_UP -> handleFollowUp(context, app, intent)
                     ACTION_MEDICATION -> handleMedication(context, app, intent)
+                    ACTION_TEST -> showTestNotification(context)
                 }
             } catch (error: Exception) {
                 Log.e("ReminderReceiver", "Unable to process reminder safely", error)
@@ -46,7 +47,7 @@ class ReminderReceiver : BroadcastReceiver() {
         if (id < 0) return
         app.repository.processDueFollowUp(id, due) ?: return
         val member = app.repository.memberForFollowUp(id)?.takeUnless { it.archived } ?: return
-        showFollowUpNotification(context, id, due, member.nickname)
+        showFollowUpNotification(context, id, due, member.relationship)
     }
 
     private suspend fun handleMedication(context: Context, app: HealthTimelineApplication, intent: Intent) {
@@ -55,15 +56,16 @@ class ReminderReceiver : BroadcastReceiver() {
         val scheduledAt = intent.getStringExtra(EXTRA_SCHEDULED_AT) ?: LocalDateTime.now().toString()
         if (scheduleId < 0 || medicationId < 0) return
         val medication = app.repository.medicationById(medicationId) ?: return
+        val schedule = app.repository.enabledMedicationSchedules().firstOrNull { it.id == scheduleId } ?: return
         val member = app.repository.memberForMedication(medicationId)?.takeUnless { it.archived } ?: return
         val scheduledDate = runCatching { LocalDateTime.parse(scheduledAt).toLocalDate() }.getOrNull() ?: return
         if (medication.archived || scheduledDate.isBefore(LocalDate.parse(medication.startDate)) ||
-            medication.endDate?.let { scheduledDate.isAfter(LocalDate.parse(it)) } == true
+            medication.endDate?.let { scheduledDate.isAfter(LocalDate.parse(it)) } == true ||
+            scheduledDate.isBefore(LocalDate.parse(schedule.effectiveFrom)) ||
+            schedule.effectiveTo?.let { scheduledDate.isAfter(LocalDate.parse(it)) } == true
         ) return
-        showMedicationNotification(context, medicationId, scheduleId, scheduledAt, member.nickname)
-        app.repository.enabledMedicationSchedules().firstOrNull { it.id == scheduleId }?.let { schedule ->
-            app.alarmScheduler.scheduleMedication(schedule)
-        }
+        showMedicationNotification(context, medicationId, scheduleId, scheduledAt, member.relationship)
+        app.alarmScheduler.scheduleMedication(schedule)
     }
 
     private fun showFollowUpNotification(context: Context, scheduleId: Long, due: LocalDate, nickname: String) {
@@ -117,6 +119,21 @@ class ReminderReceiver : BroadcastReceiver() {
             .notify((scheduleId % Int.MAX_VALUE).toInt() + 500_000, notification)
     }
 
+    private fun showTestNotification(context: Context) {
+        if (!canNotify(context)) return
+        val notification = NotificationCompat.Builder(context, NotificationChannels.FOLLOW_UP)
+            .setSmallIcon(R.drawable.ic_app)
+            .setContentTitle("病程日历测试提醒")
+            .setContentText("如果看到这条通知，基础提醒链路工作正常。")
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setContentIntent(openAppIntent(context))
+            .setPublicVersion(publicNotification(context, NotificationChannels.FOLLOW_UP))
+            .build()
+        context.getSystemService(NotificationManager::class.java).notify(TEST_NOTIFICATION_ID, notification)
+    }
+
     private fun publicNotification(context: Context, channelId: String) =
         NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_app)
@@ -140,9 +157,11 @@ class ReminderReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_FOLLOW_UP = "com.healthtimeline.app.FOLLOW_UP"
         const val ACTION_MEDICATION = "com.healthtimeline.app.MEDICATION"
+        const val ACTION_TEST = "com.healthtimeline.app.TEST_REMINDER"
         const val EXTRA_ID = "id"
         const val EXTRA_DUE = "due"
         const val EXTRA_MEDICATION_ID = "medication_id"
         const val EXTRA_SCHEDULED_AT = "scheduled_at"
+        private const val TEST_NOTIFICATION_ID = 1_950_001
     }
 }

@@ -38,9 +38,23 @@ class AlarmScheduler(
         context.getSystemService(NotificationManager::class.java).cancelAll()
     }
 
+    fun scheduleTestReminder(delaySeconds: Long = 10L): Boolean {
+        require(delaySeconds in 1L..300L) { "测试提醒时间无效" }
+        val intent = Intent(context, ReminderReceiver::class.java).apply {
+            action = ReminderReceiver.ACTION_TEST
+            data = Uri.parse("healthtimeline://test-reminder")
+        }
+        val exact = canScheduleExact()
+        schedule(
+            LocalDateTime.now().plusSeconds(delaySeconds),
+            pendingIntent(TEST_REMINDER_REQUEST_CODE, intent)
+        )
+        return exact
+    }
+
     fun scheduleFollowUp(value: FollowUpScheduleEntity) {
         cancelFollowUp(value.id)
-        if (!value.enabled) return
+        if (!value.enabled || value.deletedAt != null) return
         val dueDate = LocalDate.parse(value.nextDueDate)
         val reminderAt = dueDate.minusDays(value.leadDays.toLong())
             .atTime(LocalTime.parse(value.reminderTime))
@@ -58,11 +72,13 @@ class AlarmScheduler(
         cancelMedication(value.id)
         if (!value.enabled) return
         val medication = repository.medicationById(value.medicationId) ?: return cancelMedication(value.id)
-        if (medication.archived) return cancelMedication(value.id)
+        if (medication.archived || medication.deletedAt != null) return cancelMedication(value.id)
         val time = LocalTime.parse(value.localTime)
         val now = LocalDateTime.now()
-        val start = LocalDate.parse(medication.startDate)
-        val end = medication.endDate?.let(LocalDate::parse)
+        val start = maxOf(LocalDate.parse(medication.startDate), LocalDate.parse(value.effectiveFrom))
+        val medicationEnd = medication.endDate?.let(LocalDate::parse)
+        val scheduleEnd = value.effectiveTo?.let(LocalDate::parse)
+        val end = listOfNotNull(medicationEnd, scheduleEnd).minOrNull()
         var nextDate = maxOf(LocalDate.now(), start)
         var next = LocalDateTime.of(nextDate, time)
         if (!next.isAfter(now)) {
@@ -140,4 +156,8 @@ class AlarmScheduler(
     private fun medicationRequestCode(id: Long) = id.hashCode()
     private fun legacyFollowUpRequestCode(id: Long) = (id % 400_000).toInt() + 100_000
     private fun legacyMedicationRequestCode(id: Long) = (id % 400_000).toInt() + 600_000
+
+    private companion object {
+        const val TEST_REMINDER_REQUEST_CODE = 1_950_001
+    }
 }

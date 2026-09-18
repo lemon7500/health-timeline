@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  harmony-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/validate-harmony-v4.mjs
+      - run: node scripts/validate-backup-v5.mjs
+
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -17,7 +27,7 @@ jobs:
           cache: gradle
       - uses: android-actions/setup-android@v3
       - run: chmod +x gradlew
-      - run: ./gradlew :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintDebug :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
+      - run: ./gradlew :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintRelease :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
       - uses: actions/upload-artifact@v4
         with:
           name: android-debug-apk
@@ -66,4 +76,6 @@ jobs:
       - run: pod install
         working-directory: apps/ios
       - run: xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+        working-directory: apps/ios
+      - run: xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' CODE_SIGNING_ALLOWED=NO test
         working-directory: apps/ios

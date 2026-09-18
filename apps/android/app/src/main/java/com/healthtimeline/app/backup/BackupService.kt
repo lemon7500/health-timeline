@@ -165,7 +165,7 @@ class BackupService(
             zip.write(SnapshotJson.encode(portableSnapshot).toString().toByteArray(Charsets.UTF_8))
             zip.closeEntry()
             snapshot.attachments.forEach { attachment ->
-                val file = File(context.filesDir, attachment.relativePath)
+                val file = repository.attachmentStore.file(attachment)
                 require(file.isFile) { "附件缺失：${attachment.displayName}" }
                 require(sha256(file) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
                 zip.putNextEntry(ZipEntry("files/${attachment.id}"))
@@ -259,7 +259,7 @@ class BackupService(
         // Old files are only cleanup; interruption here cannot lose live data.
         val livePaths = restoredSnapshot.attachments.mapTo(hashSetOf()) { it.relativePath }
         previousAttachments.filter { it.relativePath !in livePaths }.forEach { attachment ->
-            runCatching { File(context.filesDir, attachment.relativePath).delete() }
+            runCatching { repository.attachmentStore.file(attachment).delete() }
         }
     }
 
@@ -437,6 +437,7 @@ internal object BackupSnapshotValidator {
             require(listOf(it.symptoms, it.diagnosis, it.treatment, it.medicationNotes, it.notes).all { text -> text.length <= 20_000 }) { "病历内容过长" }
             require(it.hospital.length <= 200 && it.clinician.length <= 100) { "医院或医生信息过长" }
             instant(it.createdAt); instant(it.updatedAt)
+            it.deletedAt?.let(::instant)
         }
         val attachmentPaths = hashSetOf<String>()
         value.attachments.forEach {
@@ -446,7 +447,7 @@ internal object BackupSnapshotValidator {
             require(it.relativePath.startsWith("attachments/") && attachmentPaths.add(it.relativePath)) { "附件路径异常或重复" }
             require(it.sizeBytes in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常" }
             require(sha256Pattern.matches(it.sha256)) { "附件校验值异常" }
-            instant(it.createdAt)
+            instant(it.createdAt); instant(it.updatedAt); it.deletedAt?.let(::instant)
         }
         value.followUps.forEach {
             require(it.conditionId == null || it.conditionId in conditionIds) { "复查计划引用了不存在的病情分类" }
@@ -457,6 +458,7 @@ internal object BackupSnapshotValidator {
             require(it.leadDays in 0..365) { "复查提前天数异常" }
             LocalDate.parse(it.anchorDate); LocalDate.parse(it.nextDueDate); LocalTime.parse(it.reminderTime)
             instant(it.createdAt); instant(it.updatedAt)
+            it.deletedAt?.let(::instant)
         }
         val occurrenceKeys = hashSetOf<String>()
         value.occurrences.forEach {
@@ -473,6 +475,9 @@ internal object BackupSnapshotValidator {
             require(it.instructions.length <= 5_000) { "服用说明过长" }
             val start = LocalDate.parse(it.startDate)
             it.endDate?.let { end -> require(!LocalDate.parse(end).isBefore(start)) { "药物结束日期早于开始日期" } }
+            it.archivedPreviousEndDate?.let { end -> require(!LocalDate.parse(end).isBefore(start)) { "药物原计划结束日期早于开始日期" } }
+            it.endedAt?.let(::instant)
+            it.deletedAt?.let(::instant)
             require(runCatching { MedicationMode.valueOf(it.mode) }.isSuccess) { "用药模式异常" }
             instant(it.createdAt); instant(it.updatedAt)
         }
@@ -517,14 +522,30 @@ private object SnapshotJson {
 
     fun decode(json: JSONObject): BackupSnapshot {
         require(json.optInt("schemaVersion", -1) == 1) { "不支持的备份数据版本" }
+        val medications = json.objects("medications") { medication(it) }
+        val medicationById = medications.associateBy { it.id }
+        val nextOrder = hashMapOf<String, Long>()
         return BackupSnapshot(
             conditions = json.objects("conditions") { condition(it) },
-            records = json.objects("records") { record(it) },
+            records = json.objects("records") { record(it) }.map { record ->
+                val order = nextOrder.getOrDefault(record.recordDate, 0L)
+                nextOrder[record.recordDate] = order + 1L
+                record.copy(dayOrder = order)
+            },
             attachments = json.objects("attachments") { attachment(it) },
             followUps = json.objects("followUps") { followUp(it) },
             occurrences = json.objects("occurrences") { occurrence(it) },
-            medications = json.objects("medications") { medication(it) },
-            medicationSchedules = json.objects("medicationSchedules") { medicationSchedule(it) },
+            medications = medications,
+            medicationSchedules = json.objects("medicationSchedules") { medicationSchedule(it) }.map { schedule ->
+                val medication = requireNotNull(medicationById[schedule.medicationId]) { "用药计划引用了不存在的药物" }
+                schedule.copy(
+                    effectiveFrom = medication.startDate,
+                    effectiveTo = medication.endDate,
+                    doseAmountSnapshot = medication.doseAmount,
+                    doseUnitSnapshot = medication.doseUnit,
+                    updatedAt = medication.updatedAt
+                )
+            },
             medicationLogs = json.objects("medicationLogs") { medicationLog(it) }
         )
     }
@@ -583,19 +604,23 @@ private object SnapshotJson {
         put("id", v.id); nullable("conditionId", v.conditionId); put("name", v.name); put("doseAmount", v.doseAmount)
         put("doseUnit", v.doseUnit); put("instructions", v.instructions); put("startDate", v.startDate)
         nullable("endDate", v.endDate); put("mode", v.mode); put("archived", v.archived)
-        put("createdAt", v.createdAt); put("updatedAt", v.updatedAt)
+        put("createdAt", v.createdAt); put("updatedAt", v.updatedAt); nullable("endedAt", v.endedAt)
+        nullable("archivedPreviousEndDate", v.archivedPreviousEndDate)
     }
     private fun medication(v: JSONObject) = MedicationEntity(
         v.long("id"), v.nullableLong("conditionId"), v.text("name"), v.text("doseAmount"), v.text("doseUnit"),
         v.text("instructions"), v.text("startDate"), v.nullableText("endDate"), v.text("mode"), v.bool("archived"),
-        v.text("createdAt"), v.text("updatedAt")
+        v.text("createdAt"), v.text("updatedAt"), endedAt = v.optionalNullableText("endedAt"),
+        archivedPreviousEndDate = v.optionalNullableText("archivedPreviousEndDate")
     )
 
     private fun medicationSchedule(v: MedicationScheduleEntity) = JSONObject().apply {
         put("id", v.id); put("medicationId", v.medicationId); put("localTime", v.localTime); put("enabled", v.enabled)
+        put("pausedByCourseEnd", v.pausedByCourseEnd)
     }
     private fun medicationSchedule(v: JSONObject) = MedicationScheduleEntity(
-        v.long("id"), v.long("medicationId"), v.text("localTime"), v.bool("enabled")
+        v.long("id"), v.long("medicationId"), v.text("localTime"), v.bool("enabled"),
+        pausedByCourseEnd = v.optBoolean("pausedByCourseEnd", false)
     )
 
     private fun medicationLog(v: MedicationLogEntity) = JSONObject().apply {
@@ -615,6 +640,7 @@ private object SnapshotJson {
     private fun JSONObject.int(key: String) = getInt(key)
     private fun JSONObject.bool(key: String) = getBoolean(key)
     private fun JSONObject.nullableText(key: String) = if (isNull(key)) null else getString(key)
+    private fun JSONObject.optionalNullableText(key: String) = if (!has(key) || isNull(key)) null else getString(key)
     private fun JSONObject.nullableLong(key: String) = if (isNull(key)) null else getLong(key)
     private fun JSONObject.nullableInt(key: String) = if (isNull(key)) null else getInt(key)
     private fun <T> JSONObject.objects(key: String, mapper: (JSONObject) -> T): List<T> {

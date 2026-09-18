@@ -7,7 +7,10 @@ import com.healthtimeline.app.data.AttachmentEntity
 import com.healthtimeline.app.data.AttachmentStore
 import com.healthtimeline.app.data.HealthRepository
 import com.healthtimeline.app.data.FamilyMemberEntity
+import com.healthtimeline.app.data.SafetyStatusStore
 import com.healthtimeline.shared.BACKUP_SCHEMA_VERSION
+import com.healthtimeline.shared.FAMILY_BACKUP_SCHEMA_VERSION
+import com.healthtimeline.shared.PREVIOUS_BACKUP_SCHEMA_VERSION
 import com.healthtimeline.shared.BackupImportPreview
 import com.healthtimeline.shared.MergeChoice
 import com.healthtimeline.shared.MergePlanner
@@ -32,7 +35,8 @@ import java.util.zip.ZipOutputStream
 class PortableBackupService(
     private val context: Context,
     private val repository: HealthRepository,
-    private val legacy: BackupService = BackupService(context, repository)
+    private val legacy: BackupService = BackupService(context, repository),
+    private val safetyStatusStore: SafetyStatusStore = SafetyStatusStore(context)
 ) {
     private val database = repository.database
 
@@ -41,8 +45,8 @@ class PortableBackupService(
             repository.mutationMutex.withLock {
                 runCatching {
                     require(password.size >= 8) { "备份密码至少需要 8 位" }
-                    val zip = File.createTempFile("health-v3-", ".zip", context.cacheDir)
-                    val encrypted = File.createTempFile("health-v3-", ".encrypted", context.cacheDir)
+                    val zip = File.createTempFile("health-v5-", ".zip", context.cacheDir)
+                    val encrypted = File.createTempFile("health-v5-", ".encrypted", context.cacheDir)
                     try {
                         val entities = loadEntities()
                         val portable = PortableSnapshotMapper.toPortable(
@@ -58,6 +62,7 @@ class PortableBackupService(
                             }
                         }
                         writeDestination(destination, encrypted)
+                        safetyStatusStore.recordSuccessfulBackup()
                     } finally {
                         zip.delete(); encrypted.delete()
                     }
@@ -179,7 +184,7 @@ class PortableBackupService(
             zip.closeEntry()
             portable.attachments.forEach { attachment ->
                 val entity = requireNotNull(files[attachment.uuid]) { "附件索引缺失：${attachment.displayName}" }
-                val file = File(context.filesDir, entity.relativePath)
+                val file = repository.attachmentStore.file(entity)
                 require(file.isFile) { "附件缺失：${attachment.displayName}" }
                 require(file.length() == attachment.sizeBytes && sha256(file) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
                 zip.putNextEntry(ZipEntry(attachment.archivePath))
@@ -302,7 +307,7 @@ class PortableBackupService(
                 val local = localById[attachment.uuid]
                 val usesIncoming = incoming != null && (local == null || decisions["attachment:${attachment.uuid}"] == MergeChoice.USE_IMPORTED ||
                     (local.sha256 == incoming.sha256 && local.sizeBytes == incoming.sizeBytes))
-                if (usesIncoming && (local == null || local.sha256 != attachment.sha256 || !File(context.filesDir, local.relativePath).isFile)) {
+                if (usesIncoming && (local == null || local.sha256 != attachment.sha256 || !repository.attachmentStore.file(local).isFile)) {
                     val source = File(preparedRoot, "files/${attachment.uuid}")
                     require(source.isFile) { "附件临时文件缺失：${attachment.displayName}" }
                     val destination = File(installed, attachment.uuid)
@@ -318,7 +323,7 @@ class PortableBackupService(
             replaceDatabase(entities)
             val livePaths = entities.attachments.mapTo(hashSetOf()) { it.relativePath }
             current.attachments.filter { it.relativePath !in livePaths }.forEach { old ->
-                runCatching { File(context.filesDir, old.relativePath).delete() }
+                runCatching { repository.attachmentStore.file(old).delete() }
             }
             if (importedPaths.isEmpty()) installed.deleteRecursively()
         } catch (error: Throwable) {
@@ -351,28 +356,59 @@ class PortableBackupService(
         createDefaultMember: Boolean
     ): PortableSnapshot {
         if (value.schemaVersion == BACKUP_SCHEMA_VERSION) return value
-        require(targetMember != null || createDefaultMember) { "请选择旧版备份要导入到的家庭成员" }
-        val member = targetMember?.let {
-            PortableFamilyMember(
-                it.uuid, it.name, it.nickname, it.relationship, it.archived,
-                it.createdAt, it.updatedAt
-            )
-        } ?: PortableFamilyMember(
-            uuid = UUID.nameUUIDFromBytes("health-timeline-v2:${value.sourceInstallationId}".toByteArray()).toString(),
-            name = "本人",
-            nickname = "本人",
-            relationship = "本人",
-            archived = false,
-            createdAt = value.exportedAt,
-            updatedAt = value.exportedAt
-        )
-        return value.copy(
+        val hasMedicationHistory = value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION
+        val familyValue = when (value.schemaVersion) {
+            PREVIOUS_BACKUP_SCHEMA_VERSION -> value
+            FAMILY_BACKUP_SCHEMA_VERSION ->
+                value.copy(members = value.members.map { it.copy(nickname = it.relationship) })
+            else -> {
+                require(targetMember != null || createDefaultMember) { "请选择旧版备份要导入到的家庭成员" }
+                val member = targetMember?.let {
+                    PortableFamilyMember(
+                        it.uuid, it.name, it.relationship, it.relationship, it.archived,
+                        it.createdAt, it.updatedAt
+                    )
+                } ?: PortableFamilyMember(
+                    uuid = UUID.nameUUIDFromBytes("health-timeline-v2:${value.sourceInstallationId}".toByteArray()).toString(),
+                    name = "本人",
+                    nickname = "本人",
+                    relationship = "本人",
+                    archived = false,
+                    createdAt = value.exportedAt,
+                    updatedAt = value.exportedAt
+                )
+                value.copy(
+                    members = listOf(member),
+                    conditions = value.conditions.map { it.copy(memberUuid = member.uuid) },
+                    records = value.records.map { it.copy(memberUuid = member.uuid) },
+                    followUps = value.followUps.map { it.copy(memberUuid = member.uuid) },
+                    medications = value.medications.map { it.copy(memberUuid = member.uuid) }
+                )
+            }
+        }
+        val medicationByUuid = familyValue.medications.associateBy { it.uuid }
+        val nextOrder = hashMapOf<String, Long>()
+        return familyValue.copy(
             schemaVersion = BACKUP_SCHEMA_VERSION,
-            members = listOf(member),
-            conditions = value.conditions.map { it.copy(memberUuid = member.uuid) },
-            records = value.records.map { it.copy(memberUuid = member.uuid) },
-            followUps = value.followUps.map { it.copy(memberUuid = member.uuid) },
-            medications = value.medications.map { it.copy(memberUuid = member.uuid) }
+            records = if (hasMedicationHistory) familyValue.records else familyValue.records.map { record ->
+                val key = "${record.memberUuid}:${record.recordDate}"
+                val order = nextOrder.getOrDefault(key, 0L)
+                nextOrder[key] = order + 1L
+                record.copy(dayOrder = order)
+            },
+            medicationSchedules = if (hasMedicationHistory) {
+                familyValue.medicationSchedules
+            } else familyValue.medicationSchedules.map { schedule ->
+                val medication = requireNotNull(medicationByUuid[schedule.medicationUuid]) {
+                    "用药计划引用了不存在的药物"
+                }
+                schedule.copy(
+                    effectiveFrom = medication.startDate,
+                    effectiveTo = medication.endDate,
+                    doseAmountSnapshot = medication.doseAmount,
+                    doseUnitSnapshot = medication.doseUnit
+                )
+            }
         ).also(com.healthtimeline.shared.PortableSnapshotValidator::validate)
     }
 

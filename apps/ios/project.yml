@@ -26,3 +26,11 @@ targets:
       - package: ZIPFoundation
       - framework: ../../shared/core/build/bin/iosSimulatorArm64/debugFramework/HealthTimelineCore.framework
         embed: false
+  HealthTimelineTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - Tests
+    dependencies:
+      - target: HealthTimeline

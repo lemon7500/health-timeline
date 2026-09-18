@@ -1,6 +1,7 @@
 package com.healthtimeline.app.ui
 
 import android.content.Context
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,6 +20,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowForwardIos
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -35,6 +37,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.HealthTimelineApplication
+import com.healthtimeline.app.domain.AiRecordFormattingPromptBuilder
 import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.IssueSeverity
 import com.healthtimeline.app.domain.ParsedClinicalRecordDraft
@@ -213,8 +216,8 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
     }
     deleteTarget?.let { target ->
         ConfirmDialog(
-            title = "删除病历？",
-            message = "病历和它的全部检查报告会被永久删除。",
+            title = "将病历移入回收站？",
+            message = "病历和它的全部检查报告会保留 30 天，期间可在设置的回收站中恢复。",
             onConfirm = { viewModel.deleteRecord(target); deleteTarget = null },
             onDismiss = { deleteTarget = null }
         )
@@ -327,6 +330,81 @@ private fun MonthGrid(
     }
 }
 
+internal data class EditableQuickDraft(
+    val date: String,
+    val title: String,
+    val conditionName: String,
+    val stage: String,
+    val symptoms: String,
+    val diagnosis: String,
+    val treatment: String,
+    val medicationNotes: String,
+    val hospital: String,
+    val clinician: String,
+    val notes: String,
+    val parserWarnings: List<QuickEntryIssue>,
+    val unrecognizedSegments: List<String>
+)
+
+internal fun ParsedClinicalRecordDraft.toEditableQuickDraft() = EditableQuickDraft(
+    date = recordDate?.toString().orEmpty(),
+    title = title.orEmpty(),
+    conditionName = conditionName.orEmpty(),
+    stage = stage?.name ?: VisitStage.OTHER.name,
+    symptoms = symptoms,
+    diagnosis = diagnosis,
+    treatment = treatment,
+    medicationNotes = medicationNotes,
+    hospital = hospital,
+    clinician = clinician,
+    notes = notes,
+    parserWarnings = issues.filter { it.severity == IssueSeverity.WARNING },
+    unrecognizedSegments = unrecognizedSegments
+)
+
+internal fun EditableQuickDraft.validationIssues(appendUnknownToNotes: Boolean): List<QuickEntryIssue> = buildList {
+    if (runCatching { LocalDate.parse(date) }.getOrNull() == null) {
+        add(QuickEntryIssue(IssueSeverity.ERROR, "日期", "INVALID_DATE", "日期格式不正确"))
+    }
+    if (title.isBlank()) add(QuickEntryIssue(IssueSeverity.ERROR, "小标题", "MISSING_TITLE", "请填写小标题"))
+    val completedTitle = ClinicalRecordQuickParser.titleWithCondition(title, conditionName)
+    if (completedTitle.length > 100) {
+        add(QuickEntryIssue(IssueSeverity.ERROR, "小标题", "TITLE_TOO_LONG", "补上病名后不能超过 100 个字符"))
+    }
+    if (conditionName.length > 50) add(QuickEntryIssue(IssueSeverity.ERROR, "病情分类", "CONDITION_TOO_LONG", "不能超过 50 个字符"))
+    if (hospital.length > 100) add(QuickEntryIssue(IssueSeverity.ERROR, "医院", "HOSPITAL_TOO_LONG", "不能超过 100 个字符"))
+    if (clinician.length > 100) add(QuickEntryIssue(IssueSeverity.ERROR, "医生", "CLINICIAN_TOO_LONG", "不能超过 100 个字符"))
+    val completedNotes = if (appendUnknownToNotes) {
+        listOf(notes, unrecognizedSegments.joinToString("\n")).filter(String::isNotBlank).joinToString("\n")
+    } else notes
+    if (!hasSourceRecord(completedNotes)) {
+        add(
+            QuickEntryIssue(
+                IssueSeverity.ERROR,
+                "其他备注",
+                "MISSING_SOURCE_RECORD",
+                "快速录入必须在备注中保留“原文记录：”及对应原文"
+            )
+        )
+    }
+    listOf(
+        "症状/病情" to symptoms,
+        "诊断" to diagnosis,
+        "治疗方案" to treatment,
+        "就诊用药记录" to medicationNotes,
+        "其他备注" to completedNotes
+    ).forEach { (field, value) ->
+        if (value.length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH) {
+            add(QuickEntryIssue(IssueSeverity.ERROR, field, "FIELD_TOO_LONG", "不能超过 10,000 个字符"))
+        }
+    }
+}
+
+private fun hasSourceRecord(value: String): Boolean {
+    val marker = value.indexOf(ClinicalRecordQuickParser.SOURCE_PREFIX)
+    return marker >= 0 && value.substring(marker + ClinicalRecordQuickParser.SOURCE_PREFIX.length).isNotBlank()
+}
+
 @Composable
 private fun RecordEditorDialog(
     initialDate: String,
@@ -355,7 +433,10 @@ private fun RecordEditorDialog(
     var quickIssues by remember(record) { mutableStateOf<List<QuickEntryIssue>>(emptyList()) }
     var unrecognizedSegments by remember(record) { mutableStateOf<List<String>>(emptyList()) }
     var quickApplied by remember(record) { mutableStateOf(false) }
-    var batchDrafts by remember(record) { mutableStateOf<List<ParsedClinicalRecordDraft>>(emptyList()) }
+    var aiHelpExpanded by remember(record) { mutableStateOf(false) }
+    var aiCopyMessage by remember(record) { mutableStateOf<String?>(null) }
+    var batchDrafts by remember(record) { mutableStateOf<List<EditableQuickDraft>>(emptyList()) }
+    var expandedBatchIndex by remember(record) { mutableStateOf<Int?>(null) }
     var appendBatchUnknownToNotes by remember(record) { mutableStateOf(false) }
     var confirmBatchSave by remember(record) { mutableStateOf(false) }
     var conditionResolution by remember(record) {
@@ -386,7 +467,7 @@ private fun RecordEditorDialog(
                                 Column(Modifier.weight(1f)) {
                                     Text("快速录入", fontWeight = FontWeight.SemiBold)
                                     Text(
-                                        "可直接粘贴自然叙述，也可使用字段模板；解析后请核对再保存",
+                                        "简单内容可离线解析；复杂长文建议先用 AI 整理成模板，保存前必须核对",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -400,6 +481,7 @@ private fun RecordEditorDialog(
                                         quickInput = it
                                         quickApplied = false
                                         batchDrafts = emptyList()
+                                        expandedBatchIndex = null
                                     },
                                     label = { Text("病历文字（最多 50,000 字）") },
                                     minLines = 5,
@@ -408,6 +490,90 @@ private fun RecordEditorDialog(
                                     isError = quickInput.length > ClinicalRecordQuickParser.MAX_INPUT_LENGTH,
                                     modifier = Modifier.fillMaxWidth()
                                 )
+                                OutlinedCard(Modifier.fillMaxWidth()) {
+                                    Column(
+                                        Modifier.fillMaxWidth().padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(7.dp)
+                                    ) {
+                                        Row(
+                                            Modifier.fillMaxWidth().clickable { aiHelpExpanded = !aiHelpExpanded },
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(Modifier.weight(1f)) {
+                                                Text("AI 辅助整理（可选）", fontWeight = FontWeight.SemiBold)
+                                                Text(
+                                                    "只复制提示词和空模板，不会复制上方病历原文",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            Text(if (aiHelpExpanded) "收起" else "查看", color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        Text(
+                                            "使用外部 AI 前，请先删除姓名、身份证号、电话、住址等敏感信息。",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                        if (aiHelpExpanded) {
+                                            Text(
+                                                "1. 复制提示词并粘贴到自行选择的 AI。\n" +
+                                                    "2. 将脱敏后的病程文字粘贴在提示词末尾。\n" +
+                                                    "3. 复制 AI 返回的模板内容。\n" +
+                                                    "4. 返回本页粘贴、解析，并逐条展开核对。",
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            val defaultYear = runCatching { LocalDate.parse(date).year }
+                                                .getOrDefault(LocalDate.now().year)
+                                            val aiPrompt = AiRecordFormattingPromptBuilder.build(defaultYear)
+                                            Button(
+                                                onClick = {
+                                                    val copied = runCatching {
+                                                        val clipboard = context.getSystemService(ClipboardManager::class.java)
+                                                        requireNotNull(clipboard).setPrimaryClip(
+                                                            ClipData.newPlainText("病程日历 AI 整理提示词", aiPrompt)
+                                                        )
+                                                    }.isSuccess
+                                                    aiCopyMessage = if (copied) {
+                                                        "提示词已复制，未复制病历原文"
+                                                    } else {
+                                                        "复制失败，请重试"
+                                                    }
+                                                },
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) { Text("复制 AI 整理提示词") }
+                                            aiCopyMessage?.let {
+                                                Text(
+                                                    it,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = if (it.startsWith("提示词已复制")) {
+                                                        MaterialTheme.colorScheme.primary
+                                                    } else {
+                                                        MaterialTheme.colorScheme.error
+                                                    }
+                                                )
+                                            }
+                                            Text("提示词预览", style = MaterialTheme.typography.labelMedium)
+                                            Text(
+                                                aiPrompt,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .background(
+                                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                                        RoundedCornerShape(6.dp)
+                                                    )
+                                                    .padding(8.dp)
+                                            )
+                                            Text(
+                                                "外部 AI 的数据处理和隐私规则不受病程日历控制。",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                }
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     OutlinedButton(
                                         onClick = {
@@ -433,6 +599,7 @@ private fun RecordEditorDialog(
                                                 unrecognizedSegments = emptyList()
                                                 quickApplied = false
                                                 batchDrafts = emptyList()
+                                                expandedBatchIndex = null
                                             }
                                         },
                                         modifier = Modifier.weight(1f)
@@ -446,6 +613,7 @@ private fun RecordEditorDialog(
                                             unrecognizedSegments = emptyList()
                                             quickApplied = false
                                             batchDrafts = emptyList()
+                                            expandedBatchIndex = null
                                         },
                                         modifier = Modifier.weight(1f)
                                     ) { Text("插入模板") }
@@ -460,12 +628,14 @@ private fun RecordEditorDialog(
                                             unrecognizedSegments = draft?.unrecognizedSegments.orEmpty()
                                             quickApplied = false
                                             batchDrafts = emptyList()
+                                            expandedBatchIndex = null
                                             appendBatchUnknownToNotes = false
                                             pendingNewCondition = null
                                             pendingArchivedCondition = null
                                             if (batch.records.size > 1) {
-                                                batchDrafts = batch.records
-                                            } else if (draft != null && !draft.hasErrors) {
+                                                batchDrafts = batch.records.map { it.toEditableQuickDraft() }
+                                                expandedBatchIndex = 0
+                                            } else if (draft != null && !batch.hasErrors) {
                                                 date = requireNotNull(draft.recordDate).toString()
                                                 title = requireNotNull(draft.title).trim()
                                                 stage = draft.stage?.name ?: VisitStage.OTHER.name
@@ -509,6 +679,7 @@ private fun RecordEditorDialog(
                                             unrecognizedSegments = emptyList()
                                             quickApplied = false
                                             batchDrafts = emptyList()
+                                            expandedBatchIndex = null
                                             appendBatchUnknownToNotes = false
                                             pendingNewCondition = null
                                             pendingArchivedCondition = null
@@ -562,47 +733,126 @@ private fun RecordEditorDialog(
                                     )
                                 }
                                 if (batchDrafts.isNotEmpty()) {
-                                    val batchAppendTooLong = appendBatchUnknownToNotes && batchDrafts.any { draft ->
-                                        val addition = draft.unrecognizedSegments.joinToString("\n")
-                                        listOf(draft.notes, addition).filter { it.isNotBlank() }
-                                            .joinToString("\n").length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH
-                                    }
-                                    val batchHasErrors = batchDrafts.any { it.hasErrors } ||
-                                        quickIssues.any { it.severity == IssueSeverity.ERROR } || batchAppendTooLong
+                                    val batchHasErrors = batchDrafts.any {
+                                        it.validationIssues(appendBatchUnknownToNotes).any { issue -> issue.severity == IssueSeverity.ERROR }
+                                    } || quickIssues.any { it.severity == IssueSeverity.ERROR }
                                     Text(
-                                        "已识别 ${batchDrafts.size} 条记录，请核对每条内容",
+                                        "已识别 ${batchDrafts.size} 条记录。请逐条展开、修改并核对，确认前不会保存。",
                                         style = MaterialTheme.typography.titleSmall,
                                         color = MaterialTheme.colorScheme.primary
                                     )
                                     batchDrafts.forEachIndexed { index, draft ->
+                                        val expanded = expandedBatchIndex == index
+                                        val draftIssues = draft.parserWarnings + draft.validationIssues(appendBatchUnknownToNotes)
+                                        val updateDraft: ((EditableQuickDraft) -> EditableQuickDraft) -> Unit = { transform ->
+                                            batchDrafts = batchDrafts.mapIndexed { itemIndex, item ->
+                                                if (itemIndex == index) transform(item) else item
+                                            }
+                                        }
                                         OutlinedCard(Modifier.fillMaxWidth()) {
                                             Column(
                                                 Modifier.fillMaxWidth().padding(10.dp),
-                                                verticalArrangement = Arrangement.spacedBy(3.dp)
+                                                verticalArrangement = Arrangement.spacedBy(7.dp)
                                             ) {
-                                                Text(
-                                                    "${index + 1}. ${draft.recordDate ?: "日期有误"} · ${draft.title ?: "标题未填"}",
-                                                    fontWeight = FontWeight.SemiBold
-                                                )
-                                                draft.conditionName?.takeIf { it.isNotBlank() }?.let { Text("分类：$it") }
-                                                draft.symptoms.takeIf { it.isNotBlank() }?.let { Text("病情：$it", maxLines = 2, overflow = TextOverflow.Ellipsis) }
-                                                draft.diagnosis.takeIf { it.isNotBlank() }?.let { Text("诊断：$it", maxLines = 2, overflow = TextOverflow.Ellipsis) }
-                                                draft.issues.forEach { issue ->
+                                                Row(
+                                                    Modifier.fillMaxWidth().clickable {
+                                                        expandedBatchIndex = if (expanded) null else index
+                                                    },
+                                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
                                                     Text(
-                                                        issue.message,
+                                                        "${index + 1}. ${draft.date.ifBlank { "日期有误" }} · ${draft.title.ifBlank { "标题未填" }}",
+                                                        fontWeight = FontWeight.SemiBold,
+                                                        modifier = Modifier.weight(1f)
+                                                    )
+                                                    Text(if (expanded) "收起" else "展开核对", color = MaterialTheme.colorScheme.primary)
+                                                }
+                                                if (!expanded) {
+                                                    draft.conditionName.takeIf { it.isNotBlank() }?.let { Text("分类：$it") }
+                                                    draft.diagnosis.takeIf { it.isNotBlank() }?.let {
+                                                        Text("诊断：$it", maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                                    }
+                                                } else {
+                                                    OutlinedTextField(
+                                                        draft.date,
+                                                        { value -> updateDraft { it.copy(date = value) } },
+                                                        label = { Text("日期（YYYY-MM-DD）*") },
+                                                        singleLine = true,
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                    OutlinedTextField(
+                                                        draft.title,
+                                                        { value -> updateDraft { it.copy(title = value) } },
+                                                        label = { Text("小标题 *") },
+                                                        supportingText = { Text("保存时会自动补上病情分类名称") },
+                                                        singleLine = true,
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                    OutlinedTextField(
+                                                        draft.conditionName,
+                                                        { value -> updateDraft { it.copy(conditionName = value) } },
+                                                        label = { Text("病情分类") },
+                                                        singleLine = true,
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                    LabeledDropdown(
+                                                        "记录类型",
+                                                        draft.stage,
+                                                        VisitStage.entries.map { it.name to visitStageLabel(it.name) },
+                                                        { value -> updateDraft { it.copy(stage = value) } }
+                                                    )
+                                                    MultiField("症状/病情", draft.symptoms) { value ->
+                                                        updateDraft { it.copy(symptoms = value) }
+                                                    }
+                                                    MultiField("诊断", draft.diagnosis) { value ->
+                                                        updateDraft { it.copy(diagnosis = value) }
+                                                    }
+                                                    MultiField("治疗方案", draft.treatment) { value ->
+                                                        updateDraft { it.copy(treatment = value) }
+                                                    }
+                                                    MultiField("就诊用药记录", draft.medicationNotes) { value ->
+                                                        updateDraft { it.copy(medicationNotes = value) }
+                                                    }
+                                                    OutlinedTextField(
+                                                        draft.hospital,
+                                                        { value -> updateDraft { it.copy(hospital = value) } },
+                                                        label = { Text("医院") },
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                    OutlinedTextField(
+                                                        draft.clinician,
+                                                        { value -> updateDraft { it.copy(clinician = value) } },
+                                                        label = { Text("医生") },
+                                                        modifier = Modifier.fillMaxWidth()
+                                                    )
+                                                    MultiField("其他备注（包含自然叙述原文）", draft.notes) { value ->
+                                                        updateDraft { it.copy(notes = value) }
+                                                    }
+                                                    if (draft.unrecognizedSegments.isNotEmpty()) {
+                                                        Text(
+                                                            "未识别：${draft.unrecognizedSegments.joinToString("；")}",
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = MaterialTheme.colorScheme.tertiary
+                                                        )
+                                                    }
+                                                    TextButton(onClick = {
+                                                        batchDrafts = batchDrafts.filterIndexed { itemIndex, _ -> itemIndex != index }
+                                                        expandedBatchIndex = null
+                                                    }) { Text("不保存此条") }
+                                                }
+                                                draftIssues.forEach { issue ->
+                                                    Text(
+                                                        buildString {
+                                                            if (!issue.field.isNullOrBlank()) append("${issue.field}：")
+                                                            append(issue.message)
+                                                        },
                                                         style = MaterialTheme.typography.bodySmall,
                                                         color = if (issue.severity == IssueSeverity.ERROR) {
                                                             MaterialTheme.colorScheme.error
                                                         } else {
                                                             MaterialTheme.colorScheme.tertiary
                                                         }
-                                                    )
-                                                }
-                                                if (draft.unrecognizedSegments.isNotEmpty()) {
-                                                    Text(
-                                                        "未识别：${draft.unrecognizedSegments.joinToString("；")}",
-                                                        style = MaterialTheme.typography.bodySmall,
-                                                        color = MaterialTheme.colorScheme.tertiary
                                                     )
                                                 }
                                             }
@@ -624,8 +874,7 @@ private fun RecordEditorDialog(
                                     ) { Text("核对并保存 ${batchDrafts.size} 条记录") }
                                     if (batchHasErrors) {
                                         Text(
-                                            if (batchAppendTooLong) "追加未识别内容后备注超过 10,000 字，请缩短原文"
-                                            else "请先修改有错误的原文并重新解析",
+                                            "请展开带红色提示的记录并修改；不需要重新解析整段文字。",
                                             color = MaterialTheme.colorScheme.error
                                         )
                                     }
@@ -637,9 +886,10 @@ private fun RecordEditorDialog(
                 OutlinedTextField(date, { date = it.take(10) }, label = { Text("日期（YYYY-MM-DD）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(
                     title,
-                    { title = it.take(100) },
+                    { title = it },
                     label = { Text("小标题 *") },
-                    supportingText = { Text("选择病情分类后，保存时会自动补上病名") },
+                    supportingText = { Text("${title.length} / 100；保存时会把病情分类名称放在标题第一位") },
+                    isError = title.length > 100,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -676,8 +926,22 @@ private fun RecordEditorDialog(
                 MultiField("诊断", diagnosis) { diagnosis = it }
                 MultiField("治疗方案", treatment) { treatment = it }
                 MultiField("就诊用药记录", medicationNotes) { medicationNotes = it }
-                OutlinedTextField(hospital, { hospital = it.take(100) }, label = { Text("医院") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(clinician, { clinician = it.take(100) }, label = { Text("医生") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    hospital,
+                    { hospital = it },
+                    label = { Text("医院") },
+                    supportingText = { Text("${hospital.length} / 100") },
+                    isError = hospital.length > 100,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    clinician,
+                    { clinician = it },
+                    label = { Text("医生") },
+                    supportingText = { Text("${clinician.length} / 100") },
+                    isError = clinician.length > 100,
+                    modifier = Modifier.fillMaxWidth()
+                )
                 MultiField("其他备注", notes) { notes = it }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
@@ -696,6 +960,11 @@ private fun RecordEditorDialog(
                     title.isBlank() -> error = "请填写小标题"
                     completedTitle.length > 100 -> error = "补上病名后小标题超过 100 个字符，请缩短"
                     validDate == null -> error = "日期格式不正确"
+                    hospital.length > 100 -> error = "医院不能超过 100 个字符"
+                    clinician.length > 100 -> error = "医生不能超过 100 个字符"
+                    listOf(symptoms, diagnosis, treatment, medicationNotes, notes).any {
+                        it.length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH
+                    } -> error = "症状、诊断、治疗、用药和备注每项不能超过 10,000 个字符"
                     else -> {
                         submitting = true
                         onSave(
@@ -710,7 +979,8 @@ private fun RecordEditorDialog(
                                 createdAt = record?.createdAt ?: now,
                                 updatedAt = now,
                                 uuid = record?.uuid ?: java.util.UUID.randomUUID().toString(),
-                                memberId = memberId
+                                memberId = memberId,
+                                dayOrder = record?.dayOrder ?: 0L
                             ),
                             conditionResolution
                         ) { submitting = false }
@@ -826,14 +1096,14 @@ private fun RecordEditorDialog(
     }
 }
 
-private fun prepareQuickBatchRequests(
-    drafts: List<ParsedClinicalRecordDraft>,
+internal fun prepareQuickBatchRequests(
+    drafts: List<EditableQuickDraft>,
     conditions: List<ConditionEntity>,
     memberId: Long,
     appendUnknownToNotes: Boolean,
     timestamp: String
 ): List<ClinicalRecordSaveRequest> = drafts.map { draft ->
-    val conditionName = draft.conditionName?.trim().orEmpty()
+    val conditionName = draft.conditionName.trim()
     val matched = conditionName.takeIf { it.isNotBlank() }?.let { requested ->
         val normalized = ClinicalRecordQuickParser.normalizeConditionName(requested)
         conditions.firstOrNull { ClinicalRecordQuickParser.normalizeConditionName(it.name) == normalized }
@@ -854,9 +1124,9 @@ private fun prepareQuickBatchRequests(
     ClinicalRecordSaveRequest(
         record = ClinicalRecordEntity(
             conditionId = matched?.id,
-            recordDate = requireNotNull(draft.recordDate).toString(),
-            title = requireNotNull(draft.title).trim(),
-            stage = draft.stage?.name ?: VisitStage.OTHER.name,
+            recordDate = LocalDate.parse(draft.date).toString(),
+            title = ClinicalRecordQuickParser.titleWithCondition(draft.title, conditionName),
+            stage = draft.stage,
             symptoms = draft.symptoms.trim(),
             diagnosis = draft.diagnosis.trim(),
             treatment = draft.treatment.trim(),
@@ -876,8 +1146,10 @@ private fun prepareQuickBatchRequests(
 private fun MultiField(label: String, value: String, onChange: (String) -> Unit) {
     OutlinedTextField(
         value,
-        { onChange(it.take(10_000)) },
+        onChange,
         label = { Text(label) },
+        supportingText = { Text("${value.length} / ${ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH}") },
+        isError = value.length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH,
         minLines = 2,
         maxLines = 5,
         modifier = Modifier.fillMaxWidth()
@@ -895,6 +1167,7 @@ private fun RecordDetailDialog(
     onDismiss: () -> Unit
 ) {
     var viewer by remember { mutableStateOf<AttachmentEntity?>(null) }
+    var attachmentDeleteTarget by remember { mutableStateOf<AttachmentEntity?>(null) }
     var cameraUriText by rememberSaveable { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
@@ -936,6 +1209,11 @@ private fun RecordDetailDialog(
                     ListItem(
                         headlineContent = { Text(attachment.displayName, maxLines = 1) },
                         supportingContent = { Text(if (attachment.kind == AttachmentKind.PDF.name) "PDF" else "图片") },
+                        trailingContent = {
+                            IconButton(onClick = { attachmentDeleteTarget = attachment }) {
+                                Icon(Icons.Outlined.Delete, "删除${attachment.displayName}", tint = MaterialTheme.colorScheme.error)
+                            }
+                        },
                         modifier = Modifier.clickable { viewer = attachment }
                     )
                 }
@@ -946,7 +1224,27 @@ private fun RecordDetailDialog(
             Row { TextButton(onClick = onDelete) { Text("删除", color = MaterialTheme.colorScheme.error) }; TextButton(onClick = onDismiss) { Text("关闭") } }
         }
     )
-    viewer?.let { AttachmentViewerDialog(it, viewModel.attachmentFile(it), onDismiss = { viewer = null }) }
+    viewer?.let { attachment ->
+        AttachmentViewerDialog(
+            attachment,
+            viewModel.attachmentFile(attachment),
+            onDismiss = { viewer = null },
+            onDelete = { attachmentDeleteTarget = attachment }
+        )
+    }
+    attachmentDeleteTarget?.let { attachment ->
+        ConfirmDialog(
+            "将检查报告移入回收站？",
+            "“${attachment.displayName}”会保留 30 天，期间可在设置的回收站中恢复，不影响所属病历。",
+            {
+                viewModel.deleteAttachment(attachment) {
+                    if (viewer?.id == attachment.id) viewer = null
+                }
+                attachmentDeleteTarget = null
+            },
+            { attachmentDeleteTarget = null }
+        )
+    }
 }
 
 @Composable

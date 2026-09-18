@@ -14,7 +14,14 @@ object PortableSnapshotValidator {
     private val timePattern = Regex("(?:[01]\\d|2[0-3]):[0-5]\\d")
 
     fun validate(value: PortableSnapshot) {
-        require(value.schemaVersion in setOf(LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION, BACKUP_SCHEMA_VERSION)) { "不支持的备份数据版本" }
+        require(
+            value.schemaVersion in setOf(
+                LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION,
+                FAMILY_BACKUP_SCHEMA_VERSION,
+                PREVIOUS_BACKUP_SCHEMA_VERSION,
+                BACKUP_SCHEMA_VERSION
+            )
+        ) { "不支持的备份数据版本" }
         instant(value.exportedAt)
         require(value.sourcePlatform in setOf("android", "ios", "harmony", "test")) { "来源平台异常" }
         uuid(value.sourceInstallationId, "来源安装标识")
@@ -40,10 +47,11 @@ object PortableSnapshotValidator {
         val recordIds = value.records.mapTo(hashSetOf()) { it.uuid }
         val followUpIds = value.followUps.mapTo(hashSetOf()) { it.uuid }
         val medicationIds = value.medications.mapTo(hashSetOf()) { it.uuid }
+        val medicationsById = value.medications.associateBy { it.uuid }
         val scheduleIds = value.medicationSchedules.mapTo(hashSetOf()) { it.uuid }
         val scheduleMedications = value.medicationSchedules.associate { it.uuid to it.medicationUuid }
 
-        if (value.schemaVersion == BACKUP_SCHEMA_VERSION) {
+        if (value.schemaVersion >= FAMILY_BACKUP_SCHEMA_VERSION) {
             require(value.members.isNotEmpty()) { "备份缺少家庭成员" }
             require(value.members.any { !it.archived }) { "备份至少需要一个未归档家庭成员" }
         } else {
@@ -54,6 +62,9 @@ object PortableSnapshotValidator {
             require(it.nickname.isNotBlank() && it.nickname.length <= 30) { "家庭成员称呼异常" }
             require(it.relationship.isNotBlank() && it.relationship.length <= 30) { "家庭成员关系异常" }
             timestamps(it.createdAt, it.updatedAt)
+            if (value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION) {
+                require(it.nickname == it.relationship) { "家庭成员兼容称呼必须与关系一致" }
+            }
         }
         value.conditions.forEach {
             memberReference(value.schemaVersion, it.memberUuid, memberIds, "病情分类")
@@ -72,6 +83,8 @@ object PortableSnapshotValidator {
             require(listOf(it.symptoms, it.diagnosis, it.treatment, it.medicationNotes, it.notes).all { text -> text.length <= 20_000 }) { "病历内容过长" }
             require(it.hospital.length <= 200 && it.clinician.length <= 100) { "医院或医生信息过长" }
             timestamps(it.createdAt, it.updatedAt)
+            if (value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION) require(it.dayOrder >= 0) { "病历日期内顺序异常" }
+            it.deletedAt?.let(::instant)
         }
         val archivePaths = hashSetOf<String>()
         value.attachments.forEach {
@@ -82,6 +95,7 @@ object PortableSnapshotValidator {
             require(it.sizeBytes in 0..MAX_ATTACHMENT_BYTES) { "附件大小异常" }
             require(sha256Pattern.matches(it.sha256)) { "附件校验值异常" }
             timestamps(it.createdAt, it.updatedAt)
+            it.deletedAt?.let(::instant)
         }
         value.followUps.forEach {
             memberReference(value.schemaVersion, it.memberUuid, memberIds, "复查计划")
@@ -95,6 +109,7 @@ object PortableSnapshotValidator {
             require(it.weekday == null || it.weekday in 1..7) { "复查星期异常" }
             require(it.leadDays in 0..365 && timePattern.matches(it.reminderTime)) { "复查提醒时间异常" }
             date(it.anchorDate); date(it.nextDueDate); timestamps(it.createdAt, it.updatedAt)
+            it.deletedAt?.let(::instant)
         }
         val occurrenceKeys = hashSetOf<String>()
         value.occurrences.forEach {
@@ -115,11 +130,31 @@ object PortableSnapshotValidator {
             require(it.instructions.length <= 5_000 && it.mode in setOf("SCHEDULED", "AS_NEEDED")) { "用药内容异常" }
             val start = LocalDate.parse(it.startDate)
             it.endDate?.let { end -> require(LocalDate.parse(end) >= start) { "药物结束日期早于开始日期" } }
+            it.archivedPreviousEndDate?.let { end -> require(LocalDate.parse(end) >= start) { "药物原计划结束日期早于开始日期" } }
+            it.endedAt?.let(::instant)
+            it.deletedAt?.let(::instant)
             timestamps(it.createdAt, it.updatedAt)
         }
         value.medicationSchedules.forEach {
             require(it.medicationUuid in medicationIds && timePattern.matches(it.localTime)) { "用药计划异常" }
+            require(!it.pausedByCourseEnd || !it.enabled) { "结束疗程暂停的用药计划不能同时启用" }
             instant(it.updatedAt)
+            if (value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION) {
+                val medication = requireNotNull(medicationsById[it.medicationUuid]) { "用药计划引用了不存在的药物" }
+                val start = LocalDate.parse(it.effectiveFrom)
+                it.effectiveTo?.let { end -> require(LocalDate.parse(end) >= start) { "用药计划结束日期早于生效日期" } }
+                require(it.doseAmountSnapshot.isNotBlank() && it.doseAmountSnapshot.length <= 30) { "用药计划剂量异常" }
+                require(it.doseUnitSnapshot.isNotBlank() && it.doseUnitSnapshot.length <= 20) { "用药计划单位异常" }
+                require(start >= LocalDate.parse(medication.startDate)) { "用药计划早于疗程开始日期" }
+                medication.endDate?.let { medicationEnd ->
+                    require(
+                        it.pausedByCourseEnd ||
+                            (it.effectiveTo != null && LocalDate.parse(it.effectiveTo) <= LocalDate.parse(medicationEnd))
+                    ) {
+                        "用药计划超出疗程结束日期"
+                    }
+                }
+            }
         }
         val medicationLogKeys = hashSetOf<String>()
         value.medicationLogs.forEach {
@@ -132,6 +167,14 @@ object PortableSnapshotValidator {
             require(it.doseAmountSnapshot.length <= 30 && it.doseUnitSnapshot.length <= 20) { "历史剂量异常" }
             timestamps(it.createdAt, it.updatedAt)
         }
+        if (value.schemaVersion == BACKUP_SCHEMA_VERSION) {
+            val recordsById = value.records.associateBy { it.uuid }
+            value.attachments.forEach { attachment ->
+                if (recordsById[attachment.recordUuid]?.deletedAt != null) {
+                    require(attachment.deletedAt != null) { "回收站病历包含未标记删除的附件" }
+                }
+            }
+        }
     }
 
     private fun unique(values: List<String>, label: String) {
@@ -140,7 +183,7 @@ object PortableSnapshotValidator {
     }
 
     private fun memberReference(schemaVersion: Int, value: String?, members: Set<String>, label: String) {
-        if (schemaVersion == BACKUP_SCHEMA_VERSION) {
+        if (schemaVersion >= FAMILY_BACKUP_SCHEMA_VERSION) {
             require(value != null && value in members) { "$label 引用了不存在的家庭成员" }
         } else {
             require(value == null) { "旧版 $label 不应包含家庭成员引用" }

@@ -28,7 +28,7 @@ import javax.crypto.spec.GCMParameterSpec
         MedicationLogEntity::class,
         FamilyMemberEntity::class
     ],
-    version = 4,
+    version = 8,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -52,7 +52,10 @@ abstract class AppDatabase : RoomDatabase() {
             val factory = SupportOpenHelperFactory(passphrase)
             val database = Room.databaseBuilder(context, AppDatabase::class.java, "health_timeline.db")
                 .openHelperFactory(factory)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(
+                    MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+                    MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8
+                )
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
                 .addCallback(object : Callback() {
                     override fun onOpen(db: SupportSQLiteDatabase) {
@@ -215,6 +218,189 @@ abstract class AppDatabase : RoomDatabase() {
                 check(rowCount(db, "family_members") == 1L) { "默认家庭成员创建失败" }
                 oldCounts.forEach { (table, count) ->
                     check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
+                }
+                val violations = mutableListOf<String>()
+                db.query("PRAGMA foreign_key_check").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        violations += "table=${cursor.getString(0)},rowId=${cursor.getLong(1)},parent=${cursor.getString(2)},fk=${cursor.getInt(3)}"
+                    }
+                }
+                check(violations.isEmpty()) { "迁移后数据引用关系异常：${violations.joinToString()}" }
+            }
+        }
+
+        internal val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val protectedTables = listOf(
+                    "family_members", "conditions", "clinical_records", "attachments",
+                    "follow_up_schedules", "follow_up_occurrences", "medications",
+                    "medication_schedules", "medication_logs"
+                )
+                val oldCounts = protectedTables.associateWith { rowCount(db, it) }
+
+                db.execSQL("ALTER TABLE clinical_records ADD COLUMN dayOrder INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN effectiveFrom TEXT NOT NULL DEFAULT '1970-01-01'")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN effectiveTo TEXT")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN doseAmountSnapshot TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN doseUnitSnapshot TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN updatedAt TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'")
+                db.execSQL("ALTER TABLE medication_logs ADD COLUMN updatedAt TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'")
+
+                db.execSQL(
+                    "UPDATE medication_schedules SET " +
+                        "effectiveFrom = (SELECT startDate FROM medications WHERE medications.id = medication_schedules.medicationId), " +
+                        "effectiveTo = (SELECT endDate FROM medications WHERE medications.id = medication_schedules.medicationId), " +
+                        "doseAmountSnapshot = (SELECT doseAmount FROM medications WHERE medications.id = medication_schedules.medicationId), " +
+                        "doseUnitSnapshot = (SELECT doseUnit FROM medications WHERE medications.id = medication_schedules.medicationId), " +
+                        "updatedAt = (SELECT updatedAt FROM medications WHERE medications.id = medication_schedules.medicationId)"
+                )
+                db.execSQL("UPDATE medication_logs SET updatedAt = createdAt")
+
+                var lastMember = Long.MIN_VALUE
+                var lastDate = ""
+                var order = 0L
+                db.query(
+                    "SELECT id, memberId, recordDate FROM clinical_records " +
+                        "ORDER BY memberId, recordDate, updatedAt DESC, id ASC"
+                ).use { cursor ->
+                    val idColumn = cursor.getColumnIndexOrThrow("id")
+                    val memberColumn = cursor.getColumnIndexOrThrow("memberId")
+                    val dateColumn = cursor.getColumnIndexOrThrow("recordDate")
+                    while (cursor.moveToNext()) {
+                        val memberId = cursor.getLong(memberColumn)
+                        val date = cursor.getString(dateColumn)
+                        if (memberId != lastMember || date != lastDate) {
+                            lastMember = memberId
+                            lastDate = date
+                            order = 0L
+                        }
+                        db.execSQL(
+                            "UPDATE clinical_records SET dayOrder = ? WHERE id = ?",
+                            arrayOf<Any>(order++, cursor.getLong(idColumn))
+                        )
+                    }
+                }
+
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_clinical_records_memberId_recordDate_dayOrder " +
+                        "ON clinical_records(memberId,recordDate,dayOrder)"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_medication_schedules_effectiveFrom ON medication_schedules(effectiveFrom)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_medication_schedules_effectiveTo ON medication_schedules(effectiveTo)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_medication_logs_scheduledAt ON medication_logs(scheduledAt)")
+
+                oldCounts.forEach { (table, count) ->
+                    check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
+                }
+                val violations = mutableListOf<String>()
+                db.query("PRAGMA foreign_key_check").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        violations += "table=${cursor.getString(0)},rowId=${cursor.getLong(1)},parent=${cursor.getString(2)},fk=${cursor.getInt(3)}"
+                    }
+                }
+                check(violations.isEmpty()) { "迁移后数据引用关系异常：${violations.joinToString()}" }
+            }
+        }
+
+        internal val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val protectedTables = listOf(
+                    "family_members", "conditions", "clinical_records", "attachments",
+                    "follow_up_schedules", "follow_up_occurrences", "medications",
+                    "medication_schedules", "medication_logs"
+                )
+                val oldCounts = protectedTables.associateWith { rowCount(db, it) }
+
+                db.execSQL("ALTER TABLE medications ADD COLUMN endedAt TEXT")
+                // Older releases used updatedAt for the moment a course was archived. Preserve
+                // that information as the best available exact timestamp and make its final day
+                // queryable by the medication calendar.
+                db.execSQL(
+                    "UPDATE medications SET endedAt = updatedAt, " +
+                        "endDate = COALESCE(endDate, substr(updatedAt, 1, 10)) WHERE archived = 1"
+                )
+
+                oldCounts.forEach { (table, count) ->
+                    check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
+                }
+                val violations = mutableListOf<String>()
+                db.query("PRAGMA foreign_key_check").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        violations += "table=${cursor.getString(0)},rowId=${cursor.getLong(1)},parent=${cursor.getString(2)},fk=${cursor.getInt(3)}"
+                    }
+                }
+                check(violations.isEmpty()) { "迁移后数据引用关系异常：${violations.joinToString()}" }
+            }
+        }
+
+        internal val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val protectedTables = listOf(
+                    "family_members", "conditions", "clinical_records", "attachments",
+                    "follow_up_schedules", "follow_up_occurrences", "medications",
+                    "medication_schedules", "medication_logs"
+                )
+                val oldCounts = protectedTables.associateWith { rowCount(db, it) }
+
+                db.execSQL("ALTER TABLE medications ADD COLUMN archivedPreviousEndDate TEXT")
+                db.execSQL("ALTER TABLE medication_schedules ADD COLUMN pausedByCourseEnd INTEGER NOT NULL DEFAULT 0")
+                // 1.2.5 closed the active schedule on the archive day. Mark that schedule so
+                // restore can safely reopen it without enabling older historical versions.
+                db.execSQL(
+                    "UPDATE medication_schedules SET pausedByCourseEnd = 1, effectiveTo = NULL " +
+                        "WHERE enabled = 0 AND EXISTS (" +
+                        "SELECT 1 FROM medications m WHERE m.id = medication_schedules.medicationId " +
+                        "AND m.archived = 1 AND medication_schedules.effectiveTo = m.endDate " +
+                        "AND medication_schedules.effectiveFrom = (" +
+                        "SELECT MAX(candidate.effectiveFrom) FROM medication_schedules candidate " +
+                        "WHERE candidate.medicationId = medication_schedules.medicationId " +
+                        "AND candidate.enabled = 0 AND candidate.effectiveTo = m.endDate))"
+                )
+
+                oldCounts.forEach { (table, count) ->
+                    check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
+                }
+                val violations = mutableListOf<String>()
+                db.query("PRAGMA foreign_key_check").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        violations += "table=${cursor.getString(0)},rowId=${cursor.getLong(1)},parent=${cursor.getString(2)},fk=${cursor.getInt(3)}"
+                    }
+                }
+                check(violations.isEmpty()) { "迁移后数据引用关系异常：${violations.joinToString()}" }
+            }
+        }
+
+        internal val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                val protectedTables = listOf(
+                    "family_members", "conditions", "clinical_records", "attachments",
+                    "follow_up_schedules", "follow_up_occurrences", "medications",
+                    "medication_schedules", "medication_logs"
+                )
+                val oldCounts = protectedTables.associateWith { rowCount(db, it) }
+
+                db.execSQL("ALTER TABLE clinical_records ADD COLUMN deletedAt TEXT")
+                db.execSQL("ALTER TABLE attachments ADD COLUMN deletedAt TEXT")
+                db.execSQL("ALTER TABLE attachments ADD COLUMN updatedAt TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'")
+                db.execSQL("ALTER TABLE follow_up_schedules ADD COLUMN deletedAt TEXT")
+                db.execSQL("ALTER TABLE medications ADD COLUMN deletedAt TEXT")
+                db.execSQL("UPDATE attachments SET updatedAt = createdAt")
+
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_clinical_records_deletedAt ON clinical_records(deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_clinical_records_memberId_deletedAt ON clinical_records(memberId,deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_attachments_deletedAt ON attachments(deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_follow_up_schedules_deletedAt ON follow_up_schedules(deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_follow_up_schedules_memberId_deletedAt ON follow_up_schedules(memberId,deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_medications_deletedAt ON medications(deletedAt)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_medications_memberId_deletedAt ON medications(memberId,deletedAt)")
+
+                oldCounts.forEach { (table, count) ->
+                    check(rowCount(db, table) == count) { "迁移后记录数量不一致：$table" }
+                }
+                listOf("clinical_records", "attachments", "follow_up_schedules", "medications").forEach { table ->
+                    db.query("SELECT COUNT(*) FROM $table WHERE deletedAt IS NOT NULL").use { cursor ->
+                        check(cursor.moveToFirst() && cursor.getLong(0) == 0L) { "迁移后删除标记异常：$table" }
+                    }
                 }
                 val violations = mutableListOf<String>()
                 db.query("PRAGMA foreign_key_check").use { cursor ->

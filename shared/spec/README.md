@@ -1,6 +1,6 @@
 # 病程日历跨平台数据协议
 
-`manifest.json` 当前版本为 3。Android、iOS 与 HarmonyOS NEXT 必须先验证整个清单和所有附件，再允许预览、合并或替换。v3 增加 `members`，并要求病情分类、病历、复查计划和药物通过 `memberUuid` 关联家庭成员；至少保留一个未归档成员。
+`manifest.json` 当前版本为 5。Android 必须先验证整个清单和所有附件，再允许预览、合并或替换。v3 增加家庭成员；v4 增加病历日期内顺序、用药计划有效区间、计划剂量快照和真实更新时间；v5 为病历、附件、复查计划和药物增加可选的 `deletedAt`，使 30 天回收站也能完整备份和恢复。`endedAt`、`archivedPreviousEndDate` 和 `pausedByCourseEnd` 仍是可选兼容字段。
 
 加密容器保持兼容 Android 1.x：
 
@@ -24,9 +24,11 @@ ZIP 只允许 `manifest.json` 和清单声明的 `files/{attachmentUuid}`。单�
 
 导入规则：
 
-- v3 以 UUID 去重，冲突默认保留本机；备份包含整个家庭的全部成员与附件。
+- v5 以 UUID 去重，冲突默认保留本机；备份包含整个家庭、历史用药计划、附件及回收站内容。已移入回收站的病历，其附件必须同时带有 `deletedAt`。
+- v4 可安全升级为 v5 活跃数据，缺失的 `deletedAt` 视为未删除。
+- v3 家庭备份导入时保留成员关联，并按清单顺序和所属药物资料安全补齐 v4 字段。
 - v2 是单人格式，合并时归入用户当前选择的成员；整体替换时创建“本人”档案。
 - v1 没有稳定 UUID，可为所有条目生成新 UUID 后作为新资料导入当前成员，或经过安全备份后整体替换；不自动去重合并。
 - 引用关系、附件大小和 SHA-256 全部验证成功后才可提交；提交失败必须保留原数据库。
 
-机器可读定义见 `backup-v3.schema.json`；`backup-v2.schema.json` 保留用于兼容测试。
+机器可读定义见 `backup-v5.schema.json`，黄金清单样本见 `test-vectors/backup-v5-manifest.json`；v2、v3、v4 定义与样本保留用于兼容测试。当前 iOS 与 HarmonyOS NEXT 是 v4 开发预览，必须拒绝 v5 文件，直到其回收站模型完成，避免静默丢弃回收站状态。

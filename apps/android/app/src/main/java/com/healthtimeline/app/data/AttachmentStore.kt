@@ -20,7 +20,16 @@ class AttachmentStore(
     private val dao: AttachmentDao
 ) {
     internal val storageRoot: File get() = context.filesDir
-    companion object { const val MAX_FILE_BYTES = 100L * 1024L * 1024L }
+    companion object {
+        const val MAX_FILE_BYTES = 100L * 1024L * 1024L
+        private const val TRASH_PAYLOAD = "payload.deleted"
+    }
+
+    internal data class StagedDeletion(
+        val original: File?,
+        val staged: File?,
+        val container: File? = null
+    )
 
     suspend fun import(recordId: Long, uri: Uri): Result<AttachmentEntity> = withContext(Dispatchers.IO) {
         runCatching {
@@ -83,17 +92,94 @@ class AttachmentStore(
         }
     }
 
-    suspend fun delete(value: AttachmentEntity) = withContext(Dispatchers.IO) {
-        dao.delete(value)
-        File(context.filesDir, value.relativePath).delete()
+    internal suspend fun stageDeletion(value: AttachmentEntity): StagedDeletion = withContext(Dispatchers.IO) {
+        val original = file(value)
+        if (!original.exists()) return@withContext StagedDeletion(null, null)
+        require(original.isFile) { "附件路径不是文件" }
+        val trashRoot = File(context.filesDir, "attachment_trash")
+        require(trashRoot.isDirectory || trashRoot.mkdirs()) { "无法创建附件临时删除目录" }
+        val container = File(trashRoot, value.uuid)
+        if (container.exists()) {
+            val previous = File(container, TRASH_PAYLOAD)
+            if (!original.exists() && previous.isFile) {
+                require(original.parentFile?.isDirectory == true || original.parentFile?.mkdirs() == true) {
+                    "无法恢复上次中断删除的附件目录"
+                }
+                require(previous.renameTo(original)) { "无法恢复上次中断删除的附件" }
+            }
+            require(container.deleteRecursively()) { "无法清理上次中断删除的临时文件" }
+        }
+        require(container.mkdirs()) { "无法创建附件临时删除目录" }
+        val staged = File(container, TRASH_PAYLOAD)
+        require(original.renameTo(staged)) { "无法安全移动待删除附件" }
+        StagedDeletion(original, staged, container)
+    }
+
+    internal suspend fun rollbackDeletion(value: StagedDeletion) = withContext(Dispatchers.IO) {
+        val original = value.original ?: return@withContext
+        val staged = value.staged ?: return@withContext
+        if (!staged.exists()) return@withContext
+        require(original.parentFile?.isDirectory == true || original.parentFile?.mkdirs() == true) {
+            "无法恢复附件目录"
+        }
+        require(staged.renameTo(original)) { "数据库操作失败，且附件恢复失败" }
+        value.container?.deleteRecursively()
+    }
+
+    internal suspend fun commitDeletion(value: StagedDeletion) = withContext(Dispatchers.IO) {
+        value.container?.deleteRecursively() ?: value.staged?.delete()
+        value.original?.parentFile?.takeIf { it.isDirectory && it.listFiles().isNullOrEmpty() }?.delete()
+    }
+
+    suspend fun cleanupDeletionTrash() = withContext(Dispatchers.IO) {
+        File(context.filesDir, "attachment_trash").let { trash ->
+            trash.listFiles()?.forEach { container ->
+                val attachment = dao.byUuid(container.name)
+                val staged = File(container, TRASH_PAYLOAD)
+                if (attachment != null && staged.isFile) {
+                    val original = file(attachment)
+                    if (!original.exists()) {
+                        require(original.parentFile?.isDirectory == true || original.parentFile?.mkdirs() == true) {
+                            "无法恢复中断删除的附件目录"
+                        }
+                        require(staged.renameTo(original)) { "无法恢复中断删除的附件" }
+                    }
+                }
+                container.deleteRecursively()
+            }
+            if (trash.isDirectory && trash.listFiles().isNullOrEmpty()) trash.delete()
+        }
     }
 
     suspend fun deleteFilesForRecord(recordId: Long) = withContext(Dispatchers.IO) {
-        dao.forRecord(recordId).forEach { File(context.filesDir, it.relativePath).delete() }
+        dao.forRecord(recordId).forEach { file(it).delete() }
         File(context.filesDir, "attachments/$recordId").deleteRecursively()
     }
 
-    fun file(value: AttachmentEntity): File = File(context.filesDir, value.relativePath)
+    fun file(value: AttachmentEntity): File {
+        require(!File(value.relativePath).isAbsolute) { "附件路径异常" }
+        val candidate = File(context.filesDir, value.relativePath).canonicalFile
+        val roots = listOf("attachments", "restored_attachments").map { File(context.filesDir, it).canonicalFile }
+        require(roots.any { candidate.path == it.path || candidate.path.startsWith(it.path + File.separator) }) {
+            "附件路径超出应用附件目录"
+        }
+        return candidate
+    }
+
+    suspend fun verifyStored(value: AttachmentEntity): Boolean = withContext(Dispatchers.IO) {
+        val stored = runCatching { file(value) }.getOrNull() ?: return@withContext false
+        if (!stored.isFile || !stored.canRead() || stored.length() != value.sizeBytes) return@withContext false
+        val digest = MessageDigest.getInstance("SHA-256")
+        stored.inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }.equals(value.sha256, ignoreCase = true)
+    }
 
     private data class Metadata(val name: String, val size: Long)
 

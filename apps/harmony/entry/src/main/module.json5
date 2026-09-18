@@ -20,7 +20,8 @@
       skills: [{ entities: ['entity.system.home'], actions: ['action.system.home'] }]
     }],
     requestPermissions: [
-      { name: 'ohos.permission.NOTIFICATION_CONTROLLER' }
+      { name: 'ohos.permission.NOTIFICATION_CONTROLLER' },
+      { name: 'ohos.permission.PUBLISH_AGENT_REMINDER' }
     ]
   }
 }

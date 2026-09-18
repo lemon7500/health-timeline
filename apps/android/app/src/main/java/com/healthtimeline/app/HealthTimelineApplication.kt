@@ -6,6 +6,8 @@ import com.healthtimeline.app.data.AppDatabase
 import com.healthtimeline.app.data.AttachmentStore
 import com.healthtimeline.app.data.HealthRepository
 import com.healthtimeline.app.data.MemberSelectionStore
+import com.healthtimeline.app.data.SafetyCenterService
+import com.healthtimeline.app.data.SafetyStatusStore
 import com.healthtimeline.app.reminders.AlarmScheduler
 import com.healthtimeline.app.security.AppLockManager
 
@@ -15,7 +17,9 @@ class HealthTimelineApplication : Application() {
         HealthRepository(database, AttachmentStore(this, database.attachmentDao()))
     }
     val alarmScheduler by lazy { AlarmScheduler(this, repository) }
-    val backupService by lazy { PortableBackupService(this, repository) }
+    val safetyStatusStore by lazy { SafetyStatusStore(this) }
+    val backupService by lazy { PortableBackupService(this, repository, safetyStatusStore = safetyStatusStore) }
+    val safetyCenterService by lazy { SafetyCenterService(this, database, repository, safetyStatusStore) }
     val memberSelectionStore by lazy { MemberSelectionStore(this) }
     val appLockManager by lazy { AppLockManager(this) }
 

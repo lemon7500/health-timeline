@@ -18,7 +18,7 @@ internal object PortableSnapshotMapper {
             sourceInstallationId = installationId,
             members = snapshot.members.map {
                 PortableFamilyMember(
-                    it.uuid, it.name, it.nickname, it.relationship, it.archived,
+                    it.uuid, it.name, it.relationship, it.relationship, it.archived,
                     it.createdAt, it.updatedAt
                 )
             },
@@ -33,7 +33,9 @@ internal object PortableSnapshotMapper {
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.recordDate, it.title, it.stage,
                     it.symptoms, it.diagnosis, it.treatment, it.medicationNotes, it.hospital, it.clinician,
                     it.notes, it.createdAt, it.updatedAt,
-                    memberUuid = requireNotNull(members[it.memberId]).uuid
+                    memberUuid = requireNotNull(members[it.memberId]).uuid,
+                    dayOrder = it.dayOrder,
+                    deletedAt = it.deletedAt
                 )
             },
             attachments = snapshot.attachments.map {
@@ -46,7 +48,9 @@ internal object PortableSnapshotMapper {
                     "files/${it.uuid}",
                     it.sizeBytes,
                     it.sha256,
-                    it.createdAt
+                    it.createdAt,
+                    updatedAt = it.updatedAt,
+                    deletedAt = it.deletedAt
                 )
             },
             followUps = snapshot.followUps.map {
@@ -54,7 +58,8 @@ internal object PortableSnapshotMapper {
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.title, it.recurrenceType,
                     it.interval, it.anchorDate, it.anchorDayOfMonth, it.weekday, it.reminderTime,
                     it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt,
-                    memberUuid = requireNotNull(members[it.memberId]).uuid
+                    memberUuid = requireNotNull(members[it.memberId]).uuid,
+                    deletedAt = it.deletedAt
                 )
             },
             occurrences = snapshot.occurrences.map {
@@ -68,12 +73,26 @@ internal object PortableSnapshotMapper {
                     it.uuid, it.conditionId?.let(conditions::get)?.uuid, it.name, it.doseAmount,
                     it.doseUnit, it.instructions, it.startDate, it.endDate, it.mode, it.archived,
                     it.createdAt, it.updatedAt,
-                    memberUuid = requireNotNull(members[it.memberId]).uuid
+                    memberUuid = requireNotNull(members[it.memberId]).uuid,
+                    endedAt = it.endedAt,
+                    archivedPreviousEndDate = it.archivedPreviousEndDate,
+                    deletedAt = it.deletedAt
                 )
             },
             medicationSchedules = snapshot.medicationSchedules.map {
                 val medication = requireNotNull(medications[it.medicationId])
-                PortableMedicationSchedule(it.uuid, medication.uuid, it.localTime, it.enabled, medication.updatedAt)
+                PortableMedicationSchedule(
+                    uuid = it.uuid,
+                    medicationUuid = medication.uuid,
+                    localTime = it.localTime,
+                    enabled = it.enabled,
+                    updatedAt = it.updatedAt,
+                    effectiveFrom = it.effectiveFrom,
+                    effectiveTo = it.effectiveTo,
+                    doseAmountSnapshot = it.doseAmountSnapshot,
+                    doseUnitSnapshot = it.doseUnitSnapshot,
+                    pausedByCourseEnd = it.pausedByCourseEnd
+                )
             },
             medicationLogs = snapshot.medicationLogs.map {
                 PortableMedicationLog(
@@ -85,7 +104,8 @@ internal object PortableSnapshotMapper {
                     it.status,
                     it.doseAmountSnapshot,
                     it.doseUnitSnapshot,
-                    it.createdAt
+                    it.createdAt,
+                    it.updatedAt
                 )
             }
         ).also(PortableSnapshotValidator::validate)
@@ -132,14 +152,14 @@ internal object PortableSnapshotMapper {
                     recordIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.recordDate,
                     it.title, it.stage, it.symptoms, it.diagnosis, it.treatment, it.medicationNotes,
                     it.hospital, it.clinician, it.notes, it.createdAt, it.updatedAt, it.uuid,
-                    memberIds.getValue(requireNotNull(it.memberUuid))
+                    memberIds.getValue(requireNotNull(it.memberUuid)), it.dayOrder, it.deletedAt
                 )
             },
             attachments = portable.attachments.map {
                 AttachmentEntity(
                     attachmentIds.getValue(it.uuid), recordIds.getValue(it.recordUuid), it.kind,
                     it.displayName, it.mimeType, attachmentPath(it, currentAttachments[it.uuid]),
-                    it.sizeBytes, it.sha256, it.createdAt, it.uuid
+                    it.sizeBytes, it.sha256, it.createdAt, it.uuid, it.deletedAt, it.updatedAt
                 )
             },
             followUps = portable.followUps.map {
@@ -147,7 +167,7 @@ internal object PortableSnapshotMapper {
                     followUpIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.title,
                     it.recurrenceType, it.interval, it.anchorDate, it.anchorDayOfMonth, it.weekday,
                     it.reminderTime, it.leadDays, it.nextDueDate, it.enabled, it.createdAt, it.updatedAt, it.uuid,
-                    memberIds.getValue(requireNotNull(it.memberUuid))
+                    memberIds.getValue(requireNotNull(it.memberUuid)), it.deletedAt
                 )
             },
             occurrences = portable.occurrences.map {
@@ -161,20 +181,25 @@ internal object PortableSnapshotMapper {
                     medicationIds.getValue(it.uuid), it.conditionUuid?.let(conditionIds::get), it.name,
                     it.doseAmount, it.doseUnit, it.instructions, it.startDate, it.endDate, it.mode,
                     it.archived, it.createdAt, it.updatedAt, it.uuid,
-                    memberIds.getValue(requireNotNull(it.memberUuid))
+                    memberIds.getValue(requireNotNull(it.memberUuid)),
+                    it.endedAt ?: if (it.archived) it.updatedAt else null,
+                    it.archivedPreviousEndDate,
+                    it.deletedAt
                 )
             },
             medicationSchedules = portable.medicationSchedules.map {
                 MedicationScheduleEntity(
                     medicationScheduleIds.getValue(it.uuid), medicationIds.getValue(it.medicationUuid),
-                    it.localTime, it.enabled, it.uuid
+                    it.localTime, it.enabled, it.uuid, it.effectiveFrom, it.effectiveTo,
+                    it.doseAmountSnapshot, it.doseUnitSnapshot, it.updatedAt, it.pausedByCourseEnd
                 )
             },
             medicationLogs = portable.medicationLogs.map {
                 MedicationLogEntity(
                     medicationLogIds.getValue(it.uuid), medicationIds.getValue(it.medicationUuid),
                     it.scheduleUuid?.let(medicationScheduleIds::get), it.scheduledAt, it.actualAt,
-                    it.status, it.doseAmountSnapshot, it.doseUnitSnapshot, it.createdAt, it.uuid
+                    it.status, it.doseAmountSnapshot, it.doseUnitSnapshot, it.createdAt, it.uuid,
+                    it.updatedAt
                 )
             }
         )

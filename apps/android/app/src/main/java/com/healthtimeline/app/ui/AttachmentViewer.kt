@@ -29,7 +29,12 @@ import java.io.File
 import kotlin.math.min
 
 @Composable
-fun AttachmentViewerDialog(attachment: AttachmentEntity, file: File, onDismiss: () -> Unit) {
+fun AttachmentViewerDialog(
+    attachment: AttachmentEntity,
+    file: File,
+    onDismiss: () -> Unit,
+    onDelete: (() -> Unit)? = null
+) {
     var page by remember { mutableIntStateOf(0) }
     val pageCountResult by produceState<Result<Int>?>(initialValue = null, file) {
         value = runCatching {
@@ -91,7 +96,10 @@ fun AttachmentViewerDialog(attachment: AttachmentEntity, file: File, onDismiss: 
                 }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+        dismissButton = onDelete?.let { action ->
+            { TextButton(onClick = action) { Text("删除附件", color = MaterialTheme.colorScheme.error) } }
+        }
     )
 }
 

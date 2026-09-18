@@ -45,6 +45,7 @@ object ClinicalRecordQuickParser {
     const val MAX_NARRATIVE_LENGTH = 10_000
     const val MAX_BATCH_RECORDS = 200
     const val TEMPLATE_DATE_TOKEN = "{{date}}"
+    const val SOURCE_PREFIX = "原文记录："
 
     val template: String = """
         日期：$TEMPLATE_DATE_TOKEN
@@ -102,7 +103,15 @@ object ClinicalRecordQuickParser {
         val values = mutableMapOf<Field, MutableList<String>>()
         val unrecognized = mutableListOf<String>()
         var currentField: Field? = null
-        input.replace("\r\n", "\n").replace('\r', '\n')
+        val normalizedInput = input.replace("\r\n", "\n").replace('\r', '\n')
+        val hasStructuredFields = Regex(
+            "(?m)^\\s*(?:日期|就诊日期|记录日期|标题|小标题|病情分类|疾病分类|记录类型|就诊类型)\\s*[：:]"
+        ).containsMatchIn(normalizedInput)
+        val terminalNotes = if (hasStructuredFields) {
+            Regex("(?m)^\\s*(?:其他备注|备注|其他)\\s*[：:]").find(normalizedInput)
+        } else null
+        val parsableInput = terminalNotes?.let { normalizedInput.substring(0, it.range.first) } ?: normalizedInput
+        parsableInput
             .split(Regex("[\n；;]+"))
             .forEach { rawSegment ->
                 val segment = rawSegment.trim()
@@ -125,6 +134,10 @@ object ClinicalRecordQuickParser {
                     unrecognized += segment
                 }
             }
+        terminalNotes?.let { marker ->
+            val rawNotes = normalizedInput.substring(marker.range.last + 1).trim()
+            values.getOrPut(Field.NOTES) { mutableListOf() } += rawNotes
+        }
 
         if (values.isEmpty()) {
             return parseNaturalNarrative(input, referenceDate, issues)
@@ -185,8 +198,20 @@ object ClinicalRecordQuickParser {
      * This keeps the single-record parser strict while allowing several days to be reviewed and saved together.
      */
     fun parseMany(input: String, referenceDate: LocalDate = LocalDate.now()): ParsedClinicalRecordBatch {
+        val formatIssues = buildList {
+            if (input.contains("```")) {
+                add(
+                    QuickEntryIssue(
+                        IssueSeverity.ERROR,
+                        null,
+                        "MARKDOWN_WRAPPER",
+                        "检测到 Markdown 代码框，请删除开头和结尾的 ``` 后重新解析"
+                    )
+                )
+            }
+        }
         if (input.length > MAX_INPUT_LENGTH || input.isBlank()) {
-            return ParsedClinicalRecordBatch(listOf(parse(input, referenceDate)))
+            return ParsedClinicalRecordBatch(listOf(parse(input, referenceDate)), formatIssues)
         }
         val normalized = input.replace("\r\n", "\n").replace('\r', '\n')
             .replace('；', '\n').replace(';', '\n')
@@ -203,7 +228,7 @@ object ClinicalRecordQuickParser {
                 .distinct()
                 .toList()
         }
-        if (starts.size <= 1) return ParsedClinicalRecordBatch(listOf(parse(normalized, referenceDate)))
+        if (starts.size <= 1) return ParsedClinicalRecordBatch(listOf(parse(normalized, referenceDate)), formatIssues)
 
         val blocks = starts.mapIndexed { index, start ->
             val blockStart = if (index == 0) 0 else start
@@ -213,7 +238,7 @@ object ClinicalRecordQuickParser {
         if (blocks.size > MAX_BATCH_RECORDS) {
             return ParsedClinicalRecordBatch(
                 records = emptyList(),
-                issues = listOf(
+                issues = formatIssues + listOf(
                     QuickEntryIssue(
                         IssueSeverity.ERROR,
                         null,
@@ -223,7 +248,7 @@ object ClinicalRecordQuickParser {
                 )
             )
         }
-        return ParsedClinicalRecordBatch(blocks.map { parse(it, referenceDate) })
+        return ParsedClinicalRecordBatch(blocks.map { parse(it, referenceDate) }, formatIssues)
     }
 
     fun templateFor(date: LocalDate): String = template.replace(TEMPLATE_DATE_TOKEN, date.toString())
@@ -324,10 +349,7 @@ object ClinicalRecordQuickParser {
         val symptoms = clauses.filter { clause ->
             SYMPTOM_WORDS.any(clause::contains)
         }.distinct().joinToString("\n")
-        val diagnosisParts = buildList {
-            addAll(diseaseNames)
-            addAll(clauses.filter { clause -> DIAGNOSIS_WORDS.any(clause::contains) })
-        }.map(::cleanClause).filter(String::isNotBlank).distinct().joinToString("\n")
+        val diagnosisParts = extractDiagnosisStatements(text, diseaseNames).joinToString("\n")
         val treatment = clauses.filter { clause ->
             TREATMENT_WORDS.any(clause::contains)
         }.map(::cleanClause).filter(String::isNotBlank).distinct().joinToString("\n")
@@ -343,7 +365,8 @@ object ClinicalRecordQuickParser {
         validateLength(Field.DIAGNOSIS, diagnosisParts, MAX_NARRATIVE_LENGTH, issues)
         validateLength(Field.TREATMENT, treatment, MAX_NARRATIVE_LENGTH, issues)
         validateLength(Field.MEDICATION, medication, MAX_NARRATIVE_LENGTH, issues)
-        validateLength(Field.NOTES, text, MAX_NARRATIVE_LENGTH, issues)
+        val sourceNotes = "$SOURCE_PREFIX\n$text"
+        validateLength(Field.NOTES, sourceNotes, MAX_NARRATIVE_LENGTH, issues)
         issues.warning(null, "NARRATIVE_MODE", "已按自然叙述自动整理，并在备注中保留原文；请核对后再保存")
 
         return ParsedClinicalRecordDraft(
@@ -357,7 +380,7 @@ object ClinicalRecordQuickParser {
             medicationNotes = medication,
             hospital = hospital,
             clinician = clinician,
-            notes = text,
+            notes = sourceNotes,
             issues = issues,
             unrecognizedSegments = emptyList()
         )
@@ -387,11 +410,27 @@ object ClinicalRecordQuickParser {
     }
 
     private fun extractClinician(text: String): String {
-        val match = Regex("(?:见了|找了|咨询了|由|请|给|让)\\s*([\\u4e00-\\u9fff·]{1,4})医生")
-            .find(text)
-            ?: Regex("(?:主治医生|就诊医生|医生)\\s*[是为：:]\\s*([\\u4e00-\\u9fff·]{1,4})")
-                .find(text)
-        return match?.groupValues?.get(1)?.let { "${it}医生" }.orEmpty()
+        val nameChars = "(?:[\\u4e00-\\u9fff·]{1,4}|[A-Za-z][A-Za-z .'-]{0,30})"
+        val department = "(?:[\\u4e00-\\u9fff]{1,8}科)?"
+        val titled = listOf(
+            Regex("(?:去)?(?:见|找|看|咨询|联系)(?:了|过|到)?\\s*$department\\s*($nameChars)(医生|主任|教授|大夫)"),
+            Regex("(?:向|问|请教)\\s*$department\\s*($nameChars)(医生|主任|教授|大夫)"),
+            Regex("\\d{1,2}[日号]\\s*($nameChars)(医生|主任|教授|大夫)"),
+            Regex("(?:^|[，,。；;、\\s])($nameChars)(医生|主任|教授|大夫)(?=[说认建表告意：:，,。；;、\\s]|$)"),
+            Regex("(?:主治医生|就诊医生|接诊医生|医生)\\s*[是为叫：:]?\\s*($nameChars)(?=认为|建议|表示|告知|说|诊断|检查|复查|治疗|[，,。；;、\\s]|$)")
+        ).firstNotNullOfOrNull { it.find(text) }
+        if (titled == null) return ""
+        val rawName = titled.groupValues[1]
+        val title = titled.groupValues.getOrNull(2).orEmpty().ifBlank { "医生" }
+        val cleanedName = cleanClinicianName(rawName)
+        return if (cleanedName.isBlank()) "" else "$cleanedName$title"
+    }
+
+    private fun cleanClinicianName(value: String): String {
+        var result = value.trim()
+        DOCTOR_NAME_PREFIXES.forEach { prefix -> result = result.removePrefix(prefix) }
+        if ('科' in result && result.substringAfterLast('科').isNotBlank()) result = result.substringAfterLast('科')
+        return result.takeLast(6)
     }
 
     private fun extractHospital(text: String): String =
@@ -403,8 +442,10 @@ object ClinicalRecordQuickParser {
             .find(text)?.groupValues?.get(1)
 
     private fun extractDiseaseNames(text: String): List<String> {
-        val cueRegex = Regex("(?:诊断为|诊断是|确诊为|确诊|考虑为|考虑|疑似|有可能是|可能是|判断为|判定为)")
-        val diseaseRegex = Regex("([\\u4e00-\\u9fff]{2,14}(?:综合征|坏死|骨折|感染|结节|囊肿|炎|癌|瘤|病|症))(?![\\u4e00-\\u9fff])")
+        val diseaseRegex = Regex(
+            "([\\u4e00-\\u9fff]{2,14}?(?:综合征|坏死|骨折|感染|结节|囊肿|息肉|溃疡|增生|肿块|积液|梗阻|炎|癌|瘤|病|症))" +
+                "(?=$|伴|并|和|及|或|、|\\s)"
+        )
         val withoutDates = text
             .replace(Regex("(?<!\\d)\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}(?!\\d)"), "")
             .replace(Regex("(?<!\\d)(?:\\d{4}年)?\\d{1,2}月\\d{1,2}[日号]"), "")
@@ -412,8 +453,10 @@ object ClinicalRecordQuickParser {
             .asSequence()
             .map(::cleanClause)
             .flatMap { clause ->
-                val cue = cueRegex.find(clause)
-                val searchable = if (cue == null) clause else clause.substring(cue.range.last + 1)
+                val marker = DISEASE_CONTEXT_MARKERS
+                    .mapNotNull { value -> clause.lastIndexOf(value).takeIf { it >= 0 }?.let { it to value } }
+                    .maxByOrNull { it.first }
+                val searchable = marker?.let { (index, value) -> clause.substring(index + value.length) } ?: clause
                 diseaseRegex.findAll(searchable).map { it.groupValues[1] }
             }
             .map { candidate ->
@@ -422,6 +465,32 @@ object ClinicalRecordQuickParser {
             .filter { it.length in 2..16 && it !in DISEASE_FALSE_POSITIVES }
             .distinct()
             .toList()
+    }
+
+    private fun extractDiagnosisStatements(text: String, diseaseNames: List<String>): List<String> {
+        val statements = mutableListOf<String>()
+        diseaseNames.forEach { disease ->
+            val index = text.indexOf(disease)
+            val prefix = if (index <= 0) "" else text.substring((index - 12).coerceAtLeast(0), index)
+            val qualifier = when {
+                listOf("疑似", "怀疑").any(prefix::contains) -> "疑似："
+                listOf("有可能是", "可能是", "可能为").any(prefix::contains) -> "可能："
+                listOf("考虑为", "考虑").any(prefix::contains) -> "考虑："
+                else -> ""
+            }
+            statements += "$qualifier$disease"
+        }
+        Regex("(?:诊断|诊断结果|确诊)\\s*[为是：:]\\s*([^，,。；;\\n]{2,80})")
+            .findAll(text)
+            .map { trimDiagnosisTail(cleanClause(it.groupValues[1])) }
+            .filter(String::isNotBlank)
+            .forEach(statements::add)
+        return statements.distinct()
+    }
+
+    private fun trimDiagnosisTail(value: String): String {
+        val cutAt = DIAGNOSIS_TAIL_MARKERS.map(value::indexOf).filter { it > 0 }.minOrNull()
+        return if (cutAt == null) value else value.substring(0, cutAt).trim()
     }
 
     private fun inferStage(text: String): VisitStage = when {
@@ -444,8 +513,12 @@ object ClinicalRecordQuickParser {
         val cleanTitle = title.trim()
         val cleanCondition = condition?.trim().orEmpty()
         if (cleanTitle.isBlank()) return cleanCondition.takeIf(String::isNotBlank)?.let { "${it}病情记录" }.orEmpty()
-        if (cleanCondition.isBlank() || cleanTitle.contains(cleanCondition, ignoreCase = true)) return cleanTitle
-        return "$cleanCondition$cleanTitle"
+        if (cleanCondition.isBlank() || cleanTitle.startsWith(cleanCondition, ignoreCase = true)) return cleanTitle
+        val remainingTitle = cleanTitle
+            .replace(Regex(Regex.escape(cleanCondition), RegexOption.IGNORE_CASE), "")
+            .trim()
+            .trim('-', '—', '－', '_', '：', ':', '·', ' ', '|', '/', '／')
+        return "$cleanCondition$remainingTitle"
     }
 
     private fun normalizeLabel(value: String): String =
@@ -483,9 +556,6 @@ object ClinicalRecordQuickParser {
     private val SYMPTOM_WORDS = listOf(
         "疼", "痛", "肿", "发热", "发烧", "鼻塞", "咳", "出血", "麻木", "头晕", "恶心", "炎症严重", "不适"
     )
-    private val DIAGNOSIS_WORDS = listOf(
-        "诊断", "确诊", "疑似", "可能是", "考虑", "判断病情", "判定"
-    )
     private val TREATMENT_WORDS = listOf(
         "手术", "治疗", "复查", "再来", "观察", "去除", "取出", "保持", "控制", "清洗", "冲洗", "处理"
     )
@@ -493,7 +563,16 @@ object ClinicalRecordQuickParser {
         "用药", "服药", "吃药", "开了药", "药物", "口服", "注射", "打地舒单抗", "再吃"
     )
     private val DISEASE_LEADING_WORDS = listOf(
-        "医生认为", "医生意见", "检查发现", "再次复查", "复查", "目前是", "目前为", "患有", "存在", "发现"
+        "医生认为", "医生意见", "检查发现", "再次复查", "复查", "目前是", "目前为", "患有", "存在", "发现", "并发", "伴"
     )
     private val DISEASE_FALSE_POSITIVES = setOf("病情", "炎症", "症状")
+    private val DISEASE_CONTEXT_MARKERS = listOf(
+        "诊断结果为", "诊断结果是", "有可能是", "可能是", "可能为", "确诊为", "诊断为", "诊断是",
+        "考虑为", "考虑", "疑似", "怀疑", "再次复查", "复查", "检查发现", "发现", "观察", "治疗",
+        "咨询", "医生意见", "医生认为", "医生建议", "建议", "患有", "存在"
+    )
+    private val DIAGNOSIS_TAIL_MARKERS = listOf("并建议", "同时建议", "建议", "后续治疗", "治疗方案", "需要治疗", "用药")
+    private val DOCTOR_NAME_PREFIXES = listOf(
+        "今天", "当天", "再次", "又去", "去", "找", "看", "咨询", "联系", "主治", "接诊", "负责"
+    )
 }

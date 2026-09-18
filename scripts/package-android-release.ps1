@@ -31,7 +31,7 @@ if (-not (Test-Path $sourceApk)) { throw 'Signed release APK was not produced.' 
 
 $dist = Join-Path $projectRoot 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$assetName = 'HealthTimeline-1.2.0.apk'
+$assetName = 'HealthTimeline-1.3.0.apk'
 $assetPath = Join-Path $dist $assetName
 Copy-Item -LiteralPath $sourceApk -Destination $assetPath -Force
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()

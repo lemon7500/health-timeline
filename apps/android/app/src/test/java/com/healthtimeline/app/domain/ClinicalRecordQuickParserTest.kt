@@ -128,6 +128,12 @@ class ClinicalRecordQuickParserTest {
         assertEquals("上颌窦炎复查", result.title)
     }
 
+    @Test fun `condition is moved to the first position of title`() {
+        assertEquals("鼻窦炎术后复查", ClinicalRecordQuickParser.titleWithCondition("术后复查鼻窦炎", "鼻窦炎"))
+        assertEquals("鼻窦炎复查", ClinicalRecordQuickParser.titleWithCondition("复查－鼻窦炎", "鼻窦炎"))
+        assertEquals("鼻窦炎术后复查", ClinicalRecordQuickParser.titleWithCondition("鼻窦炎术后复查", "鼻窦炎"))
+    }
+
     @Test fun `natural Chinese narrative is organized locally and keeps original text`() {
         val input = """
             8月29日再次去见了关丽梅医生，头颈部CT报告出来了，关医生意见
@@ -147,13 +153,53 @@ class ClinicalRecordQuickParserTest {
         assertEquals("关丽梅医生", result.clinician)
         assertTrue(result.diagnosis.contains("牙骨髓炎"))
         assertTrue(result.diagnosis.contains("下颌骨坏死"))
+        assertFalse(result.diagnosis.contains("手术"))
+        assertFalse(result.diagnosis.contains("不能判断病情"))
         assertTrue(result.treatment.contains("手术"))
         assertTrue(result.medicationNotes.contains("地舒单抗"))
         assertTrue(result.medicationNotes.contains("开了药"))
-        assertEquals(input, result.notes)
+        assertEquals("原文记录：\n$input", result.notes)
         assertTrue(result.unrecognizedSegments.isEmpty())
         assertTrue(result.issues.any { it.code == "INFERRED_YEAR" })
         assertTrue(result.issues.any { it.code == "NARRATIVE_MODE" })
+    }
+
+    @Test fun `doctor names are recognized from common narrative expressions`() {
+        val samples = listOf(
+            Triple("9月1日去找李医生复查鼻窦炎。", "李医生", "鼻窦炎"),
+            Triple("9月1日向王小明主任咨询鼻窦炎。", "王小明主任", "鼻窦炎"),
+            Triple("9月1日，赵敏医生建议继续观察鼻窦炎。", "赵敏医生", "鼻窦炎"),
+            Triple("9月1日到口腔科找关丽梅医生复查牙骨髓炎。", "关丽梅医生", "牙骨髓炎")
+        )
+
+        samples.forEach { (input, expectedDoctor, expectedCondition) ->
+            val result = ClinicalRecordQuickParser.parse(input, LocalDate.of(2026, 9, 7))
+            assertFalse("解析失败：$input", result.hasErrors)
+            assertEquals("医生识别错误：$input", expectedDoctor, result.clinician)
+            assertEquals("疾病识别错误：$input", expectedCondition, result.conditionName)
+        }
+    }
+
+    @Test fun `explicit diagnosis excludes advice in the same sentence`() {
+        val result = ClinicalRecordQuickParser.parse(
+            "9月2日找陈医生复查。诊断为术后恢复正常并建议继续用药和观察。",
+            LocalDate.of(2026, 9, 7)
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals("术后恢复正常", result.diagnosis)
+        assertFalse(result.diagnosis.contains("建议"))
+        assertFalse(result.diagnosis.contains("用药"))
+    }
+
+    @Test fun `generic doctor wording is not mistaken for a doctor name`() {
+        val result = ClinicalRecordQuickParser.parse(
+            "9月2日复查鼻窦炎，医生建议继续观察。",
+            LocalDate.of(2026, 9, 7)
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals("", result.clinician)
     }
 
     @Test fun `several natural dated paragraphs become separate records`() {
@@ -202,5 +248,91 @@ class ClinicalRecordQuickParserTest {
         assertTrue(result.hasErrors)
         assertFalse(result.records[0].hasErrors)
         assertTrue(result.records[1].issues.any { it.code == "INVALID_DATE" })
+    }
+
+    @Test fun `AI formatted records support multiple events on the same date`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            """
+                日期：2026-09-01
+                标题：鼻窦炎复查
+                病情分类：鼻窦炎
+                记录类型：复查
+                症状/病情：鼻塞减轻
+                诊断：鼻窦炎
+                治疗方案：继续冲洗
+                就诊用药记录：
+                医院：甲医院
+                医生：李医生
+                其他备注：9月1日复查鼻窦炎，鼻塞减轻。
+
+                日期：2026-09-01
+                标题：牙骨髓炎用药记录
+                病情分类：牙骨髓炎
+                记录类型：就诊后
+                症状/病情：牙龈疼痛
+                诊断：牙骨髓炎
+                治疗方案：保持口腔卫生
+                就诊用药记录：炎症严重时按医嘱服药
+                医院：
+                医生：王主任
+                其他备注：同日记录牙骨髓炎处理情况。
+            """.trimIndent()
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals(LocalDate.of(2026, 9, 1), result.records[0].recordDate)
+        assertEquals(LocalDate.of(2026, 9, 1), result.records[1].recordDate)
+        assertEquals("李医生", result.records[0].clinician)
+        assertEquals("王主任", result.records[1].clinician)
+    }
+
+    @Test fun `markdown wrapper is reported as a blocking format error`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            "```text\n日期：2026-09-01\n标题：鼻窦炎复查\n```"
+        )
+
+        assertTrue(result.hasErrors)
+        assertTrue(result.issues.any { it.code == "MARKDOWN_WRAPPER" && it.severity == IssueSeverity.ERROR })
+    }
+
+    @Test fun `AI explanation is preserved and visibly reported`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            "以下是整理结果\n日期：2026-09-01\n标题：鼻窦炎复查\n病情分类：鼻窦炎"
+        )
+
+        assertFalse(result.hasErrors)
+        assertTrue(result.records.single().unrecognizedSegments.contains("以下是整理结果"))
+        assertTrue(result.records.single().issues.any { it.code == "UNRECOGNIZED_CONTENT" })
+    }
+
+    @Test fun `other notes is terminal and preserves labels numbering and order`() {
+        val source = """
+            日期：2026-09-01
+            标题：鼻窦炎复查
+            病情分类：鼻窦炎
+            记录类型：复查
+            症状/病情：鼻塞
+            诊断：鼻窦炎
+            治疗方案：继续冲洗
+            就诊用药记录：
+            医院：甲医院
+            医生：李医生
+            其他备注：原文记录：
+            1）先检查。
+            医生：原文里的医生标签不能被重新解析
+            2）再复诊。
+            诊断：原文里的诊断标签也必须保留
+        """.trimIndent()
+
+        val result = ClinicalRecordQuickParser.parse(source)
+
+        assertFalse(result.hasErrors)
+        assertEquals("李医生", result.clinician)
+        assertEquals("鼻窦炎", result.diagnosis)
+        assertEquals(
+            "原文记录：\n1）先检查。\n医生：原文里的医生标签不能被重新解析\n2）再复诊。\n诊断：原文里的诊断标签也必须保留",
+            result.notes
+        )
     }
 }

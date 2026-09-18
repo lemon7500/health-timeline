@@ -3,7 +3,9 @@ package com.healthtimeline.shared
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
-const val BACKUP_SCHEMA_VERSION = 3
+const val BACKUP_SCHEMA_VERSION = 5
+const val PREVIOUS_BACKUP_SCHEMA_VERSION = 4
+const val FAMILY_BACKUP_SCHEMA_VERSION = 3
 const val LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION = 2
 
 @Serializable
@@ -62,7 +64,9 @@ data class PortableClinicalRecord(
     val notes: String,
     val createdAt: String,
     val updatedAt: String,
-    val memberUuid: String? = null
+    val memberUuid: String? = null,
+    val dayOrder: Long = 0L,
+    val deletedAt: String? = null
 )
 
 @Serializable
@@ -76,7 +80,8 @@ data class PortableAttachment(
     val sizeBytes: Long,
     val sha256: String,
     val createdAt: String,
-    val updatedAt: String = createdAt
+    val updatedAt: String = createdAt,
+    val deletedAt: String? = null
 )
 
 @Serializable
@@ -95,7 +100,8 @@ data class PortableFollowUpSchedule(
     val enabled: Boolean,
     val createdAt: String,
     val updatedAt: String,
-    val memberUuid: String? = null
+    val memberUuid: String? = null,
+    val deletedAt: String? = null
 )
 
 @Serializable
@@ -123,7 +129,10 @@ data class PortableMedication(
     val archived: Boolean,
     val createdAt: String,
     val updatedAt: String,
-    val memberUuid: String? = null
+    val memberUuid: String? = null,
+    val endedAt: String? = null,
+    val archivedPreviousEndDate: String? = null,
+    val deletedAt: String? = null
 )
 
 @Serializable
@@ -132,7 +141,12 @@ data class PortableMedicationSchedule(
     val medicationUuid: String,
     val localTime: String,
     val enabled: Boolean,
-    val updatedAt: String
+    val updatedAt: String,
+    val effectiveFrom: String = "",
+    val effectiveTo: String? = null,
+    val doseAmountSnapshot: String = "",
+    val doseUnitSnapshot: String = "",
+    val pausedByCourseEnd: Boolean = false
 )
 
 @Serializable

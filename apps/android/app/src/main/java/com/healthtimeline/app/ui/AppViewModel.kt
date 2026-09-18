@@ -17,6 +17,9 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.time.LocalTime
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.YearMonth
 import com.healthtimeline.shared.BackupImportPreview
 import com.healthtimeline.shared.MergeChoice
 
@@ -25,7 +28,8 @@ class AppViewModel(
     private val repository: HealthRepository,
     private val scheduler: AlarmScheduler,
     private val backupService: PortableBackupService,
-    private val memberSelection: MemberSelectionStore
+    private val memberSelection: MemberSelectionStore,
+    private val safetyCenter: SafetyCenterService
 ) : ViewModel() {
     val members = repository.memberFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     private val selectedMemberIdMutable = MutableStateFlow(memberSelection.read())
@@ -49,18 +53,33 @@ class AppViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     val medicationLogs = selectedMemberId.filterNotNull().flatMapLatest(repository::medicationLogsForMember)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    val trashItems = selectedMemberId.filterNotNull().flatMapLatest(repository::trashForMember)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     val todayDoses = selectedMemberId.filterNotNull().flatMapLatest(repository::todayDosesForMember)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    private val medicationMonthMutable = MutableStateFlow(YearMonth.now())
+    val medicationMonth = medicationMonthMutable
+    val medicationMonthData = combine(selectedMemberId.filterNotNull(), medicationMonthMutable) { memberId, month -> memberId to month }
+        .flatMapLatest { (memberId, month) -> repository.medicationMonthForMember(memberId, month) }
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5_000),
+            MedicationMonthData(YearMonth.now(), emptyMap())
+        )
 
     private val messages = Channel<String>(Channel.BUFFERED)
     val messageFlow = messages.receiveAsFlow()
     private val busyChannel = kotlinx.coroutines.flow.MutableStateFlow(false)
     val busy = busyChannel
+    val lastBackupAt = safetyCenter.lastBackupAt
+    val lastIntegrityResult = safetyCenter.lastIntegrityResult
 
     init {
         viewModelScope.launch {
             runCatching {
                 repository.ensureDefaultMember()
+                val purged = repository.purgeExpiredTrash()
+                if (purged > 0) messages.send("回收站已自动清理 $purged 项超过 30 天的内容")
                 repository.cleanupOrphanedAttachmentSets()
                 scheduler.rescheduleAll()
             }.onFailure { messages.send(it.userMessage("初始化检查失败")) }
@@ -81,6 +100,10 @@ class AppViewModel(
             memberSelection.write(memberId)
             selectedMemberIdMutable.value = memberId
         }
+    }
+
+    fun selectMedicationMonth(month: YearMonth) {
+        medicationMonthMutable.value = month
     }
 
     fun saveMember(value: FamilyMemberEntity, onSaved: () -> Unit = {}, onFailed: () -> Unit = {}) =
@@ -131,7 +154,10 @@ class AppViewModel(
         onSaved(repository.saveRecords(requests))
     }
 
-    fun deleteRecord(value: ClinicalRecordEntity) = launch("删除病历") { repository.deleteRecord(value) }
+    fun deleteRecord(value: ClinicalRecordEntity) = launch("将病历移入回收站") {
+        repository.deleteRecord(value)
+        messages.send("病历已移入回收站，可在 30 天内恢复")
+    }
 
     fun importAttachments(recordId: Long, uris: List<Uri>) = viewModelScope.launch {
         busyChannel.value = true
@@ -146,7 +172,20 @@ class AppViewModel(
         } finally { busyChannel.value = false }
     }
 
-    fun deleteAttachment(value: AttachmentEntity) = launch("删除附件") { repository.deleteAttachment(value) }
+    fun deleteAttachment(value: AttachmentEntity, onDeleted: () -> Unit = {}) = launch("删除附件") {
+        when (repository.deleteAttachment(value)) {
+            AttachmentDeleteResult.MOVED_TO_TRASH -> {
+                onDeleted()
+                messages.send("检查报告已移入回收站，可在 30 天内恢复")
+            }
+            AttachmentDeleteResult.DELETED -> onDeleted()
+            AttachmentDeleteResult.MISSING_FILE_RECORD_REMOVED -> {
+                onDeleted()
+                messages.send("原附件文件已不存在，已清除无效记录")
+            }
+            AttachmentDeleteResult.ALREADY_DELETED -> messages.send("该附件已经删除")
+        }
+    }
 
     fun saveFollowUp(value: FollowUpScheduleEntity, onSaved: () -> Unit = {}, onFailed: () -> Unit = {}) = launch("保存复查计划", onFailed) {
         val id = repository.saveFollowUp(value)
@@ -155,27 +194,65 @@ class AppViewModel(
         onSaved()
     }
 
-    fun deleteFollowUp(value: FollowUpScheduleEntity) = launch("删除复查计划") {
+    fun deleteFollowUp(value: FollowUpScheduleEntity) = launch("将复查计划移入回收站") {
         scheduler.cancelFollowUp(value.id)
         repository.deleteFollowUp(value)
+        messages.send("复查计划已移入回收站，可在 30 天内恢复")
     }
 
     fun completeOccurrence(id: Long, skipped: Boolean = false) = launch("更新复查状态") {
         repository.completeOccurrence(id, skipped)?.let(scheduler::scheduleFollowUp)
     }
 
-    fun saveMedication(value: MedicationEntity, times: List<LocalTime>, onSaved: () -> Unit = {}, onFailed: () -> Unit = {}) = launch("保存用药计划", onFailed) {
-        val result = repository.saveMedication(value, times)
+    fun saveMedication(
+        value: MedicationEntity,
+        times: List<LocalTime>,
+        effectiveDate: LocalDate? = null,
+        onSaved: () -> Unit = {},
+        onFailed: () -> Unit = {}
+    ) = launch("保存用药计划", onFailed) {
+        val result = repository.saveMedication(value, times, effectiveDate)
         result.replacedScheduleIds.forEach(scheduler::cancelMedication)
         runCatching { scheduler.rescheduleAll() }
             .onFailure { messages.send("用药计划已保存，但系统提醒安排失败；请检查权限并重新打开应用") }
         onSaved()
     }
 
-    fun archiveMedication(id: Long) = launch("归档药物") {
-        medicationSchedules.value.filter { it.medicationId == id }.forEach { scheduler.cancelMedication(it.id) }
+    fun archiveMedication(id: Long) = launch("结束疗程") {
         repository.archiveMedication(id)
-        scheduler.rescheduleAll()
+        medicationSchedules.value.filter { it.medicationId == id }.forEach { scheduler.cancelMedication(it.id) }
+        runCatching { scheduler.rescheduleAll() }
+            .onFailure { messages.send("疗程已结束，但系统提醒刷新失败；请检查通知权限并重新打开应用") }
+    }
+
+    fun restoreMedication(id: Long) = launch("恢复疗程") {
+        repository.restoreMedication(id)
+        runCatching { scheduler.rescheduleAll() }
+            .onFailure { messages.send("疗程已恢复，但系统提醒刷新失败；请检查通知权限并重新打开应用") }
+    }
+
+    fun deleteMedication(value: MedicationEntity) = launch("将药物移入回收站") {
+        medicationSchedules.value.filter { it.medicationId == value.id }.forEach { scheduler.cancelMedication(it.id) }
+        repository.deleteMedication(value.id)
+        messages.send("药物及其历史记录已移入回收站，可在 30 天内恢复")
+    }
+
+    fun restoreTrash(item: TrashItem) = launch("恢复资料") {
+        repository.restoreTrash(item)
+        if (item.type == TrashItemType.FOLLOW_UP || item.type == TrashItemType.MEDICATION) {
+            runCatching { scheduler.rescheduleAll() }
+                .onFailure { messages.send("资料已恢复，但提醒安排失败；请检查权限并重新打开应用") }
+        }
+        messages.send("已从回收站恢复")
+    }
+
+    fun permanentlyDeleteTrash(item: TrashItem) = launch("永久删除") {
+        val result = repository.permanentlyDeleteTrash(item)
+        if (result == AttachmentDeleteResult.MISSING_FILE_RECORD_REMOVED) {
+            messages.send("附件文件原已缺失，无效记录已永久删除")
+        } else {
+            messages.send("已永久删除，无法恢复")
+        }
     }
 
     fun markDose(value: TodayDose, status: MedicationLogStatus) = launch("记录用药") {
@@ -247,7 +324,60 @@ class AppViewModel(
         }
     }
 
+    fun recordDose(
+        value: MedicationDayEntry,
+        status: MedicationLogStatus,
+        actualAt: LocalDateTime?
+    ) = launch("记录用药") {
+        val planned = value.plannedAt ?: requireNotNull(actualAt)
+        if (!repository.recordDose(value.medication.id, value.schedule?.id, planned, actualAt, status)) {
+            messages.send("这一剂已经记录过了")
+        }
+    }
+
+    fun recordAsNeeded(medication: MedicationEntity, actualAt: LocalDateTime) = launch("补记用药") {
+        if (!repository.recordDose(medication.id, null, actualAt, actualAt, MedicationLogStatus.TAKEN)) {
+            messages.send("该药物在这个时间已经记录过了")
+        }
+    }
+
+    fun correctDose(logId: Long, status: MedicationLogStatus, actualAt: LocalDateTime?) = launch("修正用药记录") {
+        if (!repository.correctDose(logId, status, actualAt)) messages.send("这条用药记录已不存在")
+    }
+
     fun canScheduleExact() = scheduler.canScheduleExact()
+    fun safetySystemStatus() = safetyCenter.systemStatus()
+
+    fun scheduleTestReminder() = launch("安排测试提醒") {
+        require(safetyCenter.systemStatus().notificationsReady) { "请先允许应用通知，并开启复查和用药提醒类别" }
+        val exact = scheduler.scheduleTestReminder()
+        messages.send(
+            if (exact) "测试提醒将在约 10 秒后出现"
+            else "测试提醒已安排；精确闹钟未允许，系统可能延迟显示"
+        )
+    }
+
+    fun runSafetyIntegrityCheck() = viewModelScope.launch {
+        busyChannel.value = true
+        messages.send("正在检查数据库和全部附件，请保持应用开启")
+        try {
+            runCatching { safetyCenter.runIntegrityCheck() }
+                .onSuccess { result ->
+                    messages.send(
+                        if (result.healthy) "完整性检查通过"
+                        else "检查发现 ${result.problemCount} 项异常，请先导出备份并保留诊断报告"
+                    )
+                }
+                .onFailure { messages.send(it.userMessage("完整性检查失败")) }
+        } finally {
+            busyChannel.value = false
+        }
+    }
+
+    fun exportSafetyDiagnostic(uri: Uri) = launchResult("正在生成诊断报告", "诊断报告已导出") {
+        safetyCenter.exportDiagnostic(uri).getOrThrow()
+    }
+
     fun attachmentFile(value: AttachmentEntity) = repository.attachmentStore.file(value)
 
     private fun launch(label: String, onFailed: () -> Unit = {}, block: suspend () -> Unit) = viewModelScope.launch {
@@ -276,10 +406,11 @@ class AppViewModel(
         private val repository: HealthRepository,
         private val scheduler: AlarmScheduler,
         private val backup: PortableBackupService,
-        private val memberSelection: MemberSelectionStore
+        private val memberSelection: MemberSelectionStore,
+        private val safetyCenter: SafetyCenterService
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
-            AppViewModel(repository, scheduler, backup, memberSelection) as T
+            AppViewModel(repository, scheduler, backup, memberSelection, safetyCenter) as T
     }
 }

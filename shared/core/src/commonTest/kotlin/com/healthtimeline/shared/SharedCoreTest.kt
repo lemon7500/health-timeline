@@ -30,6 +30,7 @@ class SharedCoreTest {
     @Test
     fun jsonRoundTripAndValidation() {
         val snapshot = snapshot(recordTitle = "乳腺彩超复查")
+        assertEquals(5, snapshot.schemaVersion)
         assertEquals(snapshot, PortableJson.decode(PortableJson.encode(snapshot)))
         assertFails { PortableSnapshotValidator.validate(snapshot.copy(sourceInstallationId = "bad")) }
         assertFails { PortableSnapshotValidator.validate(snapshot.copy(sourcePlatform = "unknown")) }
@@ -69,10 +70,100 @@ class SharedCoreTest {
     }
 
     @Test
+    fun familyV3PortableBackupStillDecodesBeforeV4Conversion() {
+        val current = snapshot(recordTitle = "旧版家庭记录")
+        val legacy = current.copy(schemaVersion = FAMILY_BACKUP_SCHEMA_VERSION)
+
+        assertEquals(FAMILY_BACKUP_SCHEMA_VERSION, PortableJson.decode(PortableJson.encode(legacy)).schemaVersion)
+    }
+
+    @Test
+    fun v4PortableBackupStillDecodesBeforeTrashConversion() {
+        val previous = snapshot(recordTitle = "v4 记录").copy(schemaVersion = PREVIOUS_BACKUP_SCHEMA_VERSION)
+        assertEquals(PREVIOUS_BACKUP_SCHEMA_VERSION, PortableJson.decode(PortableJson.encode(previous)).schemaVersion)
+    }
+
+    @Test
+    fun v5TrashFieldsRoundTripAndRequireDeletedChildAttachments() {
+        val deletedAt = "2026-09-10T01:02:03Z"
+        val current = snapshot(recordTitle = "回收站记录")
+        val record = current.records.single().copy(deletedAt = deletedAt)
+        val attachment = PortableAttachment(
+            uuid = "77777777-7777-4777-8777-777777777777",
+            recordUuid = record.uuid,
+            kind = "PDF",
+            displayName = "报告.pdf",
+            mimeType = "application/pdf",
+            archivePath = "files/77777777-7777-4777-8777-777777777777",
+            sizeBytes = 4,
+            sha256 = "a".repeat(64),
+            createdAt = "2026-09-03T00:00:00Z",
+            deletedAt = deletedAt
+        )
+        val deleted = current.copy(records = listOf(record), attachments = listOf(attachment))
+        assertEquals(deleted, PortableJson.decode(PortableJson.encode(deleted)))
+        assertFails {
+            PortableSnapshotValidator.validate(deleted.copy(attachments = listOf(attachment.copy(deletedAt = null))))
+        }
+    }
+
+    @Test
+    fun v4MedicationHistoryFieldsRoundTrip() {
+        val current = snapshot(recordTitle = "用药历史").let { value ->
+            val medicationUuid = "55555555-5555-4555-8555-555555555555"
+            value.copy(
+                medications = listOf(
+                    PortableMedication(
+                        uuid = medicationUuid,
+                        name = "测试药物",
+                        doseAmount = "2",
+                        doseUnit = "片",
+                        instructions = "饭后",
+                        startDate = "2026-09-01",
+                        mode = "SCHEDULED",
+                        archived = false,
+                        createdAt = "2026-09-01T00:00:00Z",
+                        updatedAt = "2026-09-05T00:00:00Z",
+                        memberUuid = value.members.single().uuid
+                    )
+                ),
+                medicationSchedules = listOf(
+                    PortableMedicationSchedule(
+                        uuid = "66666666-6666-4666-8666-666666666666",
+                        medicationUuid = medicationUuid,
+                        localTime = "08:05",
+                        enabled = true,
+                        updatedAt = "2026-09-05T00:00:00Z",
+                        effectiveFrom = "2026-09-06",
+                        effectiveTo = null,
+                        doseAmountSnapshot = "2",
+                        doseUnitSnapshot = "片"
+                    )
+                )
+            )
+        }
+
+        val restored = PortableJson.decode(PortableJson.encode(current))
+
+        assertEquals("2026-09-06", restored.medicationSchedules.single().effectiveFrom)
+        assertEquals("2", restored.medicationSchedules.single().doseAmountSnapshot)
+    }
+
+    @Test
+    fun v4RequiresCanonicalRelationshipCompatibilityField() {
+        val current = snapshot(recordTitle = "关系字段")
+        val invalid = current.copy(
+            members = current.members.map { it.copy(nickname = "妈妈", relationship = "母亲") }
+        )
+
+        assertFails { PortableSnapshotValidator.validate(invalid) }
+    }
+
+    @Test
     fun crossMemberConditionReferenceIsRejected() {
         val current = snapshot(recordTitle = "复查")
         val other = PortableFamilyMember(
-            "44444444-4444-4444-8444-444444444444", "李先生", "爸爸", "父亲", false,
+            "44444444-4444-4444-8444-444444444444", "李先生", "父亲", "父亲", false,
             "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z"
         )
         val invalid = current.copy(
@@ -135,7 +226,7 @@ class SharedCoreTest {
             sourcePlatform = "test",
             sourceInstallationId = "00000000-0000-4000-8000-000000000001",
             members = listOf(
-                PortableFamilyMember(memberId, "张女士", "妈妈", "母亲", false, "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z")
+                PortableFamilyMember(memberId, "张女士", "母亲", "母亲", false, "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z")
             ),
             conditions = listOf(
                 PortableCondition(conditionId, "乳腺", 0, "", false, "2026-09-01T00:00:00Z", memberUuid = memberId)
@@ -156,7 +247,8 @@ class SharedCoreTest {
                     notes = "",
                     createdAt = "2026-09-03T00:00:00Z",
                     updatedAt = "2026-09-03T00:00:00Z",
-                    memberUuid = memberId
+                    memberUuid = memberId,
+                    dayOrder = 3
                 )
             )
         )

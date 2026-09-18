@@ -27,7 +27,7 @@ fun MemberSwitcher(viewModel: AppViewModel, modifier: Modifier = Modifier) {
             LabeledDropdown(
                 label = "家庭成员",
                 value = selectedId?.toString().orEmpty(),
-                options = active.map { it.id.toString() to "${it.nickname} · ${it.name}（${it.relationship}）" },
+                options = active.map { it.id.toString() to "${it.relationship} · ${it.name}" },
                 onSelect = { it.toLongOrNull()?.let(viewModel::selectMember) },
                 modifier = Modifier.fillMaxWidth()
             )
