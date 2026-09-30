@@ -423,7 +423,7 @@ class RepositoryIntegrityTest {
         assertEquals(listOf("原记录"), database.clinicalRecordDao().all().map { it.title })
     }
 
-    @Test fun interruptedAttachmentDeletionIsRecoveredWhenDatabaseRowStillExists() = runBlocking {
+    @Test fun interruptedAttachmentDeletionIsRecoveredWhenDatabaseRowStillExists(): Unit = runBlocking {
         val attachment = createStoredAttachment("recover-me.pdf")
         val original = repository.attachmentStore.file(attachment)
 
@@ -436,6 +436,7 @@ class RepositoryIntegrityTest {
         assertEquals("test-report", original.readText())
         assertEquals(attachment.uuid, database.attachmentDao().byUuid(attachment.uuid)?.uuid)
         original.parentFile?.deleteRecursively()
+        Unit
     }
 
     @Test fun attachmentMovesToTrashThenPermanentDeletionIsSafe() = runBlocking {
@@ -455,7 +456,7 @@ class RepositoryIntegrityTest {
         assertTrue(database.attachmentDao().byUuid(attachment.uuid) == null)
     }
 
-    @Test fun staleAttachmentObjectCannotDeleteAReplacedDatabaseRow() = runBlocking {
+    @Test fun staleAttachmentObjectCannotDeleteAReplacedDatabaseRow(): Unit = runBlocking {
         val attachment = createStoredAttachment("stale.pdf")
         val stale = attachment.copy(uuid = "90000000-0000-4000-8000-000000000009")
 
@@ -463,6 +464,7 @@ class RepositoryIntegrityTest {
         assertTrue(repository.attachmentStore.file(attachment).exists())
         assertEquals(attachment.uuid, database.attachmentDao().byId(attachment.id)?.uuid)
         repository.attachmentStore.file(attachment).parentFile?.deleteRecursively()
+        Unit
     }
 
     @Test fun missingAttachmentFileCanRemoveOnlyItsInvalidDatabaseRow() = runBlocking {
@@ -476,7 +478,7 @@ class RepositoryIntegrityTest {
         assertTrue(database.attachmentDao().byId(attachment.id) == null)
     }
 
-    @Test fun recordTrashAndRestorePreserveAttachmentFileAndPermanentIds() = runBlocking {
+    @Test fun recordTrashAndRestorePreserveAttachmentFileAndPermanentIds(): Unit = runBlocking {
         val attachment = createStoredAttachment("restore-from-trash.pdf")
         val record = requireNotNull(database.clinicalRecordDao().byId(attachment.recordId))
         val original = repository.attachmentStore.file(attachment)
@@ -505,6 +507,7 @@ class RepositoryIntegrityTest {
         assertTrue(restoredAttachment.deletedAt == null)
         assertTrue(original.exists())
         original.parentFile?.deleteRecursively()
+        Unit
     }
 
     @Test fun recordRestoreRefusesMissingAttachmentAndKeepsTrashState() = runBlocking {
@@ -613,7 +616,7 @@ class RepositoryIntegrityTest {
         assertTrue(database.medicationDao().medicationById(recentId)?.deletedAt != null)
     }
 
-    @Test fun safetyCenterDetectsAttachmentChecksumMismatchWithoutChangingData() = runBlocking {
+    @Test fun safetyCenterDetectsAttachmentChecksumMismatchWithoutChangingData(): Unit = runBlocking {
         val attachment = createStoredAttachment("integrity-check.pdf")
         val file = repository.attachmentStore.file(attachment)
         file.writeText("tampered-report")
@@ -641,6 +644,7 @@ class RepositoryIntegrityTest {
 
         context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE).edit().clear().commit()
         file.parentFile?.deleteRecursively()
+        Unit
     }
 
     @Test fun legacyBackupCanBeAppendedAsNewWithoutOverwritingLocalData() = runBlocking {

@@ -4,4 +4,8 @@ project 'HealthTimeline.xcodeproj'
 target 'HealthTimeline' do
   use_frameworks!
   pod 'SQLCipher', '~> 4.6'
+
+  target 'HealthTimelineTests' do
+    inherit! :search_paths
+  end
 end
