@@ -56,9 +56,7 @@ jobs:
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: |
-            set -o pipefail
-            ./gradlew :androidApp:connectedDebugAndroidTest --stacktrace 2>&1 | tee "$RUNNER_TEMP/android-instrumentation.log"
+          script: bash -o pipefail -c './gradlew :androidApp:connectedDebugAndroidTest --stacktrace 2>&1 | tee "$RUNNER_TEMP/android-instrumentation.log"'
       - name: Publish Android instrumentation errors
         if: failure() && steps.android-instrumentation.outcome == 'failure'
         shell: bash
@@ -129,5 +127,38 @@ jobs:
         with:
           name: ios-build-log
           path: ${{ runner.temp }}/ios-build.log
-      - run: xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' CODE_SIGNING_ALLOWED=NO test
+      - name: Run iOS simulator tests
+        id: ios-tests
+        shell: bash
+        run: |
+          set -o pipefail
+          simulator_id="$(xcrun simctl list devices available | awk -F '[()]' '/iPhone/ { print $2; exit }')"
+          if [[ -z "$simulator_id" ]]; then
+            xcrun simctl list devices available
+            echo '::error::No available iPhone simulator was found on the GitHub runner.'
+            exit 1
+          fi
+          echo "Using iPhone simulator $simulator_id"
+          xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_id" CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$RUNNER_TEMP/ios-test.log"
         working-directory: apps/ios
+      - name: Publish iOS test errors
+        if: failure() && steps.ios-tests.outcome == 'failure'
+        shell: bash
+        run: |
+          error_lines="$(grep -E 'error:|Test Case .* failed|XCTAssert|Unable to find a destination' "$RUNNER_TEMP/ios-test.log" | tail -n 50 || true)"
+          if [[ -z "$error_lines" ]]; then
+            echo '::error::iOS tests failed without a matched error line; inspect the uploaded ios-test-log artifact.'
+          else
+            while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              line="${line//$'\r'/'%0D'}"
+              line="${line//$'\n'/'%0A'}"
+              echo "::error::$line"
+            done <<< "$error_lines"
+          fi
+      - name: Upload iOS test log
+        if: failure() && steps.ios-tests.outcome == 'failure'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ios-test-log
+          path: ${{ runner.temp }}/ios-test.log
