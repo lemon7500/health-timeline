@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       - run: node scripts/validate-harmony-v4.mjs
@@ -27,7 +27,7 @@ jobs:
           cache: gradle
       - run: chmod +x gradlew
       - run: ./gradlew :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintRelease :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: android-debug-apk
           path: apps/android/app/build/outputs/apk/debug/*.apk
@@ -49,13 +49,41 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Run Room migration and repository integrity tests
+        id: android-instrumentation
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: ./gradlew :androidApp:connectedDebugAndroidTest --stacktrace
+          script: |
+            set -o pipefail
+            ./gradlew :androidApp:connectedDebugAndroidTest --stacktrace 2>&1 | tee "$RUNNER_TEMP/android-instrumentation.log"
+      - name: Publish Android instrumentation errors
+        if: failure() && steps.android-instrumentation.outcome == 'failure'
+        shell: bash
+        run: |
+          error_lines="$(grep -E 'FAILED|FAILURES|AssertionError|Exception|There (was|were) [0-9]+ failure' "$RUNNER_TEMP/android-instrumentation.log" | tail -n 50 || true)"
+          if [[ -z "$error_lines" ]]; then
+            echo '::error::Android instrumentation failed without a matched test error; inspect the uploaded report and log.'
+          else
+            while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              line="${line//$'\r'/'%0D'}"
+              line="${line//$'\n'/'%0A'}"
+              echo "::error::$line"
+            done <<< "$error_lines"
+          fi
+      - name: Upload Android instrumentation report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-instrumentation-report
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/android-instrumentation.log
+            apps/android/app/build/reports/androidTests/connected/
+            apps/android/app/build/outputs/androidTest-results/connected/
 
   ios-simulator:
     runs-on: macos-latest
@@ -97,7 +125,7 @@ jobs:
           fi
       - name: Upload iOS build log
         if: failure() && steps.ios-build.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ios-build-log
           path: ${{ runner.temp }}/ios-build.log

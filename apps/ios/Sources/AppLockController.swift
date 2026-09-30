@@ -13,8 +13,9 @@ final class AppLockController: ObservableObject {
     private var externalPickerDepth = 0
 
     init() {
-        enabled = UserDefaults.standard.bool(forKey: settingKey)
-        unlocked = !enabled
+        let isEnabled = UserDefaults.standard.bool(forKey: "healthTimeline.appLockEnabled")
+        enabled = isEnabled
+        unlocked = !isEnabled
     }
 
     func setEnabled(_ value: Bool) async {
