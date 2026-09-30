@@ -77,7 +77,7 @@ class RepositoryIntegrityTest {
             ),
             emptyList()
         ).medicationId
-        val scheduledAt = "2026-09-01T00:00"
+        val scheduledAt = LocalDate.now().atStartOfDay().toString()
         assertTrue(repository.markDose(medicationId, null, scheduledAt, MedicationLogStatus.TAKEN))
         assertFalse(repository.markDose(medicationId, null, scheduledAt, MedicationLogStatus.TAKEN))
         assertEquals(1, database.medicationDao().allLogs().size)
@@ -102,7 +102,12 @@ class RepositoryIntegrityTest {
         val secondSchedule = database.medicationDao().schedulesForMedication(second).single()
 
         assertFalse(
-            repository.markDose(first, secondSchedule.id, "2026-09-01T08:00", MedicationLogStatus.TAKEN)
+            repository.markDose(
+                first,
+                secondSchedule.id,
+                LocalDate.now().atTime(8, 0).toString(),
+                MedicationLogStatus.TAKEN
+            )
         )
         assertTrue(database.medicationDao().allLogs().isEmpty())
     }
@@ -634,8 +639,8 @@ class RepositoryIntegrityTest {
             .digest(file.readBytes())
             .joinToString("") { "%02x".format(it) }
         database.openHelper.writableDatabase.execSQL(
-            "UPDATE attachments SET sha256 = ? WHERE id = ?",
-            arrayOf<Any>(correctHash, attachment.id)
+            "UPDATE attachments SET sha256 = ?, sizeBytes = ? WHERE id = ?",
+            arrayOf<Any>(correctHash, file.length(), attachment.id)
         )
         val passed = service.runIntegrityCheck()
         assertTrue(passed.healthy)
