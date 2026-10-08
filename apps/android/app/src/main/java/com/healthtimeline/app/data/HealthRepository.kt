@@ -6,6 +6,7 @@ import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.RecurrenceCalculator
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -82,6 +83,30 @@ class HealthRepository(
             medications.observeLogsForMemberBetween(memberId, startAt, endAt)
         ) { medicines, schedules, logs ->
             projectMedicationMonth(month, medicines, schedules, logs)
+        }
+    }
+
+    fun todayOverviewForMember(memberId: Long, date: LocalDate): Flow<TodayOverviewData> {
+        val startAt = date.atStartOfDay().toString()
+        val endAt = date.plusDays(1).atStartOfDay().toString()
+        val throughDate = date.plusDays(6).toString()
+        return followUps.observeOverviewChanges(memberId, date.toString(), startAt, endAt, throughDate).map {
+            database.withTransaction {
+                if (members.byId(memberId)?.archived != false) {
+                    TodayOverviewData(memberId, date)
+                } else {
+                    projectTodayOverview(
+                        memberId = memberId,
+                        date = date,
+                        medicines = medications.medicationsForOverview(memberId, date.toString(), startAt, endAt),
+                        medicationSchedules = medications.schedulesForDay(memberId, date.toString()),
+                        medicationLogs = medications.logsForDay(memberId, startAt, endAt),
+                        schedules = followUps.schedulesForOverview(memberId, throughDate),
+                        occurrences = followUps.occurrencesForOverview(memberId, throughDate),
+                        conditions = conditions.forMember(memberId)
+                    )
+                }
+            }
         }
     }
 
@@ -447,6 +472,51 @@ class HealthRepository(
         }
     }
 
+    /** Resolve an exact visible occurrence, even if its notification never ran. */
+    suspend fun confirmTodayFollowUp(
+        memberId: Long,
+        scheduleId: Long,
+        scheduleUuid: String,
+        dueDate: LocalDate,
+        skipped: Boolean
+    ): Boolean = mutationMutex.withLock {
+        database.withTransaction {
+            if (dueDate.isAfter(LocalDate.now()) || members.byId(memberId)?.archived != false) {
+                return@withTransaction false
+            }
+            val schedule = followUps.scheduleById(scheduleId) ?: return@withTransaction false
+            if (schedule.memberId != memberId || schedule.uuid != scheduleUuid || schedule.deletedAt != null) {
+                return@withTransaction false
+            }
+            val due = dueDate.toString()
+            var occurrence = followUps.occurrenceForDate(scheduleId, due)
+            if (occurrence == null) {
+                // A stale sheet must never invent a historical occurrence after a rule edit.
+                if (!schedule.enabled || schedule.nextDueDate != due) return@withTransaction false
+                val inserted = followUps.insertOccurrence(
+                    FollowUpOccurrenceEntity(scheduleId = scheduleId, dueDate = due, createdAt = Instant.now().toString())
+                )
+                if (inserted <= 0) return@withTransaction false
+                occurrence = followUps.occurrenceById(inserted) ?: error("无法读取刚建立的复查事项")
+            }
+            if (occurrence.status != OccurrenceStatus.PENDING.name) return@withTransaction false
+            val now = Instant.now().toString()
+            check(followUps.markOccurrence(
+                    occurrence.id,
+                    if (skipped) OccurrenceStatus.SKIPPED.name else OccurrenceStatus.DONE.name,
+                    now
+                ) == 1) { "复查确认未能保存，请重试" }
+            if (schedule.enabled && schedule.nextDueDate == due) {
+                val next = RecurrenceCalculator.nextAfter(schedule, dueDate)
+                followUps.updateSchedule(
+                    if (next == null) schedule.copy(enabled = false, updatedAt = now)
+                    else schedule.copy(nextDueDate = next.toString(), updatedAt = now)
+                )
+            }
+            true
+        }
+    }
+
     suspend fun archiveMedication(id: Long) = mutationMutex.withLock {
         database.withTransaction {
             val today = LocalDate.now()
@@ -548,6 +618,70 @@ class HealthRepository(
                 updatedAt = now
             )
         ) > 0
+    }
+
+    /** Homepage actions cannot overwrite logs or act on a stale/ended course. */
+    suspend fun recordTodayDose(
+        memberId: Long,
+        entry: MedicationDayEntry,
+        status: MedicationLogStatus,
+        actualAt: LocalDateTime?
+    ): Boolean = mutationMutex.withLock {
+        database.withTransaction {
+            val today = LocalDate.now()
+            if (entry.medication.memberId != memberId || entry.log != null ||
+                entry.status != MedicationDayStatus.UNRECORDED || members.byId(memberId)?.archived != false) {
+                return@withTransaction false
+            }
+            val medication = medications.medicationById(entry.medication.id) ?: return@withTransaction false
+            if (medication.memberId != memberId || medication.uuid != entry.medication.uuid ||
+                medication.deletedAt != null || medication.archived || medication.endedAt != null ||
+                LocalDate.parse(medication.startDate).isAfter(today) ||
+                medication.endDate?.let { LocalDate.parse(it).isBefore(today) } == true) {
+                return@withTransaction false
+            }
+            if (status == MedicationLogStatus.TAKEN && actualAt == null) return@withTransaction false
+            if (actualAt != null && actualAt.toLocalDate() != today) return@withTransaction false
+            val schedule: MedicationScheduleEntity?
+            val scheduledAt: LocalDateTime
+            if (entry.schedule != null) {
+                val originalSchedule = entry.schedule
+                schedule = medications.scheduleById(originalSchedule.id) ?: return@withTransaction false
+                if (schedule.medicationId != medication.id || schedule.uuid != originalSchedule.uuid ||
+                    schedule.localTime != originalSchedule.localTime ||
+                    schedule.doseAmountSnapshot != originalSchedule.doseAmountSnapshot ||
+                    schedule.doseUnitSnapshot != originalSchedule.doseUnitSnapshot ||
+                    schedule.pausedByCourseEnd || LocalDate.parse(schedule.effectiveFrom).isAfter(today) ||
+                    schedule.effectiveTo?.let { LocalDate.parse(it).isBefore(today) } == true) {
+                    return@withTransaction false
+                }
+                scheduledAt = today.atTime(LocalTime.parse(schedule.localTime))
+                if (entry.plannedAt != scheduledAt) return@withTransaction false
+            } else {
+                if (entry.plannedAt != null || medication.mode != MedicationMode.AS_NEEDED.name ||
+                    status != MedicationLogStatus.TAKEN || actualAt == null ||
+                    medication.doseAmount != entry.medication.doseAmount || medication.doseUnit != entry.medication.doseUnit ||
+                    medications.hasScheduledPlanOnDate(medication.id, today.toString())) {
+                    return@withTransaction false
+                }
+                schedule = null
+                scheduledAt = actualAt
+            }
+            val now = Instant.now().toString()
+            medications.insertLog(
+                MedicationLogEntity(
+                    medicationId = medication.id,
+                    scheduleId = schedule?.id,
+                    scheduledAt = scheduledAt.toString(),
+                    actualAt = if (status == MedicationLogStatus.TAKEN) actualAt?.toString() else null,
+                    status = status.name,
+                    doseAmountSnapshot = schedule?.doseAmountSnapshot?.ifBlank { medication.doseAmount } ?: medication.doseAmount,
+                    doseUnitSnapshot = schedule?.doseUnitSnapshot?.ifBlank { medication.doseUnit } ?: medication.doseUnit,
+                    createdAt = now,
+                    updatedAt = now
+                )
+            ) > 0
+        }
     }
 
     suspend fun markDose(
@@ -750,8 +884,23 @@ internal fun projectMedicationMonth(
     schedules: List<MedicationScheduleEntity>,
     logs: List<MedicationLogEntity>
 ): MedicationMonthData {
-    val firstDate = month.atDay(1)
-    val lastDate = month.atEndOfMonth()
+    return MedicationMonthData(month, projectMedicationPeriod(month.atDay(1), month.atEndOfMonth(), medicines, schedules, logs))
+}
+
+internal fun projectMedicationDay(
+    date: LocalDate,
+    medicines: List<MedicationEntity>,
+    schedules: List<MedicationScheduleEntity>,
+    logs: List<MedicationLogEntity>
+): List<MedicationDayEntry> = projectMedicationPeriod(date, date, medicines, schedules, logs)[date].orEmpty()
+
+private fun projectMedicationPeriod(
+    firstDate: LocalDate,
+    lastDate: LocalDate,
+    medicines: List<MedicationEntity>,
+    schedules: List<MedicationScheduleEntity>,
+    logs: List<MedicationLogEntity>
+): Map<LocalDate, List<MedicationDayEntry>> {
     val medicinesById = medicines.associateBy { it.id }
     val schedulesById = schedules.associateBy { it.id }
     val logsByKey = logs.associateBy { it.medicationId to it.scheduledAt }
@@ -788,7 +937,7 @@ internal fun projectMedicationMonth(
     logs.filterNot { it.id in consumedLogIds }.forEach { log ->
         val medication = medicinesById[log.medicationId] ?: return@forEach
         val scheduledAt = runCatching { LocalDateTime.parse(log.scheduledAt) }.getOrNull() ?: return@forEach
-        if (YearMonth.from(scheduledAt) != month) return@forEach
+        if (scheduledAt.toLocalDate().isBefore(firstDate) || scheduledAt.toLocalDate().isAfter(lastDate)) return@forEach
         entries.getOrPut(scheduledAt.toLocalDate()) { mutableListOf() } += MedicationDayEntry(
             medication = medication,
             schedule = log.scheduleId?.let(schedulesById::get),
@@ -806,5 +955,5 @@ internal fun projectMedicationMonth(
                 .thenBy { it.medication.name }
         )
     }
-    return MedicationMonthData(month, sorted)
+    return sorted
 }

@@ -4,6 +4,10 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.collect
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -671,6 +675,212 @@ class RepositoryIntegrityTest {
         source.delete()
         Unit
     }
+
+    @Test fun todayFollowUpCanCompleteBeforeAnyNotificationAndOnlyAdvanceOnce(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewFollowUp(member.id, today)
+        val schedule = requireNotNull(database.followUpDao().scheduleById(id))
+        val overview = repository.todayOverviewForMember(member.id, today).first()
+        assertEquals(id, overview.upcomingFollowUps.single().schedule.id)
+        assertEquals(null, overview.upcomingFollowUps.single().occurrence)
+        assertTrue(database.followUpDao().allOccurrences().isEmpty())
+
+        assertTrue(repository.confirmTodayFollowUp(member.id, id, schedule.uuid, today, false))
+        assertFalse(repository.confirmTodayFollowUp(member.id, id, schedule.uuid, today, false))
+        assertEquals(1, database.followUpDao().allOccurrences().size)
+        assertEquals(OccurrenceStatus.DONE.name, database.followUpDao().allOccurrences().single().status)
+        assertEquals(today.plusDays(7).toString(), database.followUpDao().scheduleById(id)?.nextDueDate)
+    }
+
+    @Test fun todayFollowUpRejectsStaleWrongMemberFutureAndDeletedObjects(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val otherId = repository.saveMember(FamilyMemberEntity(
+            name = "其他成员", nickname = "亲属", relationship = "亲属", createdAt = NOW, updatedAt = NOW
+        ))
+        val today = LocalDate.now()
+        val id = createOverviewFollowUp(member.id, today)
+        val original = requireNotNull(database.followUpDao().scheduleById(id))
+        assertFalse(repository.confirmTodayFollowUp(otherId, id, original.uuid, today, false))
+        assertFalse(repository.confirmTodayFollowUp(member.id, id, UUID.randomUUID().toString(), today, false))
+        repository.saveFollowUp(original.copy(nextDueDate = today.plusDays(1).toString()))
+        assertFalse(repository.confirmTodayFollowUp(member.id, id, original.uuid, today, false))
+        assertFalse(repository.confirmTodayFollowUp(member.id, id, original.uuid, today.plusDays(1), false))
+        repository.deleteFollowUp(original)
+        assertFalse(repository.confirmTodayFollowUp(member.id, id, original.uuid, today, false))
+        assertTrue(database.followUpDao().allOccurrences().isEmpty())
+    }
+
+    @Test fun oldPendingOverviewOccurrenceCanBeResolvedWithoutAdvancingEditedRule(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val due = today.minusDays(4)
+        val id = createOverviewFollowUp(member.id, due)
+        repository.processDueFollowUp(id, due)
+        val original = requireNotNull(database.followUpDao().scheduleById(id))
+        repository.saveFollowUp(original.copy(nextDueDate = today.plusDays(3).toString()))
+        val overview = repository.todayOverviewForMember(member.id, today).first()
+        assertEquals(due, overview.overdueFollowUps.single().dueDate)
+        assertEquals(today.plusDays(3), overview.upcomingFollowUps.single().dueDate)
+        assertTrue(repository.confirmTodayFollowUp(member.id, id, original.uuid, due, true))
+        assertEquals(today.plusDays(3).toString(), database.followUpDao().scheduleById(id)?.nextDueDate)
+        assertEquals(OccurrenceStatus.SKIPPED.name, database.followUpDao().allOccurrences().single().status)
+    }
+
+    @Test fun todayDoseRejectsWrongMemberAndDuplicateWithoutOverwritingActualTime(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val entry = repository.todayOverviewForMember(member.id, today).first().medicationEntries.first()
+        assertFalse(repository.recordTodayDose(member.id + 100, entry, MedicationLogStatus.TAKEN, today.atTime(8, 10)))
+        assertFalse(repository.recordTodayDose(member.id, entry, MedicationLogStatus.TAKEN, today.minusDays(1).atTime(8, 10)))
+        assertTrue(repository.recordTodayDose(member.id, entry, MedicationLogStatus.TAKEN, today.atTime(8, 10)))
+        assertFalse(repository.recordTodayDose(member.id, entry, MedicationLogStatus.SKIPPED, null))
+        val log = database.medicationDao().allLogs().single()
+        assertEquals(id, log.medicationId)
+        assertEquals(today.atTime(8, 10).toString(), log.actualAt)
+        assertEquals(MedicationLogStatus.TAKEN.name, log.status)
+    }
+
+    @Test fun overviewRetainsEndingDayEntriesButStaleSheetCannotContinueCourse(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = repository.todayOverviewForMember(member.id, today).first()
+        assertEquals(2, before.medicationEntries.size)
+        assertTrue(repository.recordTodayDose(member.id, before.medicationEntries.first(), MedicationLogStatus.TAKEN, today.atTime(8, 5)))
+        repository.archiveMedication(id)
+        assertFalse(repository.recordTodayDose(member.id, before.medicationEntries.last(), MedicationLogStatus.TAKEN, today.atTime(20, 5)))
+        val overview = repository.todayOverviewForMember(member.id, today).first()
+        assertEquals(repository.medicationMonthForMember(member.id, java.time.YearMonth.from(today)).first().entries(today), overview.medicationEntries)
+        assertEquals(2, overview.medicationEntries.size)
+        assertTrue(overview.medicationEntries.all { it.medication.archived })
+        assertEquals(1, database.medicationDao().allLogs().size)
+        assertTrue(repository.todayOverviewForMember(member.id, today.plusDays(1)).first().medicationEntries.isEmpty())
+    }
+
+    @Test fun tomorrowEditKeepsTodayHistoricalDoseWhileTodayReplacementRejectsStalePlan(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = repository.todayOverviewForMember(member.id, today).first().medicationEntries.first()
+        val medication = requireNotNull(repository.medicationById(id))
+        repository.saveMedication(medication.copy(doseAmount = "2"), listOf(LocalTime.of(9, 5)), today.plusDays(1))
+        assertTrue(repository.recordTodayDose(member.id, before, MedicationLogStatus.TAKEN, today.atTime(8, 5)))
+        assertEquals("1", database.medicationDao().allLogs().single().doseAmountSnapshot)
+
+        val replacementId = createOverviewMedication(member.id)
+        val stale = repository.todayOverviewForMember(member.id, today).first().medicationEntries.first { it.medication.id == replacementId }
+        val original = requireNotNull(repository.medicationById(replacementId))
+        repository.saveMedication(original.copy(doseAmount = "3"), listOf(LocalTime.of(10, 0)), today)
+        assertFalse(repository.recordTodayDose(member.id, stale, MedicationLogStatus.TAKEN, today.atTime(8, 5)))
+        val switchedId = createOverviewMedication(member.id)
+        val oldModeEntry = repository.todayOverviewForMember(member.id, today).first().medicationEntries.first { it.medication.id == switchedId }
+        val switched = requireNotNull(repository.medicationById(switchedId))
+        repository.saveMedication(switched.copy(mode = MedicationMode.AS_NEEDED.name), emptyList(), today)
+        assertFalse(repository.recordTodayDose(member.id, oldModeEntry, MedicationLogStatus.TAKEN, today.atTime(8, 5)))
+        assertEquals(1, database.medicationDao().allLogs().size)
+    }
+
+    @Test fun asNeededOverviewCreatesNoPhantomDoseAndExplicitEntryUsesUniqueSlot(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id, MedicationMode.AS_NEEDED)
+        val overview = repository.todayOverviewForMember(member.id, today).first()
+        assertTrue(overview.medicationEntries.isEmpty())
+        val medication = overview.asNeededMedications.single()
+        val entry = MedicationDayEntry(medication, null, null, null, null, MedicationDayStatus.UNRECORDED)
+        assertFalse(repository.recordTodayDose(member.id, entry, MedicationLogStatus.SKIPPED, null))
+        assertTrue(repository.recordTodayDose(member.id, entry, MedicationLogStatus.TAKEN, today.atTime(14, 5)))
+        assertFalse(repository.recordTodayDose(member.id, entry, MedicationLogStatus.TAKEN, today.atTime(14, 5)))
+        repository.archiveMedication(id)
+        assertFalse(repository.recordTodayDose(member.id, entry, MedicationLogStatus.TAKEN, today.atTime(15, 5)))
+        val ended = repository.todayOverviewForMember(member.id, today).first()
+        assertTrue(ended.asNeededMedications.isEmpty())
+        assertEquals(1, ended.medicationEntries.size)
+    }
+
+    @Test fun asNeededChangeEffectiveTomorrowDoesNotPermitEarlyUnscheduledDose(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val oldEntry = repository.todayOverviewForMember(member.id, today).first().medicationEntries.first()
+        val original = requireNotNull(repository.medicationById(id))
+        repository.saveMedication(
+            original.copy(mode = MedicationMode.AS_NEEDED.name, doseAmount = "3"),
+            emptyList(), today.plusDays(1)
+        )
+        val todayOverview = repository.todayOverviewForMember(member.id, today).first()
+        assertTrue(todayOverview.asNeededMedications.isEmpty())
+        assertEquals(2, todayOverview.medicationEntries.size)
+        assertEquals("1", todayOverview.medicationEntries.first().schedule?.doseAmountSnapshot)
+        val changed = requireNotNull(repository.medicationById(id))
+        val earlyAsNeeded = MedicationDayEntry(changed, null, null, null, null, MedicationDayStatus.UNRECORDED)
+        assertFalse(repository.recordTodayDose(member.id, earlyAsNeeded, MedicationLogStatus.TAKEN, today.atTime(14, 5)))
+        assertTrue(repository.recordTodayDose(member.id, oldEntry, MedicationLogStatus.TAKEN, today.atTime(8, 5)))
+        assertEquals("1", database.medicationDao().allLogs().single().doseAmountSnapshot)
+        assertEquals(listOf(id), repository.todayOverviewForMember(member.id, today.plusDays(1)).first().asNeededMedications.map { it.id })
+    }
+
+    @Test fun overviewQueriesExcludeAdjacentDayLogsAndArchivedMembers(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val otherId = repository.saveMember(FamilyMemberEntity(
+            name = "其他成员", nickname = "亲属", relationship = "亲属", createdAt = NOW, updatedAt = NOW
+        ))
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id, MedicationMode.AS_NEEDED)
+        val otherMedicationId = createOverviewMedication(otherId, MedicationMode.AS_NEEDED)
+        repository.recordDose(id, null, today.minusDays(1).atTime(10, 0), today.minusDays(1).atTime(10, 5), MedicationLogStatus.TAKEN)
+        repository.recordDose(id, null, today.atTime(10, 0), today.atTime(10, 5), MedicationLogStatus.TAKEN)
+        repository.recordDose(otherMedicationId, null, today.atTime(10, 0), today.atTime(10, 5), MedicationLogStatus.TAKEN)
+        val overview = repository.todayOverviewForMember(member.id, today).first()
+        assertEquals(1, overview.medicationEntries.size)
+        assertEquals(id, overview.medicationEntries.single().medication.id)
+        assertEquals(1, database.medicationDao().logsForDay(member.id, today.atStartOfDay().toString(), today.plusDays(1).atStartOfDay().toString()).size)
+        repository.archiveMember(member.id)
+        assertTrue(repository.todayOverviewForMember(member.id, today).first().medicationEntries.isEmpty())
+        assertEquals(3, database.medicationDao().allLogs().size)
+    }
+
+    @Test fun overviewRefreshesAfterUpdateEvenWhenInvalidationSignalValueIsUnchanged(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val updates = Channel<TodayOverviewData>(Channel.UNLIMITED)
+        val collector = launch {
+            repository.todayOverviewForMember(member.id, today).collect { updates.send(it) }
+        }
+        try {
+            withTimeout(10_000) { updates.receive() }
+            val medication = requireNotNull(repository.medicationById(id))
+            database.medicationDao().updateMedication(medication.copy(name = "更名后的药物"))
+            val refreshed = withTimeout(10_000) {
+                var result = updates.receive()
+                while (result.medicationEntries.first().medication.name != "更名后的药物") result = updates.receive()
+                result
+            }
+            assertEquals("更名后的药物", refreshed.medicationEntries.first().medication.name)
+        } finally {
+            collector.cancel()
+            updates.close()
+        }
+    }
+
+    private suspend fun createOverviewFollowUp(memberId: Long, due: LocalDate): Long = repository.saveFollowUp(
+        FollowUpScheduleEntity(
+            memberId = memberId, title = "今日测试复查", recurrenceType = RecurrenceType.EVERY_N_DAYS.name,
+            interval = 7, anchorDate = due.toString(), anchorDayOfMonth = due.dayOfMonth,
+            nextDueDate = due.toString(), createdAt = NOW, updatedAt = NOW
+        )
+    )
+
+    private suspend fun createOverviewMedication(memberId: Long, mode: MedicationMode = MedicationMode.SCHEDULED): Long = repository.saveMedication(
+        MedicationEntity(
+            memberId = memberId, name = "今日测试药物", doseAmount = "1", doseUnit = "片", mode = mode.name,
+            startDate = LocalDate.now().minusDays(10).toString(), createdAt = NOW, updatedAt = NOW
+        ),
+        if (mode == MedicationMode.SCHEDULED) listOf(LocalTime.of(8, 0), LocalTime.of(20, 0)) else emptyList()
+    ).medicationId
 
     private suspend fun createStoredAttachment(fileName: String): AttachmentEntity {
         val member = repository.ensureDefaultMember()

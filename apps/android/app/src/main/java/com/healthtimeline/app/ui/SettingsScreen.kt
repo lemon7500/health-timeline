@@ -34,6 +34,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.flowOf
 import java.time.LocalDate
 import java.time.Instant
 import java.time.ZoneId
@@ -56,12 +58,24 @@ fun SettingsScreen(
     viewModel: AppViewModel,
     padding: PaddingValues,
     appLockEnabled: Boolean,
-    onAppLockChange: (Boolean) -> Unit
+    onAppLockChange: (Boolean) -> Unit,
+    navigation: TodayNavigation.Safety? = null,
+    onNavigationConsumed: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
-    var showSafetyCenter by rememberSaveable { mutableStateOf(false) }
-    var showTrash by rememberSaveable { mutableStateOf(false) }
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    var showSafetyCenter by rememberSaveable(selectedMemberId) { mutableStateOf(false) }
+    var showTrash by rememberSaveable(selectedMemberId) { mutableStateOf(false) }
+    LaunchedEffect(navigation?.token, selectedMemberId) {
+        navigation?.let { request ->
+            if (request.memberId == selectedMemberId) {
+                showSafetyCenter = true
+                showTrash = false
+            }
+            onNavigationConsumed(request.token)
+        }
+    }
     if (showTrash) {
         TrashScreen(viewModel, padding, onBack = { showTrash = false })
         return
@@ -73,20 +87,28 @@ fun SettingsScreen(
 
     val members by viewModel.members.collectAsState()
     val lastBackupAt by viewModel.lastBackupAt.collectAsState()
-    val trashItems by viewModel.trashItems.collectAsState()
-    var createMember by remember { mutableStateOf(false) }
-    var editingMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
-    var archiveMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
-    var deleteMember by remember { mutableStateOf<FamilyMemberEntity?>(null) }
-    var exportPassword by remember { mutableStateOf<CharArray?>(null) }
-    var passwordMode by remember { mutableStateOf<String?>(null) }
-    var restoreUri by remember { mutableStateOf<Uri?>(null) }
-    var confirmRestore by remember { mutableStateOf(false) }
-    var importPassword by remember { mutableStateOf<CharArray?>(null) }
-    var importPreview by remember { mutableStateOf<BackupImportPreview?>(null) }
-    var replacementSource by remember { mutableStateOf<Uri?>(null) }
-    var replacementPassword by remember { mutableStateOf<CharArray?>(null) }
-    val importedChoices = remember { mutableStateMapOf<String, Boolean>() }
+    val trashItems = currentMemberTrashItems(viewModel)
+    var createMember by remember(selectedMemberId) { mutableStateOf(false) }
+    var editingMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
+    var archiveMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
+    var deleteMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
+    var exportPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
+    var passwordMode by remember(selectedMemberId) { mutableStateOf<String?>(null) }
+    var restoreUri by remember(selectedMemberId) { mutableStateOf<Uri?>(null) }
+    var confirmRestore by remember(selectedMemberId) { mutableStateOf(false) }
+    var importPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
+    var importPreview by remember(selectedMemberId) { mutableStateOf<BackupImportPreview?>(null) }
+    var replacementSource by remember(selectedMemberId) { mutableStateOf<Uri?>(null) }
+    var replacementPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
+    var importPickerMemberId by remember { mutableStateOf<Long?>(null) }
+    val importedChoices = remember(selectedMemberId) { mutableStateMapOf<String, Boolean>() }
+    DisposableEffect(selectedMemberId) {
+        onDispose {
+            exportPassword?.fill('\u0000')
+            importPassword?.fill('\u0000')
+            replacementPassword?.fill('\u0000')
+        }
+    }
 
     fun clearPendingImport() {
         importPassword?.fill('\u0000')
@@ -108,7 +130,10 @@ fun SettingsScreen(
     }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         appLockManager.endExternalActivity()
-        if (uri != null) { restoreUri = uri; passwordMode = "restore" }
+        if (uri != null && importPickerMemberId != null && importPickerMemberId == viewModel.selectedMemberId.value) {
+            restoreUri = uri; passwordMode = "restore"
+        }
+        importPickerMemberId = null
     }
     val safetyExportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -212,6 +237,7 @@ fun SettingsScreen(
             Icon(Icons.Outlined.Download, null); Spacer(Modifier.width(8.dp)); Text("导出加密备份")
         }
         OutlinedButton(onClick = {
+            importPickerMemberId = viewModel.selectedMemberId.value
             appLockManager.beginExternalActivity()
             importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
         }) {
@@ -338,8 +364,10 @@ private fun TrashScreen(
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
-    val items by viewModel.trashItems.collectAsState()
-    var permanentTarget by remember { mutableStateOf<TrashItem?>(null) }
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val items = currentMemberTrashItems(viewModel)
+    val ownerId = selectedMemberId
+    var permanentTarget by remember(selectedMemberId) { mutableStateOf<TrashItem?>(null) }
 
     Column(
         Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
@@ -373,7 +401,7 @@ private fun TrashScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Row {
-                        TextButton(onClick = { viewModel.restoreTrash(item) }) {
+                        TextButton(onClick = { if (viewModel.selectedMemberId.value == ownerId) viewModel.restoreTrash(item) }) {
                             Icon(Icons.Outlined.Restore, null)
                             Spacer(Modifier.width(4.dp))
                             Text("恢复")
@@ -390,16 +418,29 @@ private fun TrashScreen(
         Spacer(Modifier.height(24.dp))
     }
 
-    permanentTarget?.let { item ->
+    permanentTarget?.takeIf { target -> items.any { it.uuid == target.uuid && it.type == target.type } }?.let { item ->
         ConfirmDialog(
             title = "永久删除${trashTypeLabel(item.type)}？",
             message = "“${item.title}”及其关联历史将立即删除，无法从回收站恢复。请确认已经保存必要备份。",
             onConfirm = {
-                viewModel.permanentlyDeleteTrash(item)
+                if (viewModel.selectedMemberId.value == ownerId) viewModel.permanentlyDeleteTrash(item)
                 permanentTarget = null
             },
             onDismiss = { permanentTarget = null }
         )
+    }
+}
+
+/** Trash children have no memberId; a keyed fresh query cannot expose the previous member's cache. */
+@Composable
+private fun currentMemberTrashItems(viewModel: AppViewModel): List<TrashItem> {
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    return key(selectedMemberId) {
+        val memberItems = remember(selectedMemberId) {
+            selectedMemberId?.let(viewModel::trashItemsForMember) ?: flowOf(emptyList<TrashItem>())
+        }
+        val items by memberItems.collectAsStateWithLifecycle(initialValue = emptyList())
+        items
     }
 }
 

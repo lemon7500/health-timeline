@@ -32,6 +32,7 @@ interface FamilyMemberDao {
 interface ConditionDao {
     @Query("SELECT * FROM conditions ORDER BY archived, name") fun observeAll(): Flow<List<ConditionEntity>>
     @Query("SELECT * FROM conditions WHERE memberId = :memberId ORDER BY archived, name") fun observeForMember(memberId: Long): Flow<List<ConditionEntity>>
+    @Query("SELECT * FROM conditions WHERE memberId = :memberId ORDER BY archived, name") suspend fun forMember(memberId: Long): List<ConditionEntity>
     @Query("SELECT * FROM conditions WHERE id = :id") suspend fun byId(id: Long): ConditionEntity?
     @Query("SELECT * FROM conditions ORDER BY id") suspend fun all(): List<ConditionEntity>
     @Insert suspend fun insert(value: ConditionEntity): Long
@@ -86,6 +87,23 @@ interface AttachmentDao {
 
 @Dao
 interface FollowUpDao {
+    // A compact invalidation signal. The repository then loads all overview data in
+    // one read transaction, rather than combining independently timed snapshots.
+    @Query("SELECT " +
+        "EXISTS(SELECT 1 FROM family_members WHERE id = :memberId) + " +
+        "EXISTS(SELECT 1 FROM conditions WHERE memberId = :memberId) + " +
+        "EXISTS(SELECT 1 FROM medications WHERE memberId = :memberId) + " +
+        "EXISTS(SELECT 1 FROM medication_schedules s INNER JOIN medications m ON m.id = s.medicationId WHERE m.memberId = :memberId AND s.effectiveFrom <= :onDate AND (s.effectiveTo IS NULL OR s.effectiveTo >= :onDate)) + " +
+        "EXISTS(SELECT 1 FROM medication_logs l INNER JOIN medications m ON m.id = l.medicationId WHERE m.memberId = :memberId AND l.scheduledAt >= :startAt AND l.scheduledAt < :endAt) + " +
+        "EXISTS(SELECT 1 FROM follow_up_schedules WHERE memberId = :memberId) + " +
+        "EXISTS(SELECT 1 FROM follow_up_occurrences o INNER JOIN follow_up_schedules s ON s.id = o.scheduleId WHERE s.memberId = :memberId AND o.dueDate <= :throughDate)")
+    fun observeOverviewChanges(memberId: Long, onDate: String, startAt: String, endAt: String, throughDate: String): Flow<Long>
+    @Query("SELECT * FROM follow_up_schedules s WHERE s.memberId = :memberId AND s.deletedAt IS NULL AND ((s.enabled = 1 AND s.nextDueDate <= :throughDate) OR EXISTS (SELECT 1 FROM follow_up_occurrences o WHERE o.scheduleId = s.id AND o.status = 'PENDING' AND o.dueDate <= :throughDate)) ORDER BY s.nextDueDate, s.id")
+    suspend fun schedulesForOverview(memberId: Long, throughDate: String): List<FollowUpScheduleEntity>
+    @Query("SELECT o.* FROM follow_up_occurrences o INNER JOIN follow_up_schedules s ON s.id = o.scheduleId WHERE s.memberId = :memberId AND s.deletedAt IS NULL AND o.dueDate <= :throughDate AND (o.status = 'PENDING' OR (s.enabled = 1 AND o.dueDate = s.nextDueDate)) ORDER BY o.dueDate, o.id")
+    suspend fun occurrencesForOverview(memberId: Long, throughDate: String): List<FollowUpOccurrenceEntity>
+    @Query("SELECT * FROM follow_up_occurrences WHERE scheduleId = :scheduleId AND dueDate = :dueDate LIMIT 1")
+    suspend fun occurrenceForDate(scheduleId: Long, dueDate: String): FollowUpOccurrenceEntity?
     @Query("SELECT * FROM follow_up_schedules WHERE deletedAt IS NULL ORDER BY enabled DESC, nextDueDate") fun observeSchedules(): Flow<List<FollowUpScheduleEntity>>
     @Query("SELECT * FROM follow_up_schedules WHERE memberId = :memberId AND deletedAt IS NULL ORDER BY enabled DESC, nextDueDate") fun observeSchedulesForMember(memberId: Long): Flow<List<FollowUpScheduleEntity>>
     @Query("SELECT * FROM follow_up_schedules WHERE memberId = :memberId AND deletedAt IS NOT NULL ORDER BY deletedAt DESC, id DESC") fun observeDeletedForMember(memberId: Long): Flow<List<FollowUpScheduleEntity>>
@@ -116,6 +134,14 @@ interface FollowUpDao {
 
 @Dao
 interface MedicationDao {
+    @Query("SELECT * FROM medications m WHERE m.memberId = :memberId AND m.deletedAt IS NULL AND ((m.startDate <= :onDate AND (m.endDate IS NULL OR m.endDate >= :onDate)) OR EXISTS (SELECT 1 FROM medication_logs l WHERE l.medicationId = m.id AND l.scheduledAt >= :startAt AND l.scheduledAt < :endAt)) ORDER BY m.archived, m.id")
+    suspend fun medicationsForOverview(memberId: Long, onDate: String, startAt: String, endAt: String): List<MedicationEntity>
+    @Query("SELECT s.* FROM medication_schedules s INNER JOIN medications m ON m.id = s.medicationId WHERE m.memberId = :memberId AND m.deletedAt IS NULL AND s.effectiveFrom <= :onDate AND (s.effectiveTo IS NULL OR s.effectiveTo >= :onDate) ORDER BY s.effectiveFrom, s.localTime, s.id")
+    suspend fun schedulesForDay(memberId: Long, onDate: String): List<MedicationScheduleEntity>
+    @Query("SELECT EXISTS(SELECT 1 FROM medication_schedules WHERE medicationId = :medicationId AND effectiveFrom <= :onDate AND (effectiveTo IS NULL OR effectiveTo >= :onDate))")
+    suspend fun hasScheduledPlanOnDate(medicationId: Long, onDate: String): Boolean
+    @Query("SELECT l.* FROM medication_logs l INNER JOIN medications m ON m.id = l.medicationId WHERE m.memberId = :memberId AND m.deletedAt IS NULL AND l.scheduledAt >= :startAt AND l.scheduledAt < :endAt ORDER BY l.scheduledAt, l.id")
+    suspend fun logsForDay(memberId: Long, startAt: String, endAt: String): List<MedicationLogEntity>
     @Query("SELECT * FROM medications WHERE deletedAt IS NULL ORDER BY archived, startDate DESC") fun observeMedications(): Flow<List<MedicationEntity>>
     @Query("SELECT * FROM medications WHERE memberId = :memberId AND deletedAt IS NULL ORDER BY archived, startDate DESC") fun observeMedicationsForMember(memberId: Long): Flow<List<MedicationEntity>>
     @Query("SELECT * FROM medications WHERE memberId = :memberId AND deletedAt IS NOT NULL ORDER BY deletedAt DESC, id DESC") fun observeDeletedForMember(memberId: Long): Flow<List<MedicationEntity>>

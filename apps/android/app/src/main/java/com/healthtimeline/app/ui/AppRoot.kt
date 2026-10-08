@@ -11,6 +11,7 @@ import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.EventRepeat
 import androidx.compose.material.icons.outlined.Medication
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Today
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -25,9 +26,15 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.healthtimeline.app.security.AppLockManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 
 private enum class Tab(val label: String) {
-    CALENDAR("日历"), FOLLOW_UP("复查"), MEDICATION("用药"), SETTINGS("设置")
+    TODAY("今日"), CALENDAR("日历"), FOLLOW_UP("复查"), MEDICATION("用药"), SETTINGS("设置")
 }
 
 @Composable
@@ -36,25 +43,53 @@ fun HealthTimelineRoot(
     appLockManager: AppLockManager,
     authenticate: (() -> Unit) -> Unit
 ) {
-    var tab by rememberSaveable { mutableStateOf(Tab.CALENDAR) }
+    var tab by rememberSaveable { mutableStateOf(Tab.TODAY) }
+    var navigation by remember { mutableStateOf<TodayNavigation?>(null) }
     val snackbar = remember { SnackbarHostState() }
     val busy by viewModel.busy.collectAsState()
     val locked by appLockManager.locked.collectAsStateWithLifecycle()
     val appLockEnabled by appLockManager.enabled.collectAsStateWithLifecycle()
     var showLockIntroduction by remember { mutableStateOf(appLockManager.shouldShowIntroduction()) }
-    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    val notificationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        viewModel.refreshTodayOverview()
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    LaunchedEffect(selectedMemberId) { navigation = null }
 
     DisposableEffect(lifecycleOwner, appLockManager) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> appLockManager.onAppForegrounded()
-                Lifecycle.Event.ON_STOP -> appLockManager.onAppBackgrounded()
+                Lifecycle.Event.ON_START -> {
+                    appLockManager.onAppForegrounded()
+                    viewModel.onOverviewForegrounded()
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    appLockManager.onAppBackgrounded()
+                    viewModel.onOverviewBackgrounded()
+                }
                 else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) viewModel.onOverviewForegrounded()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                viewModel.refreshTodayOverview()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_DATE_CHANGED)
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+        }
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            context.unregisterReceiver(receiver)
+            viewModel.onOverviewBackgrounded()
+        }
     }
 
     LaunchedEffect(locked) {
@@ -82,12 +117,25 @@ fun HealthTimelineRoot(
         return
     }
 
+    val overview by viewModel.todayOverview.collectAsStateWithLifecycle()
+    val members by viewModel.members.collectAsStateWithLifecycle()
+    val todayActionBusy by viewModel.todayActionBusy.collectAsStateWithLifecycle()
+    // The selection flow changes before a new database snapshot arrives.
+    val visibleOverview = overview.copy(
+        member = overview.member?.takeIf { it.id == selectedMemberId },
+        data = overview.data?.takeIf { it.memberId == selectedMemberId }
+    )
+    fun consumeNavigation(token: String) {
+        navigation = consumeTodayNavigation(navigation, token)
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         bottomBar = {
             NavigationBar {
                 Tab.entries.forEach { item ->
                     val icon = when (item) {
+                        Tab.TODAY -> Icons.Outlined.Today
                         Tab.CALENDAR -> Icons.Outlined.CalendarMonth
                         Tab.FOLLOW_UP -> Icons.Outlined.EventRepeat
                         Tab.MEDICATION -> Icons.Outlined.Medication
@@ -105,16 +153,42 @@ fun HealthTimelineRoot(
     ) { padding ->
         Box(Modifier.fillMaxSize()) {
             when (tab) {
-                Tab.CALENDAR -> CalendarScreen(viewModel, padding)
-                Tab.FOLLOW_UP -> FollowUpScreen(viewModel, padding)
-                Tab.MEDICATION -> MedicationScreen(viewModel, padding)
+                Tab.TODAY -> TodayScreen(
+                    state = visibleOverview,
+                    padding = padding,
+                    members = members,
+                    onSelectMember = viewModel::selectMember,
+                    onAddRecord = {
+                        visibleOverview.member?.let { navigation = TodayNavigation.AddRecord(it.id, visibleOverview.date); tab = Tab.CALENDAR }
+                    },
+                    onRecordDose = viewModel::recordOverviewDose,
+                    onRecordAsNeeded = viewModel::recordOverviewAsNeeded,
+                    onConfirmFollowUp = viewModel::confirmOverviewFollowUp,
+                    onOpenMedication = {
+                        visibleOverview.member?.let { navigation = TodayNavigation.MedicationDay(it.id, visibleOverview.date); tab = Tab.MEDICATION }
+                    },
+                    onOpenFollowUp = { item ->
+                        navigation = TodayNavigation.FollowUpDetail(item.schedule.memberId, item)
+                        tab = Tab.FOLLOW_UP
+                    },
+                    onOpenSafety = {
+                        visibleOverview.member?.let { navigation = TodayNavigation.Safety(it.id); tab = Tab.SETTINGS }
+                    },
+                    busy = busy || todayActionBusy,
+                    onRetry = viewModel::refreshTodayOverview
+                )
+                Tab.CALENDAR -> CalendarScreen(viewModel, padding, navigation as? TodayNavigation.AddRecord, ::consumeNavigation)
+                Tab.FOLLOW_UP -> FollowUpScreen(viewModel, padding, navigation as? TodayNavigation.FollowUpDetail, ::consumeNavigation)
+                Tab.MEDICATION -> MedicationScreen(viewModel, padding, navigation as? TodayNavigation.MedicationDay, ::consumeNavigation)
                 Tab.SETTINGS -> SettingsScreen(
                     viewModel,
                     padding,
                     appLockEnabled = appLockEnabled,
                     onAppLockChange = { enabled ->
                         authenticate { appLockManager.setEnabled(enabled) }
-                    }
+                    },
+                    navigation = navigation as? TodayNavigation.Safety,
+                    onNavigationConsumed = ::consumeNavigation
                 )
             }
             if (busy) LinearProgressIndicator()

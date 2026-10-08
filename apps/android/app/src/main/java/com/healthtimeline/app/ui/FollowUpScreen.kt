@@ -19,20 +19,36 @@ import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
 @Composable
-fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
-    val schedules by viewModel.followUps.collectAsStateWithLifecycle()
-    val occurrences by viewModel.occurrences.collectAsStateWithLifecycle()
-    val conditions by viewModel.conditions.collectAsStateWithLifecycle()
+fun FollowUpScreen(
+    viewModel: AppViewModel,
+    padding: PaddingValues,
+    navigation: TodayNavigation.FollowUpDetail? = null,
+    onNavigationConsumed: (String) -> Unit = {}
+) {
+    val cachedSchedules by viewModel.followUps.collectAsStateWithLifecycle()
+    val cachedOccurrences by viewModel.occurrences.collectAsStateWithLifecycle()
+    val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
-    var createForMemberId by remember { mutableStateOf<Long?>(null) }
-    var editing by remember { mutableStateOf<FollowUpScheduleEntity?>(null) }
-    var deleting by remember { mutableStateOf<FollowUpScheduleEntity?>(null) }
+    val schedules = memberScopedEntities(selectedMemberId, cachedSchedules) { it.memberId }
+    val occurrences = childrenOfMember(schedules.map { it.id }.toSet(), cachedOccurrences) { it.scheduleId }
+    val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
+    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var editing by remember(selectedMemberId) { mutableStateOf<FollowUpScheduleEntity?>(null) }
+    var deleting by remember(selectedMemberId) { mutableStateOf<FollowUpScheduleEntity?>(null) }
+    var overviewDetail by remember(selectedMemberId) { mutableStateOf<TodayFollowUpItem?>(null) }
     val pendingOccurrences = occurrences.filter { it.status == OccurrenceStatus.PENDING.name }
 
     LaunchedEffect(selectedMemberId) {
         createForMemberId = null
         editing = null
         deleting = null
+        overviewDetail = null
+    }
+    LaunchedEffect(navigation?.token, selectedMemberId) {
+        navigation?.let { request ->
+            if (selectedMemberId == request.memberId) overviewDetail = request.item
+            onNavigationConsumed(request.token)
+        }
     }
 
     Scaffold(
@@ -59,8 +75,8 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
                             Text(schedule?.title ?: "复查", fontWeight = FontWeight.SemiBold)
                             Text("应复查：${occurrence.dueDate}", color = if (LocalDate.parse(occurrence.dueDate).isBefore(LocalDate.now())) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                             Row {
-                                TextButton(onClick = { viewModel.completeOccurrence(occurrence.id) }) { Text("标记完成") }
-                                TextButton(onClick = { viewModel.completeOccurrence(occurrence.id, skipped = true) }) { Text("跳过") }
+                                TextButton(onClick = { if (viewModel.selectedMemberId.value == schedule?.memberId) viewModel.completeOccurrence(occurrence.id) }) { Text("标记完成") }
+                                TextButton(onClick = { if (viewModel.selectedMemberId.value == schedule?.memberId) viewModel.completeOccurrence(occurrence.id, skipped = true) }) { Text("跳过") }
                             }
                         }
                     }
@@ -81,22 +97,41 @@ fun FollowUpScreen(viewModel: AppViewModel, padding: PaddingValues) {
             Spacer(Modifier.height(72.dp))
         }
     }
-    if (createForMemberId != null || editing != null) {
+    overviewDetail?.takeIf { target -> target.schedule.memberId == selectedMemberId && schedules.any { it.id == target.schedule.id && it.uuid == target.schedule.uuid } }?.let { item ->
+        AlertDialog(
+            onDismissRequest = { overviewDetail = null },
+            title = { Text(item.schedule.title) },
+            text = {
+                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("应复查：${item.dueDate}")
+                    item.conditionName?.let { Text("病情分类：$it") }
+                    Text(recurrenceLabel(item.schedule))
+                    Text("提前 ${item.schedule.leadDays} 天 · ${item.schedule.reminderTime} 提醒")
+                    Text("具体安排以医生要求为准。")
+                }
+            },
+            confirmButton = { TextButton(onClick = { overviewDetail = null }) { Text("关闭") } }
+        )
+    }
+    val visibleEditing = editing?.takeIf { target -> target.memberId == selectedMemberId && schedules.any { it.id == target.id && it.uuid == target.uuid } }
+    val visibleCreateForMember = createForMemberId?.takeIf { it == selectedMemberId }
+    if (visibleCreateForMember != null || visibleEditing != null) {
         FollowUpEditorDialog(
-            existing = editing,
-            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
+            existing = visibleEditing,
+            memberId = visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember),
             conditions = conditions.filter { !it.archived },
             onSave = { value, onFailed ->
+                if (viewModel.selectedMemberId.value != value.memberId) { onFailed() } else
                 viewModel.saveFollowUp(value, { createForMemberId = null; editing = null }, onFailed)
             },
             onDismiss = { createForMemberId = null; editing = null }
         )
     }
-    deleting?.let { target ->
+    deleting?.takeIf { target -> target.memberId == selectedMemberId && schedules.any { it.id == target.id && it.uuid == target.uuid } }?.let { target ->
         ConfirmDialog(
             "将复查计划移入回收站？",
             "未来提醒会立即停止，计划和已经产生的历史状态会保留 30 天，期间可以恢复。",
-            { viewModel.deleteFollowUp(target); deleting = null },
+            { if (viewModel.selectedMemberId.value == target.memberId) viewModel.deleteFollowUp(target); deleting = null },
             { deleting = null }
         )
     }

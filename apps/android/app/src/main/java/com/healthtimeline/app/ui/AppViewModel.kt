@@ -15,7 +15,16 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import java.time.Instant
+import java.time.ZoneId
 import java.time.LocalTime
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -74,6 +83,96 @@ class AppViewModel(
     val lastBackupAt = safetyCenter.lastBackupAt
     val lastIntegrityResult = safetyCenter.lastIntegrityResult
 
+    private val todayClock = MutableStateFlow(TodayClockSnapshot(Instant.now(), ZoneId.systemDefault()))
+    private val todayDate = todayClock.map { it.date }.distinctUntilChanged()
+    private val todayReload = MutableStateFlow(0L)
+    private val systemSafety = MutableStateFlow(safetyCenter.systemStatus())
+    private var foregroundClockJob: Job? = null
+    private val todayActionBusyMutable = MutableStateFlow(false)
+    val todayActionBusy = todayActionBusyMutable
+    private data class TodayLoad(val data: TodayOverviewData? = null, val error: String? = null)
+
+    private val todayLoad = combine(selectedMemberId, todayDate, todayReload) { id, date, _ -> id to date }
+        .flatMapLatest { (id, date) ->
+            flow {
+                emit(TodayLoad())
+                if (id != null) emitAll(repository.todayOverviewForMember(id, date).map { TodayLoad(it) })
+            }.catch { emit(TodayLoad(error = it.userMessage("今日资料读取失败，请重试"))) }
+        }
+    private val todaySafety = combine(systemSafety, lastBackupAt, todayClock) { status, lastBackup, clock ->
+        todaySafetyMessages(status, lastBackup, clock.instant)
+    }
+    val todayOverview = combine(members, selectedMemberId, todayDate, todayLoad, todaySafety) { values, id, date, load, safety ->
+        val member = values.firstOrNull { it.id == id && !it.archived }
+        TodayOverviewState(
+            member = member,
+            date = date,
+            data = load.data?.takeIf { member != null && it.memberId == member.id && it.date == date },
+            safetyMessages = safety,
+            errorMessage = load.error
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(0), TodayOverviewState(null, LocalDate.now(), null))
+
+    fun refreshTodayOverview() {
+        todayClock.value = TodayClockSnapshot(Instant.now(), ZoneId.systemDefault())
+        systemSafety.value = safetyCenter.systemStatus()
+        todayReload.value++
+    }
+
+    fun onOverviewForegrounded() {
+        refreshTodayOverview()
+        foregroundClockJob?.cancel()
+        foregroundClockJob = viewModelScope.launch {
+            while (true) {
+                delay(todayClock.value.nextRefreshMillis())
+                todayClock.value = TodayClockSnapshot(Instant.now(), ZoneId.systemDefault())
+            }
+        }
+    }
+
+    fun onOverviewBackgrounded() {
+        foregroundClockJob?.cancel()
+        foregroundClockJob = null
+    }
+
+    fun recordOverviewDose(value: MedicationDayEntry, status: MedicationLogStatus, actualAt: LocalDateTime?) =
+        todayAction(value.medication.memberId, "记录用药") {
+            if (!repository.recordTodayDose(value.medication.memberId, value, status, actualAt)) {
+                messages.send("这项用药已记录或计划已改变，请重新核对")
+            }
+        }
+
+    fun recordOverviewAsNeeded(medication: MedicationEntity, actualAt: LocalDateTime) =
+        recordOverviewDose(
+            MedicationDayEntry(medication, null, null, null, null, MedicationDayStatus.UNRECORDED),
+            MedicationLogStatus.TAKEN,
+            actualAt
+        )
+
+    fun confirmOverviewFollowUp(value: TodayFollowUpItem, skipped: Boolean) =
+        todayAction(value.schedule.memberId, "更新复查状态") {
+            if (repository.confirmTodayFollowUp(value.schedule.memberId, value.schedule.id, value.schedule.uuid, value.dueDate, skipped)) {
+                runCatching { scheduler.rescheduleAll() }.onFailure {
+                    messages.send("状态已保存，但系统提醒刷新失败；请检查权限")
+                }
+            } else messages.send("该复查已处理或计划已改变，请重新核对")
+        }
+
+    private fun todayAction(memberId: Long, label: String, block: suspend () -> Unit) {
+        if (todayActionBusyMutable.value) return
+        if (selectedMemberId.value != memberId) return
+        todayActionBusyMutable.value = true
+        viewModelScope.launch {
+            try {
+                if (selectedMemberId.value == memberId) block()
+            } catch (error: Exception) {
+                messages.send(error.userMessage("$label 失败"))
+            } finally {
+                todayActionBusyMutable.value = false
+            }
+        }
+    }
+
     init {
         viewModelScope.launch {
             runCatching {
@@ -89,7 +188,13 @@ class AppViewModel(
                 val active = values.filterNot { it.archived }
                 val selected = selectedMemberIdMutable.value
                 if (selected == null || active.none { it.id == selected }) {
-                    active.firstOrNull()?.let { selectMember(it.id) }
+                    // This transaction snapshot is already authoritative. The
+                    // separately shared members flow may still hold its initial
+                    // empty list (or the previous list) during startup/archival.
+                    val fallback = active.firstOrNull()?.id
+                    selectedMemberIdMutable.value = fallback
+                    if (fallback != null) runCatching { memberSelection.write(fallback) }
+                        .onFailure { messages.send(it.userMessage("无法保存默认成员选择")) }
                 }
             }
         }
@@ -97,14 +202,18 @@ class AppViewModel(
 
     fun selectMember(memberId: Long) {
         if (members.value.any { it.id == memberId && !it.archived }) {
-            memberSelection.write(memberId)
             selectedMemberIdMutable.value = memberId
+            runCatching { memberSelection.write(memberId) }.onFailure {
+                viewModelScope.launch { messages.send(it.userMessage("无法保存成员选择")) }
+            }
         }
     }
 
     fun selectMedicationMonth(month: YearMonth) {
         medicationMonthMutable.value = month
     }
+
+    fun trashItemsForMember(memberId: Long) = repository.trashForMember(memberId)
 
     fun saveMember(value: FamilyMemberEntity, onSaved: () -> Unit = {}, onFailed: () -> Unit = {}) =
         launch("保存家庭成员", onFailed) {

@@ -10,13 +10,14 @@
 
 | 平台 | 技术 | 当前状态 |
 |---|---|---|
-| Android 8+ | Kotlin、Jetpack Compose、Room、SQLCipher | 1.3.0 第三阶段候选；新增 30 天回收站与备份 v5，等待覆盖升级真机验收 |
+| Android 8+ | Kotlin、Jetpack Compose、Room、SQLCipher | 1.3.1 候选；新增今日总览与确认打卡，等待覆盖升级真机验收 |
 | iOS/iPadOS 16+ | SwiftUI、SQLCipher、Keychain、PDFKit | 开发预览：成员隔离、主要页面、附件、提醒、用药月历、应用锁和 v4 安全合并已实现；待 CI/真机验收 |
 | HarmonyOS NEXT | ArkTS、ArkUI、加密 RDB | 开发预览：真实录入、成员隔离、迁移回滚、提醒、用药月历和 v4 清单校验已实现；平台附件/加密 ZIP/应用锁待补 |
 | 共享核心 | Kotlin Multiplatform | 数据模型、校验、搜索、复查计算、合并规则已接入 Android |
 
 ## Android 现有功能
 
+- 独立“今日”首页：当前成员的今日用药、逾期复查、近期 7 天复查和安全摘要；直接操作先确认，记录今天病情可一键进入表单。
 - 月历标题显示两行、独立浅色圆角标签，每天最多两条和 `+N`。
 - 家庭多人档案，全局切换成员；搜索、日历、复查和用药严格按当前成员隔离。
 - 按标题、病情分类、症状、诊断、治疗、用药、医院、医生和备注搜索。
@@ -42,11 +43,13 @@ iOS 与 HarmonyOS NEXT 的详细完成度和下一步见 [`docs/MULTIPLATFORM_ST
 
 给客户的简明说明见 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)。
 
+1.3.1 的验证范围和待完成真机项目见 [`docs/SELF_CHECK_REPORT_ANDROID_1.3.1.md`](docs/SELF_CHECK_REPORT_ANDROID_1.3.1.md)。
+
 ## GitHub 下载与升级
 
-正式发布后，从 [Releases](https://github.com/lemon7500/health-timeline/releases) 下载 `HealthTimeline-1.3.0.apk`，并用同目录的 `SHA256SUMS.txt` 校验文件。应用不联网、不会自行检查更新。
+正式版本从 [Releases](https://github.com/lemon7500/health-timeline/releases) 下载，并用同目录的 `SHA256SUMS.txt` 校验文件。当前 `HealthTimeline-1.3.1.apk` 为候选包，真机验收通过后才发布；更新内容见 [`docs/RELEASE_NOTES_1.3.1.md`](docs/RELEASE_NOTES_1.3.1.md)。应用不联网、不会自行检查更新。
 
-从旧版升级必须直接安装新版 APK 覆盖原应用。不要卸载旧版、不要清除应用数据；这两种操作都会删除手机里的私有资料。1.3.0 保持 `applicationId=com.healthtimeline.app` 和原发布签名，通过正式 Room 7→8 事务迁移增加回收站标记；原病历、附件、复查、用药计划、打卡、UUID 与附件路径均保留。
+从旧版升级必须直接安装新版 APK 覆盖原应用。不要卸载旧版、不要清除应用数据；这两种操作都会删除手机里的私有资料。1.3.1 保持 `applicationId=com.healthtimeline.app` 和原发布签名，Room 保持 v8、备份保持 v5，从 1.3.0 升级不新增数据库迁移；原病历、附件、复查、用药计划、打卡、UUID 与附件路径均保留。更早版本继续沿用已有正式事务迁移，禁止破坏性迁移。
 
 版本号遵循 `主版本.次版本.补丁版本`。同一功能线内的小修改按顺序递增最后一位，例如 `1.2.0 → 1.2.1 → 1.2.2`；每次发布同时递增 Android `versionCode`，不得复用已发布版本号。
 

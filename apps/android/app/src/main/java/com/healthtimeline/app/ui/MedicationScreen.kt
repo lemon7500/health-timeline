@@ -34,23 +34,32 @@ import java.time.format.DateTimeFormatter
 import kotlin.math.abs
 
 @Composable
-fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
-    val medications by viewModel.medications.collectAsStateWithLifecycle()
-    val schedules by viewModel.medicationSchedules.collectAsStateWithLifecycle()
+fun MedicationScreen(
+    viewModel: AppViewModel,
+    padding: PaddingValues,
+    navigation: TodayNavigation.MedicationDay? = null,
+    onNavigationConsumed: (String) -> Unit = {}
+) {
+    val cachedMedications by viewModel.medications.collectAsStateWithLifecycle()
+    val cachedSchedules by viewModel.medicationSchedules.collectAsStateWithLifecycle()
     val month by viewModel.medicationMonth.collectAsStateWithLifecycle()
-    val monthData by viewModel.medicationMonthData.collectAsStateWithLifecycle()
-    val conditions by viewModel.conditions.collectAsStateWithLifecycle()
+    val cachedMonthData by viewModel.medicationMonthData.collectAsStateWithLifecycle()
+    val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
-    var selectedDate by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
-    var createForMemberId by remember { mutableStateOf<Long?>(null) }
-    var editing by remember { mutableStateOf<MedicationEntity?>(null) }
-    var archiveTarget by remember { mutableStateOf<MedicationEntity?>(null) }
-    var restoreTarget by remember { mutableStateOf<MedicationEntity?>(null) }
-    var deleteTarget by remember { mutableStateOf<MedicationEntity?>(null) }
-    var takeTarget by remember { mutableStateOf<MedicationDayEntry?>(null) }
-    var correctionTarget by remember { mutableStateOf<MedicationDayEntry?>(null) }
-    var addAsNeeded by remember { mutableStateOf(false) }
-    var section by rememberSaveable { mutableStateOf(MedicationSection.TODAY) }
+    val medications = memberScopedEntities(selectedMemberId, cachedMedications) { it.memberId }
+    val schedules = childrenOfMember(medications.map { it.id }.toSet(), cachedSchedules) { it.medicationId }
+    val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
+    val monthData = memberScopedMedicationMonth(selectedMemberId, cachedMonthData)
+    var selectedDate by rememberSaveable(selectedMemberId) { mutableStateOf(LocalDate.now().toString()) }
+    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var editing by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
+    var archiveTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
+    var restoreTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
+    var deleteTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
+    var takeTarget by remember(selectedMemberId) { mutableStateOf<MedicationDayEntry?>(null) }
+    var correctionTarget by remember(selectedMemberId) { mutableStateOf<MedicationDayEntry?>(null) }
+    var addAsNeeded by remember(selectedMemberId) { mutableStateOf(false) }
+    var section by rememberSaveable(selectedMemberId) { mutableStateOf(MedicationSection.TODAY) }
 
     val selected = LocalDate.parse(selectedDate)
     val selectedEntries = monthData.entries(selected)
@@ -64,7 +73,20 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
         archiveTarget = null
         restoreTarget = null
         deleteTarget = null
+        takeTarget = null
+        correctionTarget = null
+        addAsNeeded = false
         section = MedicationSection.TODAY
+    }
+    LaunchedEffect(navigation?.token, selectedMemberId) {
+        navigation?.let { request ->
+            if (selectedMemberId == request.memberId) {
+                selectedDate = request.date.toString()
+                viewModel.selectMedicationMonth(YearMonth.from(request.date))
+                section = MedicationSection.TODAY
+            }
+            onNavigationConsumed(request.token)
+        }
     }
 
     Scaffold(
@@ -111,7 +133,7 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
                             entry = entry,
                             editable = !selected.isAfter(LocalDate.now()),
                             onTaken = { takeTarget = entry },
-                            onSkipped = { viewModel.recordDose(entry, MedicationLogStatus.SKIPPED, null) },
+                            onSkipped = { if (viewModel.selectedMemberId.value == entry.medication.memberId) viewModel.recordDose(entry, MedicationLogStatus.SKIPPED, null) },
                             onCorrect = { correctionTarget = entry }
                         )
                     }
@@ -182,17 +204,20 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
             Spacer(Modifier.height(72.dp))
         }
     }
-    if (createForMemberId != null || editing != null) {
+    val visibleEditing = editing?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }
+    val visibleCreateForMember = createForMemberId?.takeIf { it == selectedMemberId }
+    if (visibleCreateForMember != null || visibleEditing != null) {
         MedicationEditorDialog(
-            existing = editing,
-            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
-            existingTimes = editing?.let { med ->
+            existing = visibleEditing,
+            memberId = visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember),
+            existingTimes = visibleEditing?.let { med ->
                 val effectiveDate = LocalDate.now().plusDays(1)
                 schedules.filter { it.medicationId == med.id && scheduleEffectiveOn(it, effectiveDate) }
                     .map { LocalTime.parse(it.localTime) }
             }.orEmpty(),
             conditions = conditions.filter { !it.archived },
             onSave = { medication, times, effectiveDate, onFailed ->
+                if (viewModel.selectedMemberId.value != medication.memberId) { onFailed() } else
                 viewModel.saveMedication(
                     medication, times, effectiveDate,
                     { createForMemberId = null; editing = null }, onFailed
@@ -201,19 +226,19 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onDismiss = { createForMemberId = null; editing = null }
         )
     }
-    archiveTarget?.let { medication ->
+    archiveTarget?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
         ConfirmDialog(
             "结束疗程？",
             "将记录当前结束日期和时间，并停止后续提醒。当天及此前的用药计划和服药记录都会保留。",
             {
-                viewModel.archiveMedication(medication.id)
+                if (viewModel.selectedMemberId.value == medication.memberId) viewModel.archiveMedication(medication.id)
                 archiveTarget = null
                 section = MedicationSection.ENDED
             },
             { archiveTarget = null }
         )
     }
-    restoreTarget?.let { medication ->
+    restoreTarget?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
         ConfirmDialog(
             "恢复疗程？",
             if (medication.archivedPreviousEndDate == null) {
@@ -222,43 +247,43 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
                 "将恢复原计划结束日期 ${medication.archivedPreviousEndDate}，并重新启用后续用药提醒。已有日历和服药记录不会改变。"
             },
             {
-                viewModel.restoreMedication(medication.id)
+                if (viewModel.selectedMemberId.value == medication.memberId) viewModel.restoreMedication(medication.id)
                 restoreTarget = null
                 section = MedicationSection.COURSES
             },
             { restoreTarget = null }
         )
     }
-    deleteTarget?.let { medication ->
+    deleteTarget?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
         ConfirmDialog(
             "将药物移入回收站？",
             "药物、服药计划和历史打卡会保留 30 天，期间可从设置的回收站恢复；未来提醒会停止。",
             {
-                viewModel.deleteMedication(medication)
+                if (viewModel.selectedMemberId.value == medication.memberId) viewModel.deleteMedication(medication)
                 deleteTarget = null
             },
             { deleteTarget = null }
         )
     }
-    takeTarget?.let { entry ->
+    takeTarget?.takeIf { it.medication.memberId == selectedMemberId && it in selectedEntries }?.let { entry ->
         MedicationTimePickerDialog(
             title = "选择实际服药时间",
             initial = roundToFiveMinutes(
                 if (selected == LocalDate.now()) LocalTime.now() else entry.plannedAt?.toLocalTime() ?: LocalTime.NOON
             ),
             onConfirm = { time ->
-                viewModel.recordDose(entry, MedicationLogStatus.TAKEN, selected.atTime(time))
+                if (viewModel.selectedMemberId.value == entry.medication.memberId) viewModel.recordDose(entry, MedicationLogStatus.TAKEN, selected.atTime(time))
                 takeTarget = null
             },
             onDismiss = { takeTarget = null }
         )
     }
-    correctionTarget?.let { entry ->
+    correctionTarget?.takeIf { it.medication.memberId == selectedMemberId && it in selectedEntries }?.let { entry ->
         MedicationCorrectionDialog(
             entry = entry,
             date = selected,
             onConfirm = { status, actualAt ->
-                viewModel.correctDose(requireNotNull(entry.log).id, status, actualAt)
+                if (viewModel.selectedMemberId.value == entry.medication.memberId) viewModel.correctDose(requireNotNull(entry.log).id, status, actualAt)
                 correctionTarget = null
             },
             onDismiss = { correctionTarget = null }
@@ -269,7 +294,7 @@ fun MedicationScreen(viewModel: AppViewModel, padding: PaddingValues) {
             medications = medications.filter { medicationActiveOn(it, selected) },
             date = selected,
             onConfirm = { medication, actualAt ->
-                viewModel.recordAsNeeded(medication, actualAt)
+                if (viewModel.selectedMemberId.value == medication.memberId) viewModel.recordAsNeeded(medication, actualAt)
                 addAsNeeded = false
             },
             onDismiss = { addAsNeeded = false }
@@ -674,7 +699,7 @@ internal fun roundToFiveMinutes(time: LocalTime): LocalTime {
 }
 
 @Composable
-private fun MedicationTimePickerDialog(
+internal fun MedicationTimePickerDialog(
     title: String = "选择提醒时间",
     initial: LocalTime,
     onConfirm: (LocalTime) -> Unit,

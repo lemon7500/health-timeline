@@ -49,20 +49,28 @@ import java.time.YearMonth
 import java.time.format.DateTimeFormatter
 
 @Composable
-fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
-    val records by viewModel.records.collectAsStateWithLifecycle()
-    val conditions by viewModel.conditions.collectAsStateWithLifecycle()
-    val attachments by viewModel.attachments.collectAsStateWithLifecycle()
+fun CalendarScreen(
+    viewModel: AppViewModel,
+    padding: PaddingValues,
+    navigation: TodayNavigation.AddRecord? = null,
+    onNavigationConsumed: (String) -> Unit = {}
+) {
+    val cachedRecords by viewModel.records.collectAsStateWithLifecycle()
+    val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
+    val cachedAttachments by viewModel.attachments.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val records = memberScopedEntities(selectedMemberId, cachedRecords) { it.memberId }
+    val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
+    val attachments = childrenOfMember(records.map { it.id }.toSet(), cachedAttachments) { it.recordId }
     var month by rememberSaveable { mutableStateOf(YearMonth.now().toString()) }
     var selectedDate by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
-    var filterCondition by rememberSaveable { mutableStateOf<Long?>(null) }
-    var editing by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var createForMemberId by remember { mutableStateOf<Long?>(null) }
-    var details by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var manageConditionsForMemberId by remember { mutableStateOf<Long?>(null) }
-    var deleteTarget by remember { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var filterCondition by rememberSaveable(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var editing by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
+    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var details by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
+    var manageConditionsForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var deleteTarget by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
+    var searchQuery by rememberSaveable(selectedMemberId) { mutableStateOf("") }
 
     val currentMonth = YearMonth.parse(month)
     val filtered = records.filter { filterCondition == null || it.conditionId == filterCondition }
@@ -79,6 +87,17 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
         details = null
         createForMemberId = null
         manageConditionsForMemberId = null
+        deleteTarget = null
+    }
+    LaunchedEffect(navigation?.token, selectedMemberId) {
+        navigation?.let { request ->
+            if (selectedMemberId == request.memberId) {
+                month = YearMonth.from(request.date).toString()
+                selectedDate = request.date.toString()
+                createForMemberId = request.memberId
+            }
+            onNavigationConsumed(request.token)
+        }
     }
 
     Scaffold(
@@ -176,13 +195,16 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
         }
     }
 
-    if (createForMemberId != null || editing != null) {
+    val visibleEditing = editing?.takeIf { target -> target.memberId == selectedMemberId && records.any { it.id == target.id && it.uuid == target.uuid } }
+    val visibleCreateForMember = createForMemberId?.takeIf { it == selectedMemberId }
+    if (visibleCreateForMember != null || visibleEditing != null) {
         RecordEditorDialog(
             initialDate = selectedDate,
-            record = editing,
-            memberId = editing?.memberId ?: requireNotNull(createForMemberId),
+            record = visibleEditing,
+            memberId = visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember),
             conditions = conditions,
             onSave = { value, conditionResolution, onFailed ->
+                if (viewModel.selectedMemberId.value != value.memberId) { onFailed() } else
                 viewModel.saveRecord(
                     value = value,
                     conditionResolution = conditionResolution,
@@ -191,6 +213,7 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
                 )
             },
             onSaveBatch = { requests, onFailed ->
+                if (requests.any { it.record.memberId != viewModel.selectedMemberId.value }) { onFailed() } else
                 viewModel.saveRecords(
                     requests = requests,
                     onSaved = { createForMemberId = null; editing = null },
@@ -200,7 +223,7 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onDismiss = { createForMemberId = null; editing = null }
         )
     }
-    details?.let { record ->
+    details?.takeIf { target -> target.memberId == selectedMemberId && records.any { it.id == target.id && it.uuid == target.uuid } }?.let { record ->
         RecordDetailDialog(
             record = record,
             condition = conditions.firstOrNull { it.id == record.conditionId },
@@ -211,14 +234,14 @@ fun CalendarScreen(viewModel: AppViewModel, padding: PaddingValues) {
             onDismiss = { details = null }
         )
     }
-    manageConditionsForMemberId?.let { memberId ->
+    manageConditionsForMemberId?.takeIf { it == selectedMemberId }?.let { memberId ->
         ConditionManagerDialog(conditions, memberId, viewModel, onDismiss = { manageConditionsForMemberId = null })
     }
-    deleteTarget?.let { target ->
+    deleteTarget?.takeIf { target -> target.memberId == selectedMemberId && records.any { it.id == target.id && it.uuid == target.uuid } }?.let { target ->
         ConfirmDialog(
             title = "将病历移入回收站？",
             message = "病历和它的全部检查报告会保留 30 天，期间可在设置的回收站中恢复。",
-            onConfirm = { viewModel.deleteRecord(target); deleteTarget = null },
+            onConfirm = { if (viewModel.selectedMemberId.value == target.memberId) viewModel.deleteRecord(target); deleteTarget = null },
             onDismiss = { deleteTarget = null }
         )
     }
@@ -1166,18 +1189,18 @@ private fun RecordDetailDialog(
     onDelete: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    var viewer by remember { mutableStateOf<AttachmentEntity?>(null) }
-    var attachmentDeleteTarget by remember { mutableStateOf<AttachmentEntity?>(null) }
-    var cameraUriText by rememberSaveable { mutableStateOf<String?>(null) }
+    var viewer by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
+    var attachmentDeleteTarget by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
+    var cameraUriText by rememberSaveable(record.uuid) { mutableStateOf<String?>(null) }
     val context = LocalContext.current
     val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         appLockManager.endExternalActivity()
-        if (uris.isNotEmpty()) viewModel.importAttachments(record.id, uris)
+        if (uris.isNotEmpty() && viewModel.selectedMemberId.value == record.memberId) viewModel.importAttachments(record.id, uris)
     }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         appLockManager.endExternalActivity()
-        if (success) cameraUriText?.let { viewModel.importAttachments(record.id, listOf(Uri.parse(it))) }
+        if (success && viewModel.selectedMemberId.value == record.memberId) cameraUriText?.let { viewModel.importAttachments(record.id, listOf(Uri.parse(it))) }
         cameraUriText = null
     }
     AlertDialog(
@@ -1224,7 +1247,7 @@ private fun RecordDetailDialog(
             Row { TextButton(onClick = onDelete) { Text("删除", color = MaterialTheme.colorScheme.error) }; TextButton(onClick = onDismiss) { Text("关闭") } }
         }
     )
-    viewer?.let { attachment ->
+    viewer?.takeIf { target -> attachments.any { it.uuid == target.uuid && it.recordId == record.id } }?.let { attachment ->
         AttachmentViewerDialog(
             attachment,
             viewModel.attachmentFile(attachment),
@@ -1232,12 +1255,12 @@ private fun RecordDetailDialog(
             onDelete = { attachmentDeleteTarget = attachment }
         )
     }
-    attachmentDeleteTarget?.let { attachment ->
+    attachmentDeleteTarget?.takeIf { target -> attachments.any { it.uuid == target.uuid && it.recordId == record.id } }?.let { attachment ->
         ConfirmDialog(
             "将检查报告移入回收站？",
             "“${attachment.displayName}”会保留 30 天，期间可在设置的回收站中恢复，不影响所属病历。",
             {
-                viewModel.deleteAttachment(attachment) {
+                if (viewModel.selectedMemberId.value == record.memberId) viewModel.deleteAttachment(attachment) {
                     if (viewer?.id == attachment.id) viewer = null
                 }
                 attachmentDeleteTarget = null
@@ -1265,7 +1288,7 @@ private fun ConditionManagerDialog(conditions: List<ConditionEntity>, memberId: 
                 Button(
                     onClick = add@{
                         if (adding) return@add
-                        if (name.isNotBlank()) {
+                        if (name.isNotBlank() && viewModel.selectedMemberId.value == memberId) {
                             adding = true
                             viewModel.saveCondition(
                                 ConditionEntity(name = name.trim(), createdAt = Instant.now().toString(), memberId = memberId),
@@ -1280,7 +1303,7 @@ private fun ConditionManagerDialog(conditions: List<ConditionEntity>, memberId: 
                         headlineContent = { Text(condition.name) },
                         supportingContent = { if (condition.archived) Text("已归档") },
                         trailingContent = {
-                            if (!condition.archived) TextButton(onClick = { viewModel.archiveCondition(condition.id) }) { Text("归档") }
+                            if (!condition.archived) TextButton(onClick = { if (viewModel.selectedMemberId.value == memberId) viewModel.archiveCondition(condition.id) }) { Text("归档") }
                         }
                     )
                 }
