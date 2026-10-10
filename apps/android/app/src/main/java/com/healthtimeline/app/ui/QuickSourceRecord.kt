@@ -69,36 +69,39 @@ internal fun QuickSourceRecordDialog(
         onDismissRequest = onDismiss,
         title = { Text("补充原始病程") },
         text = {
-            Column(
-                Modifier.fillMaxWidth().heightIn(max = 400.dp).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(eventLabel, style = MaterialTheme.typography.titleSmall)
-                Text("粘贴这条事件整理前的原始文字，不需要自己填写标签。已有备注会保留；确认补充不会保存病历。")
-                Text("若使用了外部 AI，请从整理前的病程文字中复制对应片段，软件不能重建缺失的原文。", style = MaterialTheme.typography.bodySmall)
-                OutlinedTextField(
-                    value = originalText,
-                    onValueChange = onTextChange,
-                    label = { Text("这条事件的原始文字") },
-                    minLines = 4,
-                    maxLines = 8,
-                    isError = error != null,
-                    supportingText = { Text("${originalText.length} 字；原文与已有备注合计最多 10,000 字") },
-                    modifier = Modifier.fillMaxWidth().testTag("quick-source-input")
-                )
-                TextButton(
-                    onClick = {
-                        // Clipboard access is user-initiated only, with no history or background reads.
-                        val pasted = runCatching {
-                            context.getSystemService(ClipboardManager::class.java)?.primaryClip
-                                ?.takeIf { it.itemCount > 0 }?.getItemAt(0)
-                                ?.takeIf { it.text != null }?.text?.toString()
-                        }.getOrNull()
-                        if (pasted.isNullOrBlank()) onError("剪贴板中没有文字，请复制原始病程后重试。")
-                        else onTextChange(pasted)
-                    },
-                    modifier = Modifier.testTag("quick-source-paste")
-                ) { Text("从剪贴板粘贴原文") }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    Modifier.fillMaxWidth().heightIn(max = 320.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(eventLabel, style = MaterialTheme.typography.titleSmall)
+                    Text("粘贴这条事件整理前的原始文字，不需要自己填写标签。已有备注会保留；确认补充不会保存病历。")
+                    Text("若使用了外部 AI，请从整理前的病程文字中复制对应片段，软件不能重建缺失的原文。", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = originalText,
+                        onValueChange = onTextChange,
+                        label = { Text("这条事件的原始文字") },
+                        minLines = 4,
+                        maxLines = 8,
+                        isError = error != null,
+                        supportingText = { Text("${originalText.length} 字；原文与已有备注合计最多 10,000 字") },
+                        modifier = Modifier.fillMaxWidth().testTag("quick-source-input")
+                    )
+                    TextButton(
+                        onClick = {
+                            // Clipboard access is user-initiated only, with no history or background reads.
+                            val pasted = runCatching {
+                                context.getSystemService(ClipboardManager::class.java)?.primaryClip
+                                    ?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+                                    ?.takeIf { it.text != null }?.text?.toString()
+                            }.getOrNull()
+                            if (pasted.isNullOrBlank()) onError("剪贴板中没有文字，请复制原始病程后重试。")
+                            else onTextChange(pasted)
+                        },
+                        modifier = Modifier.testTag("quick-source-paste")
+                    ) { Text("从剪贴板粘贴原文") }
+                }
+                // Validation stays visible even when a long original scrolls out of view.
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("quick-source-error")) }
             }
         },
