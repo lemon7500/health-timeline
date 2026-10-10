@@ -29,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -416,7 +417,7 @@ internal fun EditableQuickDraft.validationIssues(appendUnknownToNotes: Boolean):
                 IssueSeverity.ERROR,
                 "其他备注",
                 "MISSING_SOURCE_RECORD",
-                "快速录入必须在备注中保留“原文记录：”及对应原文"
+                QUICK_SOURCE_REQUIRED_MESSAGE
             )
         )
     }
@@ -433,13 +434,8 @@ internal fun EditableQuickDraft.validationIssues(appendUnknownToNotes: Boolean):
     }
 }
 
-private fun hasSourceRecord(value: String): Boolean {
-    val marker = value.indexOf(ClinicalRecordQuickParser.SOURCE_PREFIX)
-    return marker >= 0 && value.substring(marker + ClinicalRecordQuickParser.SOURCE_PREFIX.length).isNotBlank()
-}
-
 @Composable
-private fun RecordEditorDialog(
+internal fun RecordEditorDialog(
     initialDate: String,
     record: ClinicalRecordEntity?,
     memberId: Long,
@@ -467,18 +463,33 @@ private fun RecordEditorDialog(
     var quickIssues by rememberUiDraftState<List<QuickEntryIssue>>(draftScope, "quickIssues") { emptyList() }
     var unrecognizedSegments by rememberUiDraftState<List<String>>(draftScope, "unknown") { emptyList() }
     var quickApplied by rememberUiDraftState(draftScope, "quickApplied") { false }
+    // Editing/clearing the input box must not bypass validation of an already parsed form.
+    var requiresSourceRecord by rememberUiDraftState(draftScope, "requiresSourceRecord") { false }
     var aiHelpExpanded by rememberUiDraftState(draftScope, "aiHelpExpanded") { false }
     var aiCopyMessage by rememberUiDraftState<String?>(draftScope, "aiCopyMessage") { null }
     var batchDrafts by rememberUiDraftState<List<EditableQuickDraft>>(draftScope, "batchDrafts") { emptyList() }
     var expandedBatchIndex by rememberUiDraftState<Int?>(draftScope, "expandedBatchIndex") { null }
     var appendBatchUnknownToNotes by rememberUiDraftState(draftScope, "appendBatchUnknownToNotes") { false }
     var confirmBatchSave by rememberUiDraftState(draftScope, "confirmBatchSave") { false }
+    var sourceTargetIndex by rememberUiDraftState<Int?>(draftScope, "sourceTargetIndex") { null }
+    var sourceOriginalText by rememberUiDraftState(draftScope, "sourceOriginalText") { "" }
+    var sourceError by rememberUiDraftState<String?>(draftScope, "sourceError") { null }
     var conditionResolution by rememberUiDraftState<RecordConditionResolution>(draftScope, "conditionResolution") { RecordConditionResolution.Selected }
     var pendingNewCondition by rememberUiDraftState<String?>(draftScope, "pendingNewCondition") { null }
     var pendingArchivedCondition by rememberUiDraftState<ConditionEntity?>(draftScope, "pendingArchivedCondition") { null }
     val now = Instant.now().toString()
     val context = LocalContext.current
     val selectableConditions = conditions.filter { !it.archived || it.id == record?.conditionId }
+    val closeSourceDialog: () -> Unit = {
+        sourceTargetIndex = null
+        sourceOriginalText = ""
+        sourceError = null
+    }
+    val openSourceDialog: (Int, String) -> Unit = { index, currentNotes ->
+        sourceOriginalText = initialSourceRecordText(currentNotes)
+        sourceError = null
+        sourceTargetIndex = index
+    }
 
     AlertDialog(
         onDismissRequest = { if (!submitting) onDismiss() },
@@ -510,6 +521,7 @@ private fun RecordEditorDialog(
                                 OutlinedTextField(
                                     value = quickInput,
                                     onValueChange = {
+                                        closeSourceDialog()
                                         quickInput = it
                                         quickApplied = false
                                         batchDrafts = emptyList()
@@ -520,7 +532,7 @@ private fun RecordEditorDialog(
                                     maxLines = 10,
                                     supportingText = { Text("${quickInput.length} / ${ClinicalRecordQuickParser.MAX_INPUT_LENGTH}") },
                                     isError = quickInput.length > ClinicalRecordQuickParser.MAX_INPUT_LENGTH,
-                                    modifier = Modifier.fillMaxWidth()
+                                    modifier = Modifier.fillMaxWidth().testTag("quick-entry-input")
                                 )
                                 OutlinedCard(Modifier.fillMaxWidth()) {
                                     Column(
@@ -626,6 +638,7 @@ private fun RecordEditorDialog(
                                                     )
                                                 )
                                             } else {
+                                                closeSourceDialog()
                                                 quickInput = text
                                                 quickIssues = emptyList()
                                                 unrecognizedSegments = emptyList()
@@ -638,6 +651,7 @@ private fun RecordEditorDialog(
                                     ) { Text("从剪贴板粘贴") }
                                     OutlinedButton(
                                         onClick = {
+                                            closeSourceDialog()
                                             val templateDate = runCatching { LocalDate.parse(date) }
                                                 .getOrDefault(LocalDate.now())
                                             quickInput = ClinicalRecordQuickParser.templateFor(templateDate)
@@ -653,6 +667,7 @@ private fun RecordEditorDialog(
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(
                                         onClick = {
+                                            closeSourceDialog()
                                             val referenceDate = runCatching { LocalDate.parse(date) }.getOrDefault(LocalDate.now())
                                             val batch = ClinicalRecordQuickParser.parseMany(quickInput, referenceDate)
                                             val draft = batch.records.singleOrNull()
@@ -699,13 +714,15 @@ private fun RecordEditorDialog(
                                                     else -> conditionId = matched.id
                                                 }
                                                 quickApplied = true
+                                                requiresSourceRecord = true
                                                 error = null
                                             }
                                         },
-                                        modifier = Modifier.weight(1f)
+                                        modifier = Modifier.weight(1f).testTag("quick-entry-parse")
                                     ) { Text("解析并填入") }
                                     TextButton(
                                         onClick = {
+                                            closeSourceDialog()
                                             quickInput = ""
                                             quickIssues = emptyList()
                                             unrecognizedSegments = emptyList()
@@ -869,6 +886,7 @@ private fun RecordEditorDialog(
                                                         )
                                                     }
                                                     TextButton(onClick = {
+                                                        closeSourceDialog()
                                                         batchDrafts = batchDrafts.filterIndexed { itemIndex, _ -> itemIndex != index }
                                                         expandedBatchIndex = null
                                                     }) { Text("不保存此条") }
@@ -887,6 +905,13 @@ private fun RecordEditorDialog(
                                                         }
                                                     )
                                                 }
+                                                if (draftIssues.any { it.code == "MISSING_SOURCE_RECORD" }) {
+                                                    TextButton(
+                                                        onClick = { openSourceDialog(index, draft.notes) },
+                                                        enabled = !submitting,
+                                                        modifier = Modifier.testTag("quick-source-repair-$index")
+                                                    ) { Text("补充原文") }
+                                                }
                                             }
                                         }
                                     }
@@ -902,11 +927,11 @@ private fun RecordEditorDialog(
                                     Button(
                                         onClick = { confirmBatchSave = true },
                                         enabled = !batchHasErrors && !submitting,
-                                        modifier = Modifier.fillMaxWidth()
+                                        modifier = Modifier.fillMaxWidth().testTag("quick-batch-save")
                                     ) { Text("核对并保存 ${batchDrafts.size} 条记录") }
                                     if (batchHasErrors) {
                                         Text(
-                                            "请展开带红色提示的记录并修改；不需要重新解析整段文字。",
+                                            "缺少原文时，点击该条记录下的“补充原文”；其他红色提示请展开修改。不需要重新解析整段文字。",
                                             color = MaterialTheme.colorScheme.error
                                         )
                                     }
@@ -975,6 +1000,14 @@ private fun RecordEditorDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 MultiField("其他备注", notes) { notes = it }
+                if (requiresSourceRecord && batchDrafts.isEmpty() && !hasSourceRecord(notes)) {
+                    Text(QUICK_SOURCE_REQUIRED_MESSAGE, color = MaterialTheme.colorScheme.error)
+                    TextButton(
+                        onClick = { openSourceDialog(-1, notes) },
+                        enabled = !submitting,
+                        modifier = Modifier.testTag("quick-source-repair-single")
+                    ) { Text("补充原文") }
+                }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
         },
@@ -994,6 +1027,10 @@ private fun RecordEditorDialog(
                     validDate == null -> error = "日期格式不正确"
                     hospital.length > 100 -> error = "医院不能超过 100 个字符"
                     clinician.length > 100 -> error = "医生不能超过 100 个字符"
+                    requiresSourceRecord && !hasSourceRecord(notes) -> {
+                        error = QUICK_SOURCE_REQUIRED_MESSAGE
+                        openSourceDialog(-1, notes)
+                    }
                     listOf(symptoms, diagnosis, treatment, medicationNotes, notes).any {
                         it.length > ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH
                     } -> error = "症状、诊断、治疗、用药和备注每项不能超过 10,000 个字符"
@@ -1018,7 +1055,7 @@ private fun RecordEditorDialog(
                         ) { submitting = false }
                     }
                 }
-            }, enabled = !submitting && batchDrafts.isEmpty()) {
+            }, enabled = !submitting && batchDrafts.isEmpty(), modifier = Modifier.testTag("record-save")) {
                 Text(
                     when {
                         submitting -> "保存中…"
@@ -1030,6 +1067,35 @@ private fun RecordEditorDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !submitting) { Text("取消") } }
     )
+
+    sourceTargetIndex?.let { targetIndex ->
+        val targetDraft = batchDrafts.getOrNull(targetIndex)
+        if ((targetIndex == -1 && batchDrafts.isEmpty()) || targetDraft != null) {
+            QuickSourceRecordDialog(
+                eventLabel = if (targetIndex == -1) "$date · $title" else "${targetIndex + 1}. ${targetDraft!!.date} · ${targetDraft.title}",
+                originalText = sourceOriginalText,
+                error = sourceError,
+                onTextChange = { sourceOriginalText = it; sourceError = null },
+                onError = { sourceError = it },
+                onConfirm = {
+                    val currentNotes = if (targetIndex == -1) notes else batchDrafts.getOrNull(targetIndex)?.notes
+                    if (currentNotes != null && !submitting) {
+                        runCatching { completeSourceRecordNotes(currentNotes, sourceOriginalText) }
+                            .onSuccess { completed ->
+                                if (targetIndex == -1) notes = completed
+                                else batchDrafts = batchDrafts.mapIndexed { index, item ->
+                                    if (index == targetIndex) item.copy(notes = completed) else item
+                                }
+                                error = null
+                                closeSourceDialog()
+                            }
+                            .onFailure { sourceError = it.message ?: "补充失败，请保留原文后重试。" }
+                    }
+                },
+                onDismiss = closeSourceDialog
+            )
+        }
+    }
 
     pendingNewCondition?.let { name ->
         AlertDialog(
@@ -1110,7 +1176,8 @@ private fun RecordEditorDialog(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        if (!submitting) {
+                        if (!submitting && !quickIssues.any { it.severity == IssueSeverity.ERROR } &&
+                            batchDrafts.none { draft -> draft.validationIssues(appendBatchUnknownToNotes).any { it.severity == IssueSeverity.ERROR } }) {
                             submitting = true
                             onSaveBatch(requests) {
                                 submitting = false
@@ -1118,7 +1185,8 @@ private fun RecordEditorDialog(
                             }
                         }
                     },
-                    enabled = !submitting
+                    enabled = !submitting,
+                    modifier = Modifier.testTag("quick-batch-confirm")
                 ) { Text(if (submitting) "保存中…" else "确认保存") }
             },
             dismissButton = {

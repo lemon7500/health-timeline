@@ -10,6 +10,63 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalendarQuickBatchTest {
+    @Test fun `source record accepts either Chinese or English colon`() {
+        val draft = validDraft().copy(notes = "原文记录:\n9月3日复查，医生建议下月再复诊。")
+
+        assertFalse(draft.validationIssues(false).any { it.code == "MISSING_SOURCE_RECORD" })
+    }
+
+    @Test fun `missing source error tells user which repair action to use`() {
+        val issue = validDraft().copy(notes = "待核对报告").validationIssues(false)
+            .single { it.code == "MISSING_SOURCE_RECORD" }
+
+        assertTrue(issue.message.contains("补充原文"))
+        assertTrue(issue.message.contains("这条"))
+    }
+
+    @Test fun `formatted AI records without originals are parseable but require source completion`() {
+        val parsed = com.healthtimeline.app.domain.ClinicalRecordQuickParser.parseMany(
+            "日期：2026-09-03\n标题：鼻窦炎复查\n其他备注：待核对报告\n\n" +
+                "日期：2026-09-04\n标题：牙龈炎复查\n其他备注：",
+            java.time.LocalDate.of(2026, 9, 4)
+        )
+        assertFalse(parsed.hasErrors)
+        assertEquals(2, parsed.records.size)
+        assertTrue(parsed.records.all { record ->
+            record.toEditableQuickDraft().validationIssues(false).any { it.code == "MISSING_SOURCE_RECORD" }
+        })
+    }
+
+    @Test fun `completion preserves existing notes and original punctuation and ordering`() {
+        val original = "9月3日复查；医生：测试医生\n1）先拍片。\n2）再看报告：诊断仍待确认。"
+        val notes = completeSourceRecordNotes("待核对报告", original)
+
+        assertEquals("原文记录：\n$original\n\n补充备注：\n待核对报告", notes)
+        assertTrue(validDraft().copy(notes = notes).validationIssues(false).isEmpty())
+        assertEquals("", initialSourceRecordText("待核对报告"))
+    }
+
+    @Test fun `source completion rejects empty or label only text`() {
+        listOf("", "  ", "原文记录：\n", "原文记录:  ").forEach { source ->
+            assertTrue(runCatching { completeSourceRecordNotes("已有备注", source) }.isFailure)
+        }
+        assertFalse(hasSourceRecord("原文记录: \n"))
+        assertFalse(hasSourceRecord("原文记录："))
+    }
+
+    @Test fun `completion normalizes newline and avoids duplicate markers or notes`() {
+        assertEquals("原文记录：\n第一步\n第二步", completeSourceRecordNotes("原文记录：", "原文记录:\r\n第一步\r第二步"))
+        val once = completeSourceRecordNotes("", "真实原文")
+        assertEquals(once, completeSourceRecordNotes(once, "真实原文"))
+    }
+
+    @Test fun `combined source and existing notes length is checked without truncation`() {
+        val original = "文".repeat(com.healthtimeline.app.domain.ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH - "原文记录：\n".length)
+        assertEquals(10_000, completeSourceRecordNotes("", original).length)
+        assertTrue(runCatching { completeSourceRecordNotes("旧备注", original) }.isFailure)
+        assertTrue(runCatching { completeSourceRecordNotes("", original + "文") }.isFailure)
+    }
+
     @Test fun `edited batch values are the values prepared for atomic save`() {
         val draft = validDraft().copy(
             date = "2026-09-04",
