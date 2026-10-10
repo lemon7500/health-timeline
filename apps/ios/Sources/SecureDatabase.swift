@@ -85,7 +85,7 @@ final class SecureDatabase: HealthStateDatabase {
                     guard sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO calendar_date_migration_original(id,payload,interpreted_time_zone) VALUES(1,?,?)", -1, &backup, nil) == SQLITE_OK else { throw StorageError.database(lastError) }
                     defer { sqlite3_finalize(backup) }
                     let blob = original.withUnsafeBytes { sqlite3_bind_blob(backup, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-                    let zone = TimeZone.current.identifier.withCString { sqlite3_bind_text(backup, 2, $0, -1, SQLITE_TRANSIENT) }
+                    let zone = HealthDate.localTimeZone.identifier.withCString { sqlite3_bind_text(backup, 2, $0, -1, SQLITE_TRANSIENT) }
                     guard blob == SQLITE_OK, zone == SQLITE_OK, sqlite3_step(backup) == SQLITE_DONE else { throw StorageError.database(lastError) }
                     #if DEBUG
                     if failAfterMigrationBackupForTesting { throw StorageError.database("测试迁移中断") }

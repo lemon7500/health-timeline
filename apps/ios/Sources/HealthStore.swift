@@ -33,7 +33,7 @@ final class HealthStore: ObservableObject {
             state = loaded
             storageReady = true
             if migratedDates {
-                noticeMessage = "旧版未记录原录入时区，本次按手机当前时区（\(TimeZone.current.identifier)）解释旧日期和用药时间；原始加密资料已保留，请核对。"
+                noticeMessage = "旧版未记录原录入时区，本次按手机当前时区（\(HealthDate.localTimeZone.identifier)）解释旧日期和用药时间；原始加密资料已保留，请核对。"
             }
         } catch {
             errorMessage = error.localizedDescription

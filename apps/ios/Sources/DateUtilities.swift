@@ -1,27 +1,24 @@
 import Foundation
 
 enum HealthDate {
+    // Use Foundation's application default consistently. DateFormatter defaults
+    // to this zone, while TimeZone.current can still report the system zone when
+    // the application default is overridden (including simulator tests).
+    static var localTimeZone: TimeZone { NSTimeZone.default }
+
     static var calendar: Calendar {
         var value = Calendar(identifier: .gregorian)
         value.locale = Locale(identifier: "zh_CN")
-        value.timeZone = .current
+        value.timeZone = localTimeZone
         return value
     }
 
     static func day(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: date)
+        formatter("yyyy-MM-dd", timeZone: localTimeZone).string(from: date)
     }
 
     static func localDateTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = calendar
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        return formatter.string(from: date)
+        formatter("yyyy-MM-dd'T'HH:mm:ss", timeZone: localTimeZone).string(from: date)
     }
 
     static func instant(_ date: Date) -> String {
@@ -71,7 +68,7 @@ enum HealthDate {
     // Date is only a UI adapter. A DST gap may normalize its display; never encode
     // that adapted Date over the authoritative stored calendar/local-clock string.
     private static func displayDate(_ value: String, pattern: String) -> Date? {
-        let local = formatter(pattern, timeZone: .current)
+        let local = formatter(pattern, timeZone: localTimeZone)
         if let date = local.date(from: value) { return date }
         local.isLenient = true
         return local.date(from: value) ?? strictUTC(value, pattern: pattern)

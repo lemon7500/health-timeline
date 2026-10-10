@@ -266,6 +266,11 @@ final class HealthTimelineTests: XCTestCase {
         let member = FamilyMember()
         let day = try XCTUnwrap(HealthDate.parseDay("2026-09-09"))
         let clock = try XCTUnwrap(HealthDate.parseLocalDateTime("2026-09-09T08:05:00"))
+        // Prove the setup actually parses Shanghai wall time, not the simulator's
+        // system UTC zone followed by formatting with another default zone.
+        XCTAssertEqual(HealthDate.calendar.timeZone, try XCTUnwrap(TimeZone(identifier: "Asia/Shanghai")))
+        XCTAssertEqual(clock, try XCTUnwrap(HealthDate.parseInstant("2026-09-09T00:05:00Z")))
+        XCTAssertEqual(HealthDate.localDateTime(clock), "2026-09-09T08:05:00")
         var source = HealthState(); source.members = [member]; source.selectedMemberId = member.id
         source.records = [ClinicalRecord(memberId: member.id, recordDate: day, dayOrder: 0, title: "测试病历")]
         let followUp = FollowUpSchedule(memberId: member.id, title: "测试复查", recurrenceType: "EVERY_N_MONTHS", interval: 3, anchorDate: day, anchorDayOfMonth: 9, nextDueDate: day)
@@ -279,8 +284,14 @@ final class HealthTimelineTests: XCTestCase {
         let stored = try encoder.encode(source)
         let exported = try PortableBackupMapper.export(source)
         for zone in ["America/Los_Angeles", "UTC", "Asia/Tokyo"] {
-            NSTimeZone.default = try XCTUnwrap(TimeZone(identifier: zone))
+            let selectedZone = try XCTUnwrap(TimeZone(identifier: zone))
+            NSTimeZone.default = selectedZone
+            XCTAssertEqual(HealthDate.calendar.timeZone, selectedZone)
             let reopened = try decoder.decode(HealthState.self, from: stored)
+            let expectedDisplayInstant = try XCTUnwrap(HealthDate.parseInstant("2026-09-09T08:05:00Z"))
+                .addingTimeInterval(-TimeInterval(selectedZone.secondsFromGMT(for: clock)))
+            XCTAssertEqual(reopened.medicationLogs[0].scheduledAt, expectedDisplayInstant)
+            XCTAssertEqual(HealthDate.localDateTime(reopened.medicationLogs[0].scheduledAt), "2026-09-09T08:05:00")
             let roundTrip = try PortableBackupMapper.export(PortableBackupMapper.toState(exported, attachmentPaths: [:]))
             let reopenedExport = try PortableBackupMapper.export(reopened)
             for result in [roundTrip, reopenedExport] {
