@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.HealthTimelineApplication
 import com.healthtimeline.app.domain.AiRecordFormattingPromptBuilder
@@ -59,14 +60,16 @@ fun CalendarScreen(
     val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val cachedAttachments by viewModel.attachments.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val drafts: UiDraftStateViewModel = composeViewModel()
+    val pageScope = "calendar/$selectedMemberId"
     val records = memberScopedEntities(selectedMemberId, cachedRecords) { it.memberId }
     val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
     val attachments = childrenOfMember(records.map { it.id }.toSet(), cachedAttachments) { it.recordId }
     var month by rememberSaveable { mutableStateOf(YearMonth.now().toString()) }
     var selectedDate by rememberSaveable { mutableStateOf(LocalDate.now().toString()) }
     var filterCondition by rememberSaveable(selectedMemberId) { mutableStateOf<Long?>(null) }
-    var editing by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
-    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
+    var editing by rememberUiDraftState<ClinicalRecordEntity?>(pageScope, "editing") { null }
+    var createForMemberId by rememberUiDraftState<Long?>(pageScope, "creating") { null }
     var details by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
     var manageConditionsForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
     var deleteTarget by remember(selectedMemberId) { mutableStateOf<ClinicalRecordEntity?>(null) }
@@ -83,9 +86,7 @@ fun CalendarScreen(
     LaunchedEffect(selectedMemberId) {
         filterCondition = null
         searchQuery = ""
-        editing = null
         details = null
-        createForMemberId = null
         manageConditionsForMemberId = null
         deleteTarget = null
     }
@@ -208,7 +209,10 @@ fun CalendarScreen(
                 viewModel.saveRecord(
                     value = value,
                     conditionResolution = conditionResolution,
-                    onSaved = { createForMemberId = null; editing = null },
+                    onSaved = {
+                        drafts.clearScope(recordDraftScope(value.memberId, visibleEditing?.uuid))
+                        createForMemberId = null; editing = null
+                    },
                     onFailed = onFailed
                 )
             },
@@ -216,11 +220,17 @@ fun CalendarScreen(
                 if (requests.any { it.record.memberId != viewModel.selectedMemberId.value }) { onFailed() } else
                 viewModel.saveRecords(
                     requests = requests,
-                    onSaved = { createForMemberId = null; editing = null },
+                    onSaved = {
+                        drafts.clearScope(recordDraftScope(requireNotNull(visibleCreateForMember), null))
+                        createForMemberId = null; editing = null
+                    },
                     onFailed = onFailed
                 )
             },
-            onDismiss = { createForMemberId = null; editing = null }
+            onDismiss = {
+                drafts.clearScope(recordDraftScope(visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember), visibleEditing?.uuid))
+                createForMemberId = null; editing = null
+            }
         )
     }
     details?.takeIf { target -> target.memberId == selectedMemberId && records.any { it.id == target.id && it.uuid == target.uuid } }?.let { record ->
@@ -438,35 +448,34 @@ private fun RecordEditorDialog(
     onSaveBatch: (List<ClinicalRecordSaveRequest>, () -> Unit) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var date by remember(record) { mutableStateOf(record?.recordDate ?: initialDate) }
-    var title by remember(record) { mutableStateOf(record?.title.orEmpty()) }
-    var stage by remember(record) { mutableStateOf(record?.stage ?: VisitStage.OTHER.name) }
-    var conditionId by remember(record) { mutableStateOf(record?.conditionId) }
-    var symptoms by remember(record) { mutableStateOf(record?.symptoms.orEmpty()) }
-    var diagnosis by remember(record) { mutableStateOf(record?.diagnosis.orEmpty()) }
-    var treatment by remember(record) { mutableStateOf(record?.treatment.orEmpty()) }
-    var medicationNotes by remember(record) { mutableStateOf(record?.medicationNotes.orEmpty()) }
-    var hospital by remember(record) { mutableStateOf(record?.hospital.orEmpty()) }
-    var clinician by remember(record) { mutableStateOf(record?.clinician.orEmpty()) }
-    var notes by remember(record) { mutableStateOf(record?.notes.orEmpty()) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var submitting by remember(record) { mutableStateOf(false) }
-    var quickExpanded by remember(record) { mutableStateOf(record == null) }
-    var quickInput by remember(record) { mutableStateOf("") }
-    var quickIssues by remember(record) { mutableStateOf<List<QuickEntryIssue>>(emptyList()) }
-    var unrecognizedSegments by remember(record) { mutableStateOf<List<String>>(emptyList()) }
-    var quickApplied by remember(record) { mutableStateOf(false) }
-    var aiHelpExpanded by remember(record) { mutableStateOf(false) }
-    var aiCopyMessage by remember(record) { mutableStateOf<String?>(null) }
-    var batchDrafts by remember(record) { mutableStateOf<List<EditableQuickDraft>>(emptyList()) }
-    var expandedBatchIndex by remember(record) { mutableStateOf<Int?>(null) }
-    var appendBatchUnknownToNotes by remember(record) { mutableStateOf(false) }
-    var confirmBatchSave by remember(record) { mutableStateOf(false) }
-    var conditionResolution by remember(record) {
-        mutableStateOf<RecordConditionResolution>(RecordConditionResolution.Selected)
-    }
-    var pendingNewCondition by remember(record) { mutableStateOf<String?>(null) }
-    var pendingArchivedCondition by remember(record) { mutableStateOf<ConditionEntity?>(null) }
+    val draftScope = recordDraftScope(memberId, record?.uuid)
+    var date by rememberUiDraftState(draftScope, "date") { record?.recordDate ?: initialDate }
+    var title by rememberUiDraftState(draftScope, "title") { record?.title.orEmpty() }
+    var stage by rememberUiDraftState(draftScope, "stage") { record?.stage ?: VisitStage.OTHER.name }
+    var conditionId by rememberUiDraftState(draftScope, "condition") { record?.conditionId }
+    var symptoms by rememberUiDraftState(draftScope, "symptoms") { record?.symptoms.orEmpty() }
+    var diagnosis by rememberUiDraftState(draftScope, "diagnosis") { record?.diagnosis.orEmpty() }
+    var treatment by rememberUiDraftState(draftScope, "treatment") { record?.treatment.orEmpty() }
+    var medicationNotes by rememberUiDraftState(draftScope, "medicationNotes") { record?.medicationNotes.orEmpty() }
+    var hospital by rememberUiDraftState(draftScope, "hospital") { record?.hospital.orEmpty() }
+    var clinician by rememberUiDraftState(draftScope, "clinician") { record?.clinician.orEmpty() }
+    var notes by rememberUiDraftState(draftScope, "notes") { record?.notes.orEmpty() }
+    var error by rememberUiDraftState<String?>(draftScope, "error") { null }
+    var submitting by rememberUiDraftState(draftScope, "submitting") { false }
+    var quickExpanded by rememberUiDraftState(draftScope, "quickExpanded") { record == null }
+    var quickInput by rememberUiDraftState(draftScope, "quickInput") { "" }
+    var quickIssues by rememberUiDraftState<List<QuickEntryIssue>>(draftScope, "quickIssues") { emptyList() }
+    var unrecognizedSegments by rememberUiDraftState<List<String>>(draftScope, "unknown") { emptyList() }
+    var quickApplied by rememberUiDraftState(draftScope, "quickApplied") { false }
+    var aiHelpExpanded by rememberUiDraftState(draftScope, "aiHelpExpanded") { false }
+    var aiCopyMessage by rememberUiDraftState<String?>(draftScope, "aiCopyMessage") { null }
+    var batchDrafts by rememberUiDraftState<List<EditableQuickDraft>>(draftScope, "batchDrafts") { emptyList() }
+    var expandedBatchIndex by rememberUiDraftState<Int?>(draftScope, "expandedBatchIndex") { null }
+    var appendBatchUnknownToNotes by rememberUiDraftState(draftScope, "appendBatchUnknownToNotes") { false }
+    var confirmBatchSave by rememberUiDraftState(draftScope, "confirmBatchSave") { false }
+    var conditionResolution by rememberUiDraftState<RecordConditionResolution>(draftScope, "conditionResolution") { RecordConditionResolution.Selected }
+    var pendingNewCondition by rememberUiDraftState<String?>(draftScope, "pendingNewCondition") { null }
+    var pendingArchivedCondition by rememberUiDraftState<ConditionEntity?>(draftScope, "pendingArchivedCondition") { null }
     val now = Instant.now().toString()
     val context = LocalContext.current
     val selectableConditions = conditions.filter { !it.archived || it.id == record?.conditionId }

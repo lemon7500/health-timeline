@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -92,13 +93,8 @@ class ReminderReceiver : BroadcastReceiver() {
         nickname: String
     ) {
         if (!canNotify(context)) return
-        val actionIntent = Intent(context, ReminderActionReceiver::class.java).apply {
-            action = ReminderActionReceiver.ACTION_TAKEN
-            putExtra(EXTRA_MEDICATION_ID, medicationId)
-            putExtra(EXTRA_ID, scheduleId)
-            putExtra(EXTRA_SCHEDULED_AT, scheduledAt)
-        }
-        val action = PendingIntent.getBroadcast(
+        val actionIntent = medicationReviewIntent(context, medicationId, scheduleId, scheduledAt)
+        val action = PendingIntent.getActivity(
             context,
             (scheduleId % 400_000).toInt() + 1_100_000,
             actionIntent,
@@ -111,9 +107,9 @@ class ReminderReceiver : BroadcastReceiver() {
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
-            .setContentIntent(openAppIntent(context))
+            .setContentIntent(action)
             .setPublicVersion(publicNotification(context, NotificationChannels.MEDICATION))
-            .addAction(0, "已服", action)
+            .addAction(0, "核对并记录", action)
             .build()
         context.getSystemService(NotificationManager::class.java)
             .notify((scheduleId % Int.MAX_VALUE).toInt() + 500_000, notification)
@@ -165,3 +161,14 @@ class ReminderReceiver : BroadcastReceiver() {
         private const val TEST_NOTIFICATION_ID = 1_950_001
     }
 }
+
+/** An explicit Activity intent: authentication and confirmation happen in the app. */
+internal fun medicationReviewIntent(context: Context, medicationId: Long, scheduleId: Long, scheduledAt: String): Intent =
+    Intent(context, MainActivity::class.java).apply {
+        action = "com.healthtimeline.app.REVIEW_MEDICATION"
+        data = Uri.parse("healthtimeline://review-dose/$scheduleId/${Uri.encode(scheduledAt)}")
+        addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        putExtra(ReminderReceiver.EXTRA_MEDICATION_ID, medicationId)
+        putExtra(ReminderReceiver.EXTRA_ID, scheduleId)
+        putExtra(ReminderReceiver.EXTRA_SCHEDULED_AT, scheduledAt)
+    }

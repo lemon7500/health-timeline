@@ -32,6 +32,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
+import com.healthtimeline.app.reminders.NotificationReviewRequest
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 
 private enum class Tab(val label: String) {
     TODAY("今日"), CALENDAR("日历"), FOLLOW_UP("复查"), MEDICATION("用药"), SETTINGS("设置")
@@ -41,10 +45,13 @@ private enum class Tab(val label: String) {
 fun HealthTimelineRoot(
     viewModel: AppViewModel,
     appLockManager: AppLockManager,
-    authenticate: (() -> Unit) -> Unit
+    authenticate: (() -> Unit) -> Unit,
+    notificationReview: NotificationReviewRequest? = null,
+    onNotificationReviewConsumed: (NotificationReviewRequest) -> Unit = {}
 ) {
+    val drafts: UiDraftStateViewModel = composeViewModel()
     var tab by rememberSaveable { mutableStateOf(Tab.TODAY) }
-    var navigation by remember { mutableStateOf<TodayNavigation?>(null) }
+    var navigation by drafts.navigationState
     val snackbar = remember { SnackbarHostState() }
     val busy by viewModel.busy.collectAsState()
     val locked by appLockManager.locked.collectAsStateWithLifecycle()
@@ -56,7 +63,25 @@ fun HealthTimelineRoot(
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
-    LaunchedEffect(selectedMemberId) { navigation = null }
+    // Bind before composing forms; clearing afterward could discard a just-created draft on rotation.
+    drafts.bindMember(selectedMemberId)
+    LaunchedEffect(selectedMemberId) {
+        // A notification can switch member and create its destination in the same frame.
+        if (navigation?.memberId != selectedMemberId) navigation = null
+    }
+    LaunchedEffect(locked, notificationReview) {
+        notificationReview?.takeUnless { locked }?.let { request ->
+            try {
+                viewModel.reviewMedicationNotification(request)?.let { target ->
+                    navigation = target
+                    tab = Tab.MEDICATION
+                }
+            } finally {
+                // Keep an unprocessed intent if locking or recreation cancels validation.
+                if (currentCoroutineContext().isActive) onNotificationReviewConsumed(request)
+            }
+        }
+    }
 
     DisposableEffect(lifecycleOwner, appLockManager) {
         val observer = LifecycleEventObserver { _, event ->

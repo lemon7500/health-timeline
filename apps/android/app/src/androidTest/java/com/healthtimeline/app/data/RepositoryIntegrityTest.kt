@@ -154,13 +154,198 @@ class RepositoryIntegrityTest {
         val schedules = database.medicationDao().schedulesForMedication(medicationId)
         val closed = schedules.first { it.id == oldSchedule.id }
         val next = schedules.first { it.id != oldSchedule.id }
-        assertFalse(closed.enabled)
+        assertTrue(closed.enabled)
         assertEquals(today.toString(), closed.effectiveTo)
         assertEquals("1", closed.doseAmountSnapshot)
         assertEquals(today.plusDays(1).toString(), next.effectiveFrom)
         assertEquals("09:05", next.localTime)
         assertEquals("2", next.doseAmountSnapshot)
         assertEquals("1", database.medicationDao().allLogs().single().doseAmountSnapshot)
+        assertEquals(setOf(oldSchedule.id, next.id), database.medicationDao().enabledSchedules(today.toString()).map { it.id }.toSet())
+        assertEquals(listOf(next.id), database.medicationDao().enabledSchedules(today.plusDays(1).toString()).map { it.id })
+    }
+
+    @Test fun laterStartDateCannotHideExistingMedicationHistoryOrBreakBackup(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val originalSchedules = database.medicationDao().schedulesForMedication(id)
+        val historicalDate = today.minusDays(1)
+        repository.recordDose(id, originalSchedules.first().id, historicalDate.atTime(8, 0), historicalDate.atTime(8, 5), MedicationLogStatus.TAKEN)
+        val originalLogs = database.medicationDao().allLogs()
+
+        val failure = runCatching {
+            repository.saveMedication(before.copy(startDate = today.toString()), listOf(LocalTime.of(9, 5)), today.plusDays(1))
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(originalSchedules, database.medicationDao().schedulesForMedication(id))
+        assertEquals(originalLogs, database.medicationDao().allLogs())
+        assertEquals(2, repository.medicationMonthForMember(member.id, java.time.YearMonth.from(historicalDate)).first().entries(historicalDate).size)
+    }
+
+    @Test fun startDateCannotMovePastEarlierAsNeededLog(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id, MedicationMode.AS_NEEDED)
+        val before = requireNotNull(repository.medicationById(id))
+        val recordedDate = today.minusDays(2)
+        assertTrue(repository.recordDose(id, null, recordedDate.atTime(10, 0), recordedDate.atTime(10, 0), MedicationLogStatus.TAKEN))
+
+        val failure = runCatching {
+            repository.saveMedication(before.copy(startDate = today.toString()), emptyList(), today.plusDays(1))
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(1, database.medicationDao().allLogs().size)
+    }
+
+    @Test fun earlierStartDateIsAllowedWithoutRewritingExistingHistory(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val originalSchedules = database.medicationDao().schedulesForMedication(id)
+        val earlier = LocalDate.parse(before.startDate).minusDays(2)
+
+        repository.saveMedication(before.copy(startDate = earlier.toString()), listOf(LocalTime.of(9, 5)), today.plusDays(1))
+
+        assertEquals(earlier.toString(), repository.medicationById(id)?.startDate)
+        originalSchedules.forEach { previous ->
+            val preserved = requireNotNull(database.medicationDao().scheduleById(previous.id))
+            assertEquals(previous.uuid, preserved.uuid)
+            assertEquals(previous.effectiveFrom, preserved.effectiveFrom)
+            assertEquals(previous.doseAmountSnapshot, preserved.doseAmountSnapshot)
+            assertTrue(preserved.enabled)
+        }
+        assertEquals(2, repository.medicationMonthForMember(member.id, java.time.YearMonth.from(today)).first().entries(today).size)
+    }
+
+    @Test fun futureCourseRejectsPlanBeforeStartAndEndingBeforeStart(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val futureStart = today.plusDays(5)
+        val id = repository.saveMedication(
+            MedicationEntity(
+                name = "尚未开始药物", doseAmount = "1", doseUnit = "片", startDate = futureStart.toString(),
+                mode = MedicationMode.SCHEDULED.name, createdAt = NOW, updatedAt = NOW, memberId = member.id
+            ), listOf(LocalTime.of(8, 0))
+        ).medicationId
+        val before = requireNotNull(repository.medicationById(id))
+        val schedules = database.medicationDao().schedulesForMedication(id)
+
+        val editFailure = runCatching {
+            repository.saveMedication(before.copy(doseAmount = "2"), listOf(LocalTime.of(9, 5)), today.plusDays(1))
+        }.exceptionOrNull()
+        val endFailure = runCatching { repository.archiveMedication(id) }.exceptionOrNull()
+
+        assertTrue(editFailure is IllegalArgumentException)
+        assertTrue(endFailure is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(schedules, database.medicationDao().schedulesForMedication(id))
+        assertTrue(schedules.all { it.enabled && !it.pausedByCourseEnd })
+    }
+
+    @Test fun shorteningEndDateCannotInvalidateLegacyClosedSchedule(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val originalSchedules = database.medicationDao().schedulesForMedication(id)
+        // Previous releases could disable a plan immediately despite its future effective end.
+        val legacyClosed = originalSchedules.first().copy(enabled = false, effectiveTo = today.plusDays(5).toString())
+        database.medicationDao().updateSchedule(legacyClosed)
+        val preservedSchedules = database.medicationDao().schedulesForMedication(id)
+
+        val failure = runCatching {
+            repository.saveMedication(
+                before.copy(endDate = today.toString(), mode = MedicationMode.AS_NEEDED.name), emptyList(), today.plusDays(1)
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(preservedSchedules, database.medicationDao().schedulesForMedication(id))
+    }
+
+    @Test fun shorteningCurrentCourseClosesPlanWithoutChangingPastDoses(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val oldSchedules = database.medicationDao().schedulesForMedication(id)
+        val yesterday = today.minusDays(1)
+        assertTrue(repository.recordDose(id, oldSchedules.first().id, yesterday.atTime(8, 0), yesterday.atTime(8, 5), MedicationLogStatus.TAKEN))
+        val log = database.medicationDao().allLogs().single()
+
+        repository.saveMedication(
+            before.copy(endDate = today.toString(), mode = MedicationMode.AS_NEEDED.name), emptyList(), today.plusDays(1)
+        )
+
+        assertEquals(today.toString(), repository.medicationById(id)?.endDate)
+        assertEquals(log, database.medicationDao().allLogs().single())
+        assertEquals(oldSchedules.map { it.uuid }, database.medicationDao().schedulesForMedication(id).map { it.uuid })
+        assertTrue(database.medicationDao().schedulesForMedication(id).all { it.effectiveTo == today.toString() })
+        assertEquals(2, repository.medicationMonthForMember(member.id, java.time.YearMonth.from(yesterday)).first().entries(yesterday).size)
+    }
+
+    @Test fun endingCourseRejectsUnfinishedLegacyDisabledScheduleWithoutChangingHistory(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val first = database.medicationDao().schedulesForMedication(id).first()
+        val legacy = first.copy(enabled = false, effectiveTo = today.plusDays(5).toString(), pausedByCourseEnd = false)
+        database.medicationDao().updateSchedule(legacy)
+        val preservedSchedules = database.medicationDao().schedulesForMedication(id)
+
+        val failure = runCatching { repository.archiveMedication(id) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(preservedSchedules, database.medicationDao().schedulesForMedication(id))
+        assertTrue(database.medicationDao().schedulesForMedication(id).none { it.pausedByCourseEnd })
+
+        database.medicationDao().updateSchedule(legacy.copy(effectiveTo = null))
+        val indefiniteSchedules = database.medicationDao().schedulesForMedication(id)
+        assertTrue(runCatching { repository.archiveMedication(id) }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(indefiniteSchedules, database.medicationDao().schedulesForMedication(id))
+    }
+
+    @Test fun archivedMemberCannotEndMedicationOrChangeItsSchedules(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        repository.saveMember(FamilyMemberEntity(
+            name = "另一成员", nickname = "亲属", relationship = "亲属", createdAt = NOW, updatedAt = NOW
+        ))
+        val id = createOverviewMedication(member.id)
+        val before = requireNotNull(repository.medicationById(id))
+        val preservedSchedules = database.medicationDao().schedulesForMedication(id)
+        repository.archiveMember(member.id)
+
+        assertTrue(runCatching { repository.archiveMedication(id) }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(before, repository.medicationById(id))
+        assertEquals(preservedSchedules, database.medicationDao().schedulesForMedication(id))
+    }
+
+    @Test fun finishedDisabledHistoryAllowsCourseEndAndIsNotReenabledOnRestore(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = createOverviewMedication(member.id)
+        val first = database.medicationDao().schedulesForMedication(id).first()
+        val closed = first.copy(enabled = false, effectiveTo = today.toString(), pausedByCourseEnd = false)
+        database.medicationDao().updateSchedule(closed)
+
+        repository.archiveMedication(id)
+
+        assertTrue(repository.medicationById(id)?.archived == true)
+        assertEquals(closed, database.medicationDao().scheduleById(first.id))
+        repository.restoreMedication(id)
+        assertFalse(requireNotNull(repository.medicationById(id)).archived)
+        assertEquals(closed, database.medicationDao().scheduleById(first.id))
     }
 
     @Test fun endingMedicationRecordsExactTimeAndKeepsFinalDayInCalendar() = runBlocking {
@@ -430,6 +615,79 @@ class RepositoryIntegrityTest {
         assertTrue(runCatching { repository.saveRecords(requests) }.isFailure)
         assertTrue(database.conditionDao().all().isEmpty())
         assertEquals(listOf("原记录"), database.clinicalRecordDao().all().map { it.title })
+    }
+
+    @Test fun exhaustedDayOrderRejectsAppendWithoutChangingExistingRecordOrCreatingCondition(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val original = ClinicalRecordEntity(
+            memberId = member.id, recordDate = "2026-09-06", title = "导入的原记录",
+            dayOrder = Long.MAX_VALUE, createdAt = NOW, updatedAt = NOW
+        )
+        val id = database.clinicalRecordDao().insert(original)
+        val preserved = requireNotNull(database.clinicalRecordDao().byId(id))
+
+        val failure = runCatching {
+            repository.saveRecord(
+                ClinicalRecordEntity(
+                    memberId = member.id, recordDate = original.recordDate, title = "不应保存",
+                    createdAt = NOW, updatedAt = NOW
+                ), RecordConditionResolution.Create("不应留下分类")
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertEquals(listOf(preserved), database.clinicalRecordDao().all())
+        assertTrue(database.conditionDao().all().isEmpty())
+        assertTrue(database.clinicalRecordDao().all().all { it.dayOrder >= 0 })
+    }
+
+    @Test fun batchDayOrderOverflowRollsBackEarlierAppendAndCondition(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val original = ClinicalRecordEntity(
+            memberId = member.id, recordDate = "2026-09-06", title = "临界顺序原记录",
+            dayOrder = Long.MAX_VALUE - 1L, createdAt = NOW, updatedAt = NOW
+        )
+        val id = database.clinicalRecordDao().insert(original)
+        val preserved = requireNotNull(database.clinicalRecordDao().byId(id))
+        val requests = listOf("第一条", "第二条").map { title ->
+            ClinicalRecordSaveRequest(
+                ClinicalRecordEntity(
+                    memberId = member.id, recordDate = original.recordDate, title = title,
+                    createdAt = NOW, updatedAt = NOW
+                ), RecordConditionResolution.Create("批量不得留下分类")
+            )
+        }
+
+        assertTrue(runCatching { repository.saveRecords(requests) }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(listOf(preserved), database.clinicalRecordDao().all())
+        assertTrue(database.conditionDao().all().isEmpty())
+        assertTrue(database.clinicalRecordDao().all().all { it.dayOrder >= 0 })
+    }
+
+    @Test fun changingDateToExhaustedDayRejectsMoveButSameDayEditingStillWorks(): Unit = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val target = ClinicalRecordEntity(
+            memberId = member.id, recordDate = "2026-09-06", title = "当天顺序已满",
+            dayOrder = Long.MAX_VALUE, createdAt = NOW, updatedAt = NOW
+        )
+        val targetId = database.clinicalRecordDao().insert(target)
+        val sourceId = repository.saveRecord(ClinicalRecordEntity(
+            memberId = member.id, recordDate = "2026-09-05", title = "其他日期原记录",
+            createdAt = NOW, updatedAt = NOW
+        ))
+        val source = requireNotNull(database.clinicalRecordDao().byId(sourceId))
+        val preserved = database.clinicalRecordDao().all()
+
+        assertTrue(runCatching {
+            repository.saveRecord(source.copy(recordDate = target.recordDate))
+        }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(preserved, database.clinicalRecordDao().all())
+
+        val existingTarget = requireNotNull(database.clinicalRecordDao().byId(targetId))
+        repository.saveRecord(existingTarget.copy(title = "核对后修改标题"))
+        assertEquals(Long.MAX_VALUE, database.clinicalRecordDao().byId(targetId)?.dayOrder)
+        assertEquals(existingTarget.uuid, database.clinicalRecordDao().byId(targetId)?.uuid)
+        assertEquals(source, database.clinicalRecordDao().byId(sourceId))
     }
 
     @Test fun interruptedAttachmentDeletionIsRecoveredWhenDatabaseRowStillExists(): Unit = runBlocking {

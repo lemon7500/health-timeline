@@ -50,10 +50,7 @@ enum PortableBackupService {
         defer { try? FileManager.default.removeItem(at: root) }
         let manifestURL = root.appendingPathComponent("manifest.json")
         let zipURL = root.appendingPathComponent("payload.zip")
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        let manifest = try encoder.encode(snapshot)
+        let manifest = try PortableBackupMapper.encodedCanonical(snapshot)
         guard manifest.count <= maximumManifestBytes else { throw StoreValidationError.message("备份清单过大") }
         try manifest.write(to: manifestURL, options: [.atomic])
         let archive = try Archive(url: zipURL, accessMode: .create)
@@ -123,7 +120,7 @@ enum PortableBackupService {
         var result = local
         result.members = merge(local.members, imported.members, entity: "member", useImported: useImported)
         result.conditions = merge(local.conditions, imported.conditions, entity: "condition", useImported: useImported)
-        result.records = merge(local.records, imported.records, entity: "record", useImported: useImported)
+        result.records = mergeRecords(local.records, imported.records, useImported: useImported)
         result.attachments = merge(local.attachments, imported.attachments, entity: "attachment", useImported: useImported)
         result.followUps = merge(local.followUps, imported.followUps, entity: "followup", useImported: useImported)
         result.occurrences = merge(local.occurrences, imported.occurrences, entity: "occurrence", useImported: useImported)
@@ -140,7 +137,7 @@ enum PortableBackupService {
         var output = BackupPreview()
         count(local.members, imported.members, entity: "member", output: &output)
         count(local.conditions, imported.conditions, entity: "condition", output: &output)
-        count(local.records, imported.records, entity: "record", output: &output)
+        countRecords(local.records, imported.records, output: &output)
         countAttachments(local.attachments, imported.attachments, output: &output)
         count(local.followUps, imported.followUps, entity: "followup", output: &output)
         count(local.occurrences, imported.occurrences, entity: "occurrence", output: &output)
@@ -155,13 +152,61 @@ enum PortableBackupService {
         var indexes = Dictionary(uniqueKeysWithValues: result.indices.map { (result[$0].id, $0) })
         for value in imported {
             if let index = indexes[value.id] {
-                if useImported.contains("\(entity):\(value.id.uuidString)") { result[index] = value }
+                if selected(entity: entity, id: value.id, in: useImported) { result[index] = value }
             } else {
                 indexes[value.id] = result.count
                 result.append(value)
             }
         }
         return result
+    }
+
+    private static func selected(entity: String, id: UUID, in values: Set<String>) -> Bool {
+        values.contains("\(entity):\(id.uuidString)") || values.contains("\(entity):\(id.uuidString.lowercased())")
+    }
+
+    private static func mergeRecords(_ local: [ClinicalRecord], _ imported: [ClinicalRecord], useImported: Set<String>) -> [ClinicalRecord] {
+        let incomingById = Dictionary(uniqueKeysWithValues: imported.map { ($0.id, $0) })
+        let localIds = Set(local.map(\.id))
+        let retained = local.enumerated().sorted {
+            let lhs = $0.element.dayOrder ?? 0; let rhs = $1.element.dayOrder ?? 0
+            return lhs == rhs ? $0.offset < $1.offset : lhs < rhs
+        }.map { indexed -> ClinicalRecord in
+            let current = indexed.element
+            if var incoming = incomingById[current.id], selected(entity: "record", id: current.id, in: useImported) {
+                incoming.dayOrder = current.dayOrder
+                return incoming
+            }
+            return current
+        }
+        let additions = imported.enumerated().filter { !localIds.contains($0.element.id) }.sorted {
+            let lhs = $0.element.dayOrder ?? 0; let rhs = $1.element.dayOrder ?? 0
+            return lhs == rhs ? $0.offset < $1.offset : lhs < rhs
+        }.map(\.element)
+        let combined = retained + additions
+        let denseDays = Set(combined.filter { $0.dayOrder == Int64.max }.map { "\($0.memberId?.uuidString ?? ""):\($0.$recordDate)" })
+        var next: [String: Int64] = [:]
+        return combined.map { record in
+            var value = record
+            let day = "\(record.memberId?.uuidString ?? ""):\(record.$recordDate)"
+            let order = denseDays.contains(day) ? next[day, default: 0] : max(record.dayOrder ?? 0, next[day, default: 0])
+            value.dayOrder = order
+            next[day] = order + 1
+            return value
+        }
+    }
+
+    private static func countRecords(_ local: [ClinicalRecord], _ imported: [ClinicalRecord], output: inout BackupPreview) {
+        let localById = Dictionary(uniqueKeysWithValues: local.map { ($0.id, $0) })
+        for value in imported {
+            guard var existing = localById[value.id] else { output.additions += 1; continue }
+            existing.dayOrder = value.dayOrder
+            if existing == value { output.duplicates += 1 }
+            else {
+                output.updates += 1
+                output.conflicts.append(BackupConflict(entity: "record", uuid: value.id, localUpdatedAt: "local", importedUpdatedAt: "imported"))
+            }
+        }
     }
 
     private static func count<T: Identifiable & Equatable>(_ local: [T], _ imported: [T], entity: String, output: inout BackupPreview) where T.ID == UUID {

@@ -122,6 +122,11 @@ class AlarmScheduler(
         )?.let(alarmManager::cancel)
     }
 
+    fun cancelMedicationNotification(id: Long) {
+        context.getSystemService(NotificationManager::class.java)
+            .cancel((id % Int.MAX_VALUE).toInt() + 500_000)
+    }
+
     private fun schedule(at: LocalDateTime, pendingIntent: PendingIntent) {
         val millis = at.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
         try {

@@ -1,6 +1,8 @@
 package com.healthtimeline.app
 
 import android.os.Bundle
+import android.content.Intent
+import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.healthtimeline.app.ui.AppViewModel
@@ -28,10 +32,17 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import com.healthtimeline.app.reminders.NotificationReviewRequest
+import com.healthtimeline.app.reminders.ReminderReceiver
 
 class MainActivity : FragmentActivity() {
+    private var incomingReminder by mutableStateOf<NotificationReviewRequest?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Medical screens must not appear in screenshots, recordings or recent-task thumbnails.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        incomingReminder = readReminderIntent(intent)
         val app = application as HealthTimelineApplication
         setContent {
             HealthTimelineTheme {
@@ -67,7 +78,9 @@ class MainActivity : FragmentActivity() {
                     HealthTimelineRoot(
                         viewModel = model,
                         appLockManager = app.appLockManager,
-                        authenticate = ::authenticate
+                        authenticate = ::authenticate,
+                        notificationReview = incomingReminder,
+                        onNotificationReviewConsumed = ::consumeReminder
                     )
                 } else {
                     Surface {
@@ -86,6 +99,29 @@ class MainActivity : FragmentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        incomingReminder = readReminderIntent(intent)
+    }
+
+    private fun readReminderIntent(value: Intent?): NotificationReviewRequest? {
+        val medicationId = value?.getLongExtra(ReminderReceiver.EXTRA_MEDICATION_ID, -1L) ?: return null
+        val scheduleId = value.getLongExtra(ReminderReceiver.EXTRA_ID, -1L)
+        val scheduledAt = value.getStringExtra(ReminderReceiver.EXTRA_SCHEDULED_AT) ?: return null
+        return NotificationReviewRequest(medicationId, scheduleId, scheduledAt).takeIf { it.plannedTimeOrNull() != null }
+    }
+
+    private fun consumeReminder(request: NotificationReviewRequest) {
+        if (incomingReminder != request) return
+        incomingReminder = null
+        intent?.apply {
+            removeExtra(ReminderReceiver.EXTRA_MEDICATION_ID)
+            removeExtra(ReminderReceiver.EXTRA_ID)
+            removeExtra(ReminderReceiver.EXTRA_SCHEDULED_AT)
         }
     }
 

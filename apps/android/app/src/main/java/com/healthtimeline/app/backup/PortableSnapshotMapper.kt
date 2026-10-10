@@ -108,14 +108,15 @@ internal object PortableSnapshotMapper {
                     it.updatedAt
                 )
             }
-        ).also(PortableSnapshotValidator::validate)
+        ).canonicalized().also(PortableSnapshotValidator::validate)
     }
 
     fun toEntities(
-        portable: PortableSnapshot,
+        source: PortableSnapshot,
         current: BackupSnapshot,
         attachmentPath: (PortableAttachment, AttachmentEntity?) -> String
     ): BackupSnapshot {
+        val portable = source.canonicalized()
         PortableSnapshotValidator.validate(portable)
         fun ids(uuids: List<String>, existing: Map<String, Long>): Map<String, Long> {
             var next = existing.values.maxOrNull() ?: 0L
@@ -123,16 +124,16 @@ internal object PortableSnapshotMapper {
         }
 
         require(portable.schemaVersion == BACKUP_SCHEMA_VERSION) { "备份尚未转换为家庭档案格式" }
-        val memberIds = ids(portable.members.map { it.uuid }, current.members.associate { it.uuid to it.id })
-        val conditionIds = ids(portable.conditions.map { it.uuid }, current.conditions.associate { it.uuid to it.id })
-        val recordIds = ids(portable.records.map { it.uuid }, current.records.associate { it.uuid to it.id })
-        val attachmentIds = ids(portable.attachments.map { it.uuid }, current.attachments.associate { it.uuid to it.id })
-        val followUpIds = ids(portable.followUps.map { it.uuid }, current.followUps.associate { it.uuid to it.id })
-        val occurrenceIds = ids(portable.occurrences.map { it.uuid }, current.occurrences.associate { it.uuid to it.id })
-        val medicationIds = ids(portable.medications.map { it.uuid }, current.medications.associate { it.uuid to it.id })
-        val medicationScheduleIds = ids(portable.medicationSchedules.map { it.uuid }, current.medicationSchedules.associate { it.uuid to it.id })
-        val medicationLogIds = ids(portable.medicationLogs.map { it.uuid }, current.medicationLogs.associate { it.uuid to it.id })
-        val currentAttachments = current.attachments.associateBy { it.uuid }
+        val memberIds = ids(portable.members.map { it.uuid }, current.members.associate { it.uuid.lowercase() to it.id })
+        val conditionIds = ids(portable.conditions.map { it.uuid }, current.conditions.associate { it.uuid.lowercase() to it.id })
+        val recordIds = ids(portable.records.map { it.uuid }, current.records.associate { it.uuid.lowercase() to it.id })
+        val attachmentIds = ids(portable.attachments.map { it.uuid }, current.attachments.associate { it.uuid.lowercase() to it.id })
+        val followUpIds = ids(portable.followUps.map { it.uuid }, current.followUps.associate { it.uuid.lowercase() to it.id })
+        val occurrenceIds = ids(portable.occurrences.map { it.uuid }, current.occurrences.associate { it.uuid.lowercase() to it.id })
+        val medicationIds = ids(portable.medications.map { it.uuid }, current.medications.associate { it.uuid.lowercase() to it.id })
+        val medicationScheduleIds = ids(portable.medicationSchedules.map { it.uuid }, current.medicationSchedules.associate { it.uuid.lowercase() to it.id })
+        val medicationLogIds = ids(portable.medicationLogs.map { it.uuid }, current.medicationLogs.associate { it.uuid.lowercase() to it.id })
+        val currentAttachments = current.attachments.associateBy { it.uuid.lowercase() }
 
         return BackupSnapshot(
             members = portable.members.map {

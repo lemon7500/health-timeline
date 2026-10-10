@@ -13,7 +13,8 @@ object PortableSnapshotValidator {
     private val sha256Pattern = Regex("[0-9a-f]{64}")
     private val timePattern = Regex("(?:[01]\\d|2[0-3]):[0-5]\\d")
 
-    fun validate(value: PortableSnapshot) {
+    fun validate(source: PortableSnapshot) {
+        val value = source.canonicalized()
         require(
             value.schemaVersion in setOf(
                 LEGACY_PORTABLE_BACKUP_SCHEMA_VERSION,
@@ -83,7 +84,9 @@ object PortableSnapshotValidator {
             require(listOf(it.symptoms, it.diagnosis, it.treatment, it.medicationNotes, it.notes).all { text -> text.length <= 20_000 }) { "病历内容过长" }
             require(it.hospital.length <= 200 && it.clinician.length <= 100) { "医院或医生信息过长" }
             timestamps(it.createdAt, it.updatedAt)
-            if (value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION) require(it.dayOrder >= 0) { "病历日期内顺序异常" }
+            if (value.schemaVersion >= PREVIOUS_BACKUP_SCHEMA_VERSION) {
+                require(it.dayOrder in 0..(Long.MAX_VALUE - MAX_ROWS)) { "病历日期内顺序异常" }
+            }
             it.deletedAt?.let(::instant)
         }
         val archivePaths = hashSetOf<String>()

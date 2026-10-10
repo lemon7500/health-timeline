@@ -22,6 +22,7 @@ export function emptyState(): HealthState {
 }
 
 export function normalizeState(value: HealthState): HealthState {
+  if (value.schemaVersion > 4) throw new Error('此版本不支持 v5 或更高版本资料，请勿降级导入');
   const fallback = emptyState();
   if (!value.installationId) value.installationId = fallback.installationId;
   if (!value.members || value.members.length === 0) value.members = fallback.members;
@@ -82,11 +83,20 @@ export function validateState(value: HealthState): void {
   value.followUps.forEach(item => { if (!members.has(item.memberUuid) || !item.title.trim() || !validDay(item.anchorDate) || !validDay(item.nextDueDate) || item.leadDays < 0 || (item.conditionUuid && conditionMember.get(item.conditionUuid) !== item.memberUuid)) throw new Error('复查计划异常'); });
   value.occurrences.forEach(item => { const key = `${item.scheduleUuid}:${item.dueDate}`; if (!followIds.has(item.scheduleUuid) || occurrenceKeys.has(key)) throw new Error('复查记录异常或重复'); occurrenceKeys.add(key); });
   const medicationMember = new Map(value.medications.map(item => [item.uuid, item.memberUuid]));
-  value.medications.forEach(item => { if (!members.has(item.memberUuid) || !item.name.trim() || !item.doseAmount.trim() || !item.doseUnit.trim() || !validDay(item.startDate) || (item.endDate && (!validDay(item.endDate) || item.endDate < item.startDate)) || (item.conditionUuid && conditionMember.get(item.conditionUuid) !== item.memberUuid)) throw new Error('药物内容异常'); });
+  value.medications.forEach(item => { if (!members.has(item.memberUuid) || !item.name.trim() || !item.doseAmount.trim() || !item.doseUnit.trim() || !validDay(item.startDate) || (item.endDate && (!validDay(item.endDate) || item.endDate < item.startDate)) || (item.archivedPreviousEndDate && (!validDay(item.archivedPreviousEndDate) || item.archivedPreviousEndDate < item.startDate)) || (item.endedAt && (!item.archived || !item.endDate || !Number.isFinite(Date.parse(item.endedAt)))) || (item.conditionUuid && conditionMember.get(item.conditionUuid) !== item.memberUuid)) throw new Error('药物内容异常'); });
+  const medicationsById = new Map(value.medications.map(item => [item.uuid, item]));
   const scheduleMedication = new Map(value.medicationSchedules.map(item => [item.uuid, item.medicationUuid]));
-  value.medicationSchedules.forEach(item => { if (!medicationMember.has(item.medicationUuid) || !validDay(item.effectiveFrom) || (item.effectiveTo && (!validDay(item.effectiveTo) || item.effectiveTo < item.effectiveFrom)) || !validTime(item.localTime) || !item.doseAmountSnapshot || !item.doseUnitSnapshot) throw new Error('用药计划异常'); });
+  value.medicationSchedules.forEach(item => {
+    const medication = medicationsById.get(item.medicationUuid);
+    if (!medication || !validDay(item.effectiveFrom) || item.effectiveFrom < medication.startDate || (item.effectiveTo && (!validDay(item.effectiveTo) || item.effectiveTo < item.effectiveFrom)) || !validTime(item.localTime) || !item.doseAmountSnapshot || !item.doseUnitSnapshot || (item.pausedByCourseEnd && (item.enabled || !medication.archived || !medication.endedAt)) || (medication.endDate && !item.pausedByCourseEnd && (!item.effectiveTo || item.effectiveTo > medication.endDate))) throw new Error('用药计划或结束暂停标记异常');
+  });
   const logKeys = new Set<string>();
-  value.medicationLogs.forEach(item => { const key = `${item.medicationUuid}:${item.scheduledAt}`; if (!medicationMember.has(item.medicationUuid) || (item.scheduleUuid && scheduleMedication.get(item.scheduleUuid) !== item.medicationUuid) || !['TAKEN', 'SKIPPED'].includes(item.status) || logKeys.has(key)) throw new Error('用药记录异常或重复'); logKeys.add(key); });
+  value.medicationLogs.forEach(item => {
+    const planned = item.scheduledAt.length === 16 ? `${item.scheduledAt}:00` : item.scheduledAt.replace(/\.0+$/, '');
+    const key = `${item.medicationUuid}:${planned}`;
+    if (!medicationMember.has(item.medicationUuid) || !validLocalDateTime(item.scheduledAt) || (item.actualAt && !validLocalDateTime(item.actualAt)) || (item.scheduleUuid && scheduleMedication.get(item.scheduleUuid) !== item.medicationUuid) || !['TAKEN', 'SKIPPED'].includes(item.status) || logKeys.has(key)) throw new Error('用药记录异常或重复');
+    logKeys.add(key);
+  });
 }
 
 function unique(values: string[], label: string): void { if (new Set(values).size !== values.length) throw new Error(`${label} UUID 重复`); }
@@ -97,3 +107,6 @@ function validDay(value: string): boolean {
   return date.getFullYear() === parts[0] && date.getMonth() === parts[1] - 1 && date.getDate() === parts[2];
 }
 function validTime(value: string): boolean { return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value); }
+function validLocalDateTime(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?$/.test(value) && validDay(value.substring(0, 10));
+}

@@ -183,6 +183,8 @@ interface MedicationDao {
     @Query("SELECT * FROM medication_logs WHERE id = :id") suspend fun logById(id: Long): MedicationLogEntity?
     @Query("SELECT COUNT(*) FROM medication_logs WHERE medicationId = :medicationId AND scheduledAt >= :startAt AND scheduledAt < :endAt")
     suspend fun logCountBetween(medicationId: Long, startAt: String, endAt: String): Int
+    @Query("SELECT MIN(substr(scheduledAt, 1, 10)) FROM medication_logs WHERE medicationId = :medicationId")
+    suspend fun earliestLogDate(medicationId: Long): String?
     @Query("SELECT * FROM medication_logs ORDER BY id") suspend fun allLogs(): List<MedicationLogEntity>
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertLog(value: MedicationLogEntity): Long
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insertLogs(values: List<MedicationLogEntity>)

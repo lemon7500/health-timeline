@@ -18,7 +18,7 @@ struct HealthTimelineApp: App {
             .environmentObject(lock)
             .task {
                 if lock.enabled { _ = await lock.authenticate() }
-                await LocalReminderScheduler.rebuild(store.state)
+                if store.storageReady { await LocalReminderScheduler.rebuild(store.state) }
             }
             .onChange(of: scenePhase) { lock.handle($0) }
             .alert("数据操作未完成", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.clearError() } })) {

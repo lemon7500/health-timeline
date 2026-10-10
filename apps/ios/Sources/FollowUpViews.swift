@@ -3,10 +3,19 @@ import SwiftUI
 struct FollowUpHome: View {
     @EnvironmentObject private var store: HealthStore
     @State private var adding = false
+    @State private var pendingAction: FollowUpAction?
+
+    private struct FollowUpAction {
+        let scheduleId: UUID
+        let memberId: UUID
+        let dueDay: String
+        let title: String
+        let skipped: Bool
+    }
 
     private var schedules: [FollowUpSchedule] {
         guard let memberId = store.currentMemberId else { return [] }
-        return store.state.followUps.filter { $0.memberId == memberId && $0.enabled }.sorted { $0.nextDueDate < $1.nextDueDate }
+        return store.state.followUps.filter { $0.memberId == memberId && $0.enabled }.sorted { $0.$nextDueDate < $1.$nextDueDate }
     }
 
     var body: some View {
@@ -15,11 +24,13 @@ struct FollowUpHome: View {
                 ForEach(schedules) { value in
                     VStack(alignment: .leading, spacing: 6) {
                         Text(value.title).font(.headline)
-                        Text("下次：\(value.nextDueDate.formatted(date: .abbreviated, time: .omitted)) · 提前 \(value.leadDays) 天")
+                        Text("下次：\(value.$nextDueDate) · 提前 \(value.leadDays) 天")
                             .font(.subheadline).foregroundStyle(.secondary)
-                        HStack {
-                            Button("完成") { store.completeFollowUp(value.id) }.buttonStyle(.borderedProminent)
-                            Button("跳过") { store.completeFollowUp(value.id, skipped: true) }.buttonStyle(.bordered)
+                        if value.$nextDueDate <= HealthDate.day(Date()), let memberId = value.memberId {
+                            HStack {
+                                Button("完成") { pendingAction = FollowUpAction(scheduleId: value.id, memberId: memberId, dueDay: value.$nextDueDate, title: value.title, skipped: false) }.buttonStyle(.borderedProminent)
+                                Button("跳过") { pendingAction = FollowUpAction(scheduleId: value.id, memberId: memberId, dueDay: value.$nextDueDate, title: value.title, skipped: true) }.buttonStyle(.bordered)
+                            }
                         }
                     }.padding(.vertical, 4)
                 }
@@ -31,6 +42,16 @@ struct FollowUpHome: View {
                 ToolbarItem(placement: .navigationBarTrailing) { Button { adding = true } label: { Image(systemName: "plus") } }
             }
             .sheet(isPresented: $adding) { FollowUpEditor(memberId: store.currentMemberId) }
+            .onChange(of: store.currentMemberId) { _ in pendingAction = nil }
+            .confirmationDialog("核对复查事项", isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } }), presenting: pendingAction) { action in
+                Button(action.skipped ? "确认跳过" : "确认完成") {
+                    _ = store.completeFollowUp(action.scheduleId, dueDay: action.dueDay, memberId: action.memberId, skipped: action.skipped)
+                    pendingAction = nil
+                }
+                Button("取消", role: .cancel) { pendingAction = nil }
+            } message: { action in
+                Text("\(store.currentMember?.displayName ?? "") · \(action.title) · \(action.dueDay)")
+            }
         }
     }
 }

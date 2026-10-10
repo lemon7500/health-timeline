@@ -1,7 +1,8 @@
 import { promptAction } from '@kit.ArkUI';
 import { util } from '@kit.ArkTS';
 import { formatDate, nextOccurrence } from '../domain/Recurrence';
-import { ClinicalRecord, FollowUpSchedule, Medication, MedicationSchedule, newMember } from '../model/Models';
+import { MedicationDayEntry, MedicationHistory } from '../domain/MedicationHistory';
+import { ClinicalRecord, FollowUpSchedule, Medication, newMember } from '../model/Models';
 import { ReminderScheduler } from '../platform/ReminderScheduler';
 import { HealthStore } from '../store/HealthStore';
 
@@ -10,6 +11,8 @@ import { HealthStore } from '../store/HealthStore';
 struct Index {
   @State selected: number = 0;
   @State revision: number = 0;
+  @State storageReady: boolean = false;
+  @State storageError: string = '';
   @State query: string = '';
   @State month: Date = new Date();
   @State selectedMedicationDay: string = formatDate(new Date());
@@ -17,6 +20,19 @@ struct Index {
   @State showFollowUpForm: boolean = false;
   @State showMedicationForm: boolean = false;
   @State editingMedicationUuid: string = '';
+  @State medicationMemberUuid: string = '';
+  @State medicationSection: number = 0;
+  @State pendingAction: string = '';
+  @State pendingMemberUuid: string = '';
+  @State pendingMedicationUuid: string = '';
+  @State pendingScheduleUuid: string = '';
+  @State pendingLogUuid: string = '';
+  @State pendingUpdatedAt: string = '';
+  @State pendingDay: string = '';
+  @State pendingStatus: string = '';
+  @State pendingActualTime: string = '';
+  @State pendingSummary: string = '';
+  @State medicationBusy: boolean = false;
   @State showMemberForm: boolean = false;
   @State recordMemberUuid: string = '';
   @State editingRecordUuid: string = '';
@@ -43,17 +59,31 @@ struct Index {
   @State memberName: string = '';
   @State memberRelationship: string = '';
 
-  aboutToAppear(): void {
-    ReminderScheduler.rebuild(HealthStore.instance.state).catch(() => {});
+  async aboutToAppear(): Promise<void> {
+    try {
+      await HealthStore.instance.waitUntilInitialized();
+      this.storageReady = true; this.revision++;
+      ReminderScheduler.rebuild(HealthStore.instance.state).catch(() => {});
+    } catch (error) {
+      this.storageReady = false;
+      this.storageError = error instanceof Error ? error.message : '资料未能安全加载，请重新启动；原有资料没有清除';
+    }
   }
 
   build() {
-    Tabs({ barPosition: BarPosition.End, index: this.selected }) {
-      TabContent() { this.calendarPage() }.tabBar('日历')
-      TabContent() { this.followUpPage() }.tabBar('复查')
-      TabContent() { this.medicationPage() }.tabBar('用药')
-      TabContent() { this.settingsPage() }.tabBar('设置')
-    }.onChange(index => this.selected = index)
+    if (!this.storageReady) {
+      Column({ space: 12 }) {
+        Text(this.storageError || '正在安全加载本机资料…').fontSize(18)
+        Text('加载完成前不会写入资料或重建提醒。加载失败请勿卸载应用。').fontSize(14)
+      }.padding(20).width('100%').height('100%')
+    } else {
+      Tabs({ barPosition: BarPosition.End, index: this.selected }) {
+        TabContent() { this.calendarPage() }.tabBar('日历')
+        TabContent() { this.followUpPage() }.tabBar('复查')
+        TabContent() { this.medicationPage() }.tabBar('用药')
+        TabContent() { this.settingsPage() }.tabBar('设置')
+      }.onChange(index => this.selected = index)
+    }
   }
 
   @Builder memberSelector() {
@@ -66,7 +96,7 @@ struct Index {
           try {
             if (index < members.length) await HealthStore.instance.update(state => state.selectedMemberUuid = members[index].uuid);
           } catch (_) { promptAction.showToast({ message: '成员切换失败，原有资料没有改变' }); return; }
-          this.revision++;
+          this.closeMedicationForm(); this.pendingAction = ''; this.revision++;
         })
     }.width('100%')
   }
@@ -157,36 +187,66 @@ struct Index {
           GridItem() { Button(day.substring(8)).onClick(() => this.selectedMedicationDay = day).backgroundColor(day === this.selectedMedicationDay ? '#D8E8FF' : '#FFFFFF') }
         })
       }.columnsTemplate('1fr 1fr 1fr 1fr 1fr 1fr 1fr').height(190)
-      if (this.selectedMedicationDay <= formatDate(new Date())) {
+      Row({ space: 6 }) {
+        Button('当日明细').onClick(() => this.medicationSection = 0)
+        Button('用药疗程').onClick(() => this.medicationSection = 1)
+        Button('已结束用药').onClick(() => this.medicationSection = 2)
+      }
+      if (this.pendingAction.length > 0) {
+        Column({ space: 6 }) {
+          Text(this.pendingSummary).fontSize(14).width('100%')
+          Row({ space: 8 }) {
+            Button('确认').enabled(!this.medicationBusy).onClick(() => this.confirmMedicationAction())
+            Button('取消').enabled(!this.medicationBusy).onClick(() => this.pendingAction = '')
+          }
+        }.padding(8).backgroundColor('#FFF3D8').borderRadius(8)
+      }
+      if (this.medicationSection === 0 && this.selectedMedicationDay <= formatDate(new Date())) {
         Text(`实际服用时间 ${this.twoDigits(this.doseHour)}:${this.twoDigits(this.doseMinute)}（每 5 分钟）`).width('100%')
         Slider({ value: this.doseHour, min: 0, max: 23, step: 1 }).onChange(value => this.doseHour = Math.round(value))
         Slider({ value: this.doseMinute, min: 0, max: 55, step: 5 }).onChange(value => this.doseMinute = Math.round(value / 5) * 5)
-      } else {
+      } else if (this.medicationSection === 0) {
         Text('未来日期仅供查看，不能提前打卡。').fontSize(13).fontColor('#A06000').width('100%')
       }
       List() {
-        ForEach(HealthStore.instance.medicationsForCurrentMember().filter(item => !item.archived && item.startDate <= this.selectedMedicationDay && (!item.endDate || item.endDate >= this.selectedMedicationDay)), (item: Medication) => {
-          ListItem() {
-            Column({ space: 6 }) {
-              Text(`${item.name} ${item.doseAmount}${item.doseUnit}`).fontSize(18)
-              ForEach(HealthStore.instance.schedulesForDay(item, this.selectedMedicationDay), (schedule: MedicationSchedule) => {
+        if (this.medicationSection === 0) {
+          ForEach(HealthStore.instance.medicationEntriesForDay(this.selectedMedicationDay), (entry: MedicationDayEntry) => {
+            ListItem() {
+              Column({ space: 6 }) {
+                Text(`${entry.medication.name} ${entry.doseAmount}${entry.doseUnit}`).fontSize(18)
+                Text(`${entry.plannedAt.substring(11, 16)} · ${this.entryStatus(entry)}`).fontSize(14)
+                if (entry.medication.archived) Text('疗程已结束；历史记录仍保留').fontSize(12).fontColor('#666666')
                 Row({ space: 8 }) {
-                  Text(`${schedule.localTime} · ${this.logStatus(item, schedule)}`).layoutWeight(1)
-                  Button('已服').enabled(this.selectedMedicationDay <= formatDate(new Date())).onClick(() => this.markDose(item, schedule, 'TAKEN'))
-                  Button('跳过').enabled(this.selectedMedicationDay <= formatDate(new Date())).onClick(() => this.markDose(item, schedule, 'SKIPPED'))
+                  if (this.selectedMedicationDay <= formatDate(new Date()) && (entry.log || !entry.medication.archived)) {
+                    Button(entry.log ? '修正为已服' : '已服').enabled(!this.medicationBusy).onClick(() => this.prepareDose(entry, 'TAKEN'))
+                    Button(entry.log ? '修正为跳过' : '跳过').enabled(!this.medicationBusy).onClick(() => this.prepareDose(entry, 'SKIPPED'))
+                  }
                 }
-              }, (schedule: MedicationSchedule) => schedule.uuid)
-              Row({ space: 8 }) {
-                if (item.startDate <= formatDate(new Date()) && (!item.endDate || item.endDate >= formatDate(new Date()))) {
-                  Button('修改计划').onClick(() => this.beginMedicationEdit(item))
-                  Button('今日结束疗程').onClick(() => this.endMedication(item))
+              }.alignItems(HorizontalAlign.Start).padding(8)
+            }
+          }, (entry: MedicationDayEntry) => entry.log?.uuid ?? `${entry.schedule?.uuid}:${entry.plannedAt}`)
+        } else {
+          ForEach(HealthStore.instance.medicationsForCurrentMember().filter(item => this.medicationSection === 2 ? item.archived : !item.archived), (item: Medication) => {
+            ListItem() {
+              Column({ space: 6 }) {
+                Text(`${item.name} ${item.doseAmount}${item.doseUnit}`).fontSize(18)
+                Text(`开始：${item.startDate} · 结束：${item.endDate ?? '未设置'}`).fontSize(13)
+                if (item.archived) {
+                  Text(`结束操作：${item.endedAt ? new Date(item.endedAt).toLocaleString() : '旧资料未记录操作时间'}`).fontSize(13)
+                  if (item.endedAt) Button('恢复疗程（需确认）').enabled(!this.medicationBusy).onClick(() => this.prepareCourseAction(item, 'RESTORE'))
+                } else {
+                  Row({ space: 8 }) {
+                    Button('修改计划').enabled(!this.medicationBusy).onClick(() => this.beginMedicationEdit(item))
+                    if (item.startDate <= formatDate(new Date()) && (!item.endDate || item.endDate >= formatDate(new Date()))) Button('今日结束疗程').enabled(!this.medicationBusy).onClick(() => this.prepareCourseAction(item, 'END'))
+                  }
+                  if (item.mode === 'AS_NEEDED' && this.selectedMedicationDay <= formatDate(new Date())) Button('补记按需用药').enabled(!this.medicationBusy).onClick(() => this.prepareDose({ medication: item, plannedAt: `${this.selectedMedicationDay}T00:00:00`, doseAmount: item.doseAmount, doseUnit: item.doseUnit }, 'TAKEN'))
                 }
-              }
-            }.alignItems(HorizontalAlign.Start).padding(8)
-          }
-        }, (item: Medication) => item.uuid)
+              }.alignItems(HorizontalAlign.Start).padding(8)
+            }
+          }, (item: Medication) => item.uuid)
+        }
       }.layoutWeight(1)
-      Button(this.showMedicationForm ? '取消用药表单' : '新增用药').onClick(() => this.showMedicationForm ? this.closeMedicationForm() : this.beginNewMedication())
+      Button(this.showMedicationForm ? '取消用药表单' : '新增用药').enabled(!this.medicationBusy).onClick(() => this.showMedicationForm ? this.closeMedicationForm() : this.beginNewMedication())
       if (this.showMedicationForm) this.medicationForm()
     }.padding(16).width('100%').height('100%')
   }
@@ -202,7 +262,7 @@ struct Index {
       Slider({ value: this.medicationHour, min: 0, max: 23, step: 1 }).onChange(value => this.medicationHour = Math.round(value))
       Slider({ value: this.medicationMinute, min: 0, max: 55, step: 5 }).onChange(value => this.medicationMinute = Math.round(value / 5) * 5)
       if (this.editingMedicationUuid.length > 0) Text('修改默认从明天生效，过去的时间和剂量保持不变。').fontSize(12).fontColor('#666666')
-      Button(this.editingMedicationUuid.length > 0 ? '保存修改（明日起生效）' : '保存用药').onClick(() => this.saveMedication())
+      Button(this.editingMedicationUuid.length > 0 ? '保存修改（明日起生效）' : '保存用药').enabled(!this.medicationBusy).onClick(() => this.saveMedication())
     }
   }
 
@@ -308,31 +368,34 @@ struct Index {
   }
 
   private async saveMedication(): Promise<void> {
+    if (this.medicationBusy) return;
     if (this.medicationName.trim().length === 0 || this.medicationAmount.trim().length === 0 || this.medicationUnit.trim().length === 0) { promptAction.showToast({ message: '请填写药名、剂量和单位' }); return; }
-    const member = HealthStore.instance.currentMember(); const now = new Date().toISOString(); const medicationUuid = this.editingMedicationUuid.length > 0 ? this.editingMedicationUuid : util.generateRandomUUID(true); const time = `${this.twoDigits(this.medicationHour)}:${this.twoDigits(this.medicationMinute)}`;
+    const memberUuid = this.medicationMemberUuid; const editingUuid = this.editingMedicationUuid;
+    const name = this.medicationName.trim(); const amount = this.medicationAmount.trim(); const unit = this.medicationUnit.trim();
+    const now = new Date().toISOString(); const medicationUuid = editingUuid.length > 0 ? editingUuid : util.generateRandomUUID(true); const time = `${this.twoDigits(this.medicationHour)}:${this.twoDigits(this.medicationMinute)}`;
+    const today = formatDate(new Date()); const tomorrowDate = new Date(); tomorrowDate.setDate(tomorrowDate.getDate() + 1); const tomorrow = formatDate(tomorrowDate);
+    this.medicationBusy = true;
     try { await HealthStore.instance.update(state => {
-      const existing = state.medications.find(item => item.uuid === this.editingMedicationUuid);
-      if (existing) {
-        if (existing.memberUuid !== member.uuid) throw new Error('不能更改药物所属成员');
-        const today = formatDate(new Date()); const tomorrowDate = new Date(); tomorrowDate.setDate(tomorrowDate.getDate() + 1); const tomorrow = formatDate(tomorrowDate);
-        state.medicationSchedules = state.medicationSchedules.filter(schedule => schedule.medicationUuid !== existing.uuid || schedule.effectiveFrom < tomorrow);
-        state.medicationSchedules.filter(schedule => schedule.medicationUuid === existing.uuid && (!schedule.effectiveTo || schedule.effectiveTo >= tomorrow)).forEach(schedule => { schedule.effectiveTo = today; schedule.updatedAt = now; });
-        existing.name = this.medicationName.trim(); existing.doseAmount = this.medicationAmount.trim(); existing.doseUnit = this.medicationUnit.trim(); existing.updatedAt = now;
-        state.medicationSchedules.push({ uuid: util.generateRandomUUID(true), medicationUuid: existing.uuid, localTime: time, enabled: true, effectiveFrom: tomorrow, doseAmountSnapshot: existing.doseAmount, doseUnitSnapshot: existing.doseUnit, updatedAt: now });
+      if (state.selectedMemberUuid !== memberUuid || !state.members.some(item => item.uuid === memberUuid && !item.archived)) throw new Error('成员已变化，请重新打开表单');
+      if (editingUuid) {
+        MedicationHistory.changeSchedule(state, memberUuid, editingUuid, name, amount, unit, time, today, tomorrow, now, util.generateRandomUUID(true));
       } else {
-        state.medications.push({ uuid: medicationUuid, memberUuid: member.uuid, name: this.medicationName.trim(), doseAmount: this.medicationAmount.trim(), doseUnit: this.medicationUnit.trim(), instructions: '', startDate: formatDate(new Date()), mode: 'SCHEDULED', archived: false, createdAt: now, updatedAt: now });
-        state.medicationSchedules.push({ uuid: util.generateRandomUUID(true), medicationUuid: medicationUuid, localTime: time, enabled: true, effectiveFrom: formatDate(new Date()), doseAmountSnapshot: this.medicationAmount.trim(), doseUnitSnapshot: this.medicationUnit.trim(), updatedAt: now });
+        state.medications.push({ uuid: medicationUuid, memberUuid: memberUuid, name: name, doseAmount: amount, doseUnit: unit, instructions: '', startDate: today, mode: 'SCHEDULED', archived: false, createdAt: now, updatedAt: now });
+        state.medicationSchedules.push({ uuid: util.generateRandomUUID(true), medicationUuid: medicationUuid, localTime: time, enabled: true, effectiveFrom: today, doseAmountSnapshot: amount, doseUnitSnapshot: unit, updatedAt: now });
       }
-    }); } catch (_) { promptAction.showToast({ message: '用药计划未保存，原有资料没有改变' }); return; }
+    }); } catch (error) { promptAction.showToast({ message: error instanceof Error ? error.message : '用药计划未保存，原有资料没有改变' }); return; }
+    finally { this.medicationBusy = false; }
     this.closeMedicationForm(); this.revision++; await ReminderScheduler.rebuild(HealthStore.instance.state);
   }
 
   private beginNewMedication(): void {
+    this.medicationMemberUuid = HealthStore.instance.currentMember().uuid;
     this.editingMedicationUuid = ''; this.medicationName = ''; this.medicationAmount = '1'; this.medicationUnit = '片';
     this.medicationHour = 8; this.medicationMinute = 0; this.showMedicationForm = true;
   }
 
   private beginMedicationEdit(medication: Medication): void {
+    this.medicationMemberUuid = medication.memberUuid;
     this.editingMedicationUuid = medication.uuid; this.medicationName = medication.name;
     this.medicationAmount = medication.doseAmount; this.medicationUnit = medication.doseUnit;
     const tomorrowDate = new Date(); tomorrowDate.setDate(tomorrowDate.getDate() + 1); const tomorrow = formatDate(tomorrowDate);
@@ -341,36 +404,47 @@ struct Index {
     this.medicationHour = parts[0]; this.medicationMinute = parts[1]; this.showMedicationForm = true;
   }
 
-  private closeMedicationForm(): void { this.showMedicationForm = false; this.editingMedicationUuid = ''; this.medicationName = ''; }
+  private closeMedicationForm(): void { this.showMedicationForm = false; this.editingMedicationUuid = ''; this.medicationMemberUuid = ''; this.medicationName = ''; }
 
-  private async endMedication(medication: Medication): Promise<void> {
-    try { await HealthStore.instance.update(state => {
-      const target = state.medications.find(item => item.uuid === medication.uuid); if (!target) return;
-      const today = formatDate(new Date()); const endedAt = new Date().toISOString();
-      target.archivedPreviousEndDate = target.endDate; target.endDate = today;
-      target.endedAt = endedAt; target.archived = true; target.updatedAt = endedAt;
-      state.medicationSchedules.filter(item => item.medicationUuid === target.uuid && item.enabled).forEach(item => {
-        item.enabled = false; item.pausedByCourseEnd = true; item.updatedAt = endedAt;
-      });
-    }); } catch (_) { promptAction.showToast({ message: '疗程结束日期未保存' }); return; }
-    this.revision++; await ReminderScheduler.rebuild(HealthStore.instance.state);
+  private prepareCourseAction(medication: Medication, action: string): void {
+    this.pendingMemberUuid = HealthStore.instance.currentMember().uuid; this.pendingMedicationUuid = medication.uuid;
+    this.pendingUpdatedAt = medication.updatedAt;
+    this.pendingDay = formatDate(new Date()); this.pendingAction = action;
+    this.pendingSummary = `${HealthStore.instance.currentMember().relationship} · ${medication.name}：确认${action === 'END' ? '今日结束疗程（历史记录保留）' : '恢复结束前的疗程与提醒'}？`;
   }
 
-  private logStatus(medication: Medication, schedule: MedicationSchedule): string {
-    const log = HealthStore.instance.logsForDay(medication, this.selectedMedicationDay).find(item => item.scheduleUuid === schedule.uuid);
+  private entryStatus(entry: MedicationDayEntry): string {
+    const log = entry.log;
     return !log ? '未记录' : log.status === 'TAKEN' ? `已服 ${log.actualAt?.substring(11, 16) ?? ''}` : '已跳过';
   }
 
-  private async markDose(medication: Medication, schedule: MedicationSchedule, status: string): Promise<void> {
-    if (this.selectedMedicationDay > formatDate(new Date())) { promptAction.showToast({ message: '未来日期不能提前打卡' }); return; }
-    const scheduledAt = `${this.selectedMedicationDay}T${schedule.localTime}:00`;
-    try { await HealthStore.instance.update(state => {
-      const existing = state.medicationLogs.find(item => item.medicationUuid === medication.uuid && item.scheduleUuid === schedule.uuid && item.scheduledAt === scheduledAt);
-      const now = new Date(); const actual = `${this.selectedMedicationDay}T${this.twoDigits(this.doseHour)}:${this.twoDigits(this.doseMinute)}:00`;
-      if (existing) { existing.status = status; existing.actualAt = status === 'TAKEN' ? actual : undefined; existing.updatedAt = now.toISOString(); return; }
-      state.medicationLogs.push({ uuid: util.generateRandomUUID(true), medicationUuid: medication.uuid, scheduleUuid: schedule.uuid, scheduledAt: scheduledAt, actualAt: status === 'TAKEN' ? actual : undefined, status: status, doseAmountSnapshot: schedule.doseAmountSnapshot, doseUnitSnapshot: schedule.doseUnitSnapshot, createdAt: now.toISOString(), updatedAt: now.toISOString() });
-    }); } catch (_) { promptAction.showToast({ message: '用药记录未保存，请稍后重试' }); return; }
-    this.revision++;
+  private prepareDose(entry: MedicationDayEntry, status: string): void {
+    this.pendingMemberUuid = HealthStore.instance.currentMember().uuid; this.pendingMedicationUuid = entry.medication.uuid;
+    this.pendingScheduleUuid = entry.log?.scheduleUuid ?? entry.schedule?.uuid ?? ''; this.pendingLogUuid = entry.log?.uuid ?? '';
+    this.pendingUpdatedAt = entry.log?.updatedAt ?? entry.schedule?.updatedAt ?? entry.medication.updatedAt;
+    this.pendingDay = this.selectedMedicationDay; this.pendingStatus = status;
+    this.pendingActualTime = `${this.twoDigits(this.doseHour)}:${this.twoDigits(this.doseMinute)}`; this.pendingAction = 'DOSE';
+    this.pendingSummary = `${HealthStore.instance.currentMember().relationship} · ${entry.medication.name} ${entry.doseAmount}${entry.doseUnit} · ${this.pendingDay}：确认${entry.log ? '修正为' : '记录为'}${status === 'TAKEN' ? `已服（实际 ${this.pendingActualTime}）` : '跳过（不填写实际服用时间）'}？`;
+  }
+
+  private async confirmMedicationAction(): Promise<void> {
+    if (this.medicationBusy || !this.pendingAction) return;
+    const action = this.pendingAction; const memberUuid = this.pendingMemberUuid; const medicationUuid = this.pendingMedicationUuid;
+    const scheduleUuid = this.pendingScheduleUuid; const logUuid = this.pendingLogUuid; const day = this.pendingDay; const updatedAt = this.pendingUpdatedAt;
+    const status = this.pendingStatus; const time = this.pendingActualTime; const now = new Date().toISOString(); const today = formatDate(new Date());
+    this.medicationBusy = true; this.pendingAction = '';
+    try {
+      await HealthStore.instance.update(state => {
+        if (action !== 'DOSE' && day !== today) throw new Error('日期已变化，请重新核对疗程');
+        if (action !== 'DOSE' && !state.medications.some(item => item.uuid === medicationUuid && item.updatedAt === updatedAt)) throw new Error('疗程已变化，请重新打开后核对');
+        if (action === 'END') MedicationHistory.endCourse(state, memberUuid, medicationUuid, today, now);
+        else if (action === 'RESTORE') MedicationHistory.restoreCourse(state, memberUuid, medicationUuid, now);
+        else MedicationHistory.recordDose(state, memberUuid, medicationUuid, scheduleUuid, day, status, time, today, now, util.generateRandomUUID(true), logUuid, updatedAt);
+      });
+      this.revision++;
+      await ReminderScheduler.rebuild(HealthStore.instance.state);
+    } catch (error) { promptAction.showToast({ message: error instanceof Error ? error.message : '操作未完成，请刷新后核对' }); }
+    finally { this.medicationBusy = false; }
   }
 
   private async saveMember(): Promise<void> {
@@ -378,7 +452,7 @@ struct Index {
     const member = newMember(this.memberName.trim(), this.memberRelationship.trim());
     try { await HealthStore.instance.update(state => { state.members.push(member); state.selectedMemberUuid = member.uuid; }); }
     catch (_) { promptAction.showToast({ message: '成员未保存，原有资料没有改变' }); return; }
-    this.memberName = ''; this.memberRelationship = ''; this.showMemberForm = false; this.revision++;
+    this.memberName = ''; this.memberRelationship = ''; this.showMemberForm = false; this.closeMedicationForm(); this.pendingAction = ''; this.revision++;
   }
 
   private twoDigits(value: number): string { return `${value}`.padStart(2, '0'); }

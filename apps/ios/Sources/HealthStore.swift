@@ -6,16 +6,35 @@ final class HealthStore: ObservableObject {
     @Published private(set) var state = HealthState()
     @Published var errorMessage: String?
     @Published var noticeMessage: String?
-    private var database: SecureDatabase?
+    @Published private(set) var storageReady = false
+    private var database: (any HealthStateDatabase)?
 
-    init() {
+    init(
+        databaseFactory: () throws -> any HealthStateDatabase = { try SecureDatabase() },
+        reconcileAttachments: (HealthState) throws -> Void = {
+            try AttachmentFiles.reconcileTrash(liveAttachments: $0.attachments)
+            try? AttachmentFiles.reconcileRestoreDirectories(liveAttachments: $0.attachments)
+        }
+    ) {
         do {
-            database = try SecureDatabase()
-            var loaded = try database?.load() ?? HealthState()
-            if loaded.normalizeLegacyData() { try database?.save(loaded) }
+            let opened = try databaseFactory()
+            var loaded = try opened.load()
+            guard (0...1).contains(loaded.calendarDateEncodingVersion) else { throw StoreValidationError.message("本机日期编码版本不受支持") }
+            let migratedDates = loaded.calendarDateEncodingVersion == 0
+            guard (1...4).contains(loaded.schemaVersion) else { throw StoreValidationError.message("本机数据版本不受支持") }
+            guard loaded.records.count <= 100_000, loaded.records.allSatisfy({
+                $0.dayOrder == nil || (0...PortableBackupValidator.maximumDayOrder).contains($0.dayOrder!)
+            }) else { throw StoreValidationError.message("本机病历顺序异常，未修改已有资料") }
+            let changed = loaded.normalizeLegacyData()
+            _ = try PortableBackupMapper.export(loaded)
+            if changed { try opened.save(loaded) }
+            try reconcileAttachments(loaded)
+            database = opened
             state = loaded
-            try AttachmentFiles.reconcileTrash(liveAttachments: loaded.attachments)
-            try? AttachmentFiles.reconcileRestoreDirectories(liveAttachments: loaded.attachments)
+            storageReady = true
+            if migratedDates {
+                noticeMessage = "旧版未记录原录入时区，本次按手机当前时区（\(TimeZone.current.identifier)）解释旧日期和用药时间；原始加密资料已保留，请核对。"
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -30,10 +49,15 @@ final class HealthStore: ObservableObject {
 
     @discardableResult
     func mutate(_ change: (inout HealthState) throws -> Void) -> Bool {
+        guard storageReady else { errorMessage = "本机资料未安全加载，已禁止写入。请重新打开应用或先恢复备份。"; return false }
         guard errorMessage == nil else { return false }
         var candidate = state
         do {
             try change(&candidate)
+            // Every write must satisfy the same limits/references as startup and
+            // backup. Otherwise a valid-looking form could make the next launch
+            // reject its own stored data and lock the user out.
+            _ = try PortableBackupMapper.export(candidate)
             guard let database else { throw StorageError.database("数据库未打开") }
             try database.save(candidate)
             state = candidate
@@ -48,11 +72,13 @@ final class HealthStore: ObservableObject {
     func clearError() { errorMessage = nil }
 
     func exportBackup(password: String) throws -> Data {
-        try PortableBackupService.export(state: state, password: password)
+        try requireStorageReady()
+        return try PortableBackupService.export(state: state, password: password)
     }
 
     func prepareBackupImport(data: Data, password: String) throws -> PreparedPortableBackup {
-        try PortableBackupService.prepareImport(data: data, password: password, local: state, targetMember: currentMember)
+        try requireStorageReady()
+        return try PortableBackupService.prepareImport(data: data, password: password, local: state, targetMember: currentMember)
     }
 
     func mergeBackup(_ prepared: PreparedPortableBackup, useImported: Set<String> = []) -> Bool {
@@ -73,6 +99,7 @@ final class HealthStore: ObservableObject {
 
     func replaceBackup(_ prepared: PreparedPortableBackup, password: String) -> Bool {
         do {
+            try requireStorageReady()
             guard password.count >= 8 else { throw StoreValidationError.message("备份密码至少需要 8 位") }
             _ = try BackupSafetyStore.create(state: state, password: password)
             var replacement = prepared.importedState
@@ -102,6 +129,7 @@ final class HealthStore: ObservableObject {
         candidate source: HealthState,
         incomingAttachmentIds: Set<UUID>
     ) throws {
+        try requireStorageReady()
         guard let database else { throw StorageError.database("数据库未打开") }
         let previous = state
         let batchId = UUID()
@@ -139,6 +167,10 @@ final class HealthStore: ObservableObject {
             installed.forEach { try? AttachmentFiles.deleteImmediately($0) }
             throw error
         }
+    }
+
+    private func requireStorageReady() throws {
+        guard storageReady else { throw StorageError.database("本机资料未安全加载，操作已阻止") }
     }
 
     func selectMember(_ id: UUID) {
@@ -220,8 +252,8 @@ final class HealthStore: ObservableObject {
                     candidate.conditionId = condition.id
                 }
             }
-            let day = HealthDate.day(candidate.recordDate)
-            let next = value.records.filter { $0.memberId == memberId && HealthDate.day($0.recordDate) == day }.compactMap(\.dayOrder).max().map { $0 + 1 } ?? 0
+            let day = candidate.$recordDate
+            let next = value.records.filter { $0.memberId == memberId && $0.$recordDate == day }.compactMap(\.dayOrder).max().map { $0 + 1 } ?? 0
             candidate.dayOrder = next
             value.records.append(candidate)
         }
@@ -252,16 +284,18 @@ final class HealthStore: ObservableObject {
                     }
                 }
                 guard let date = HealthDate.parseDay(draft.recordDate) else { throw StoreValidationError.message("快速录入日期无效") }
-                let day = HealthDate.day(date)
-                let nextOrder = value.records.filter { $0.memberId == memberId && HealthDate.day($0.recordDate) == day }
+                let day = draft.recordDate
+                let nextOrder = value.records.filter { $0.memberId == memberId && $0.$recordDate == day }
                     .compactMap(\.dayOrder).max().map { $0 + 1 } ?? 0
-                value.records.append(ClinicalRecord(
+                var record = ClinicalRecord(
                     memberId: memberId, conditionId: conditionId, recordDate: date, dayOrder: nextOrder,
                     title: draft.title.trimmingCharacters(in: .whitespacesAndNewlines), stage: draft.stage,
                     symptoms: draft.symptoms, diagnosis: draft.diagnosis, treatment: draft.treatment,
                     medicationNotes: draft.medicationNotes, hospital: draft.hospital,
                     clinician: draft.clinician, notes: draft.notes
-                ))
+                )
+                try record.setRecordDay(day)
+                value.records.append(record)
             }
         }
     }
@@ -320,15 +354,33 @@ final class HealthStore: ObservableObject {
         return mutate { state in var item = value; item.memberId = memberId; item.updatedAt = Date(); state.followUps.append(item) }
     }
 
-    func completeFollowUp(_ id: UUID, skipped: Bool = false) {
-        mutate { value in
-            guard let index = value.followUps.firstIndex(where: { $0.id == id }) else { return }
+    @discardableResult
+    func completeFollowUp(_ id: UUID, dueDay: String, memberId: UUID, skipped: Bool = false, now: Date = Date()) -> Bool {
+        // The displayed cycle is immutable: a stale second tap cannot complete
+        // the newly advanced (possibly future) cycle or another member's event.
+        guard currentMemberId == memberId,
+              state.members.contains(where: { $0.id == memberId && !$0.archived }),
+              HealthDate.canonicalDay(dueDay) != nil, dueDay <= HealthDate.day(now),
+              let schedule = state.followUps.first(where: { $0.id == id && $0.memberId == memberId && $0.enabled }),
+              schedule.$nextDueDate == dueDay,
+              !state.occurrences.contains(where: { $0.scheduleId == id && $0.$dueDate == dueDay && $0.status != "PENDING" }) else { return false }
+        return mutate { value in
+            guard let index = value.followUps.firstIndex(where: { $0.id == id && $0.memberId == memberId && $0.enabled }),
+                  value.followUps[index].$nextDueDate == dueDay else { throw StoreValidationError.message("复查事项已变化，请重新核对") }
             let schedule = value.followUps[index]
-            guard !value.occurrences.contains(where: { $0.scheduleId == id && HealthDate.calendar.isDate($0.dueDate, inSameDayAs: schedule.nextDueDate) }) else { return }
-            value.occurrences.append(FollowUpOccurrence(scheduleId: id, dueDate: schedule.nextDueDate, status: skipped ? "SKIPPED" : "DONE", completedAt: Date()))
-            if let next = HealthDate.nextOccurrence(for: schedule) { value.followUps[index].nextDueDate = next }
+            if let existing = value.occurrences.firstIndex(where: { $0.scheduleId == id && $0.$dueDate == dueDay }) {
+                guard value.occurrences[existing].status == "PENDING" else { throw StoreValidationError.message("这次复查已经处理") }
+                value.occurrences[existing].status = skipped ? "SKIPPED" : "DONE"
+                value.occurrences[existing].completedAt = now
+                value.occurrences[existing].updatedAt = now
+            } else {
+                var occurrence = FollowUpOccurrence(scheduleId: id, dueDate: schedule.nextDueDate, status: skipped ? "SKIPPED" : "DONE", completedAt: now, createdAt: now, updatedAt: now)
+                try occurrence.setDueDay(dueDay)
+                value.occurrences.append(occurrence)
+            }
+            if let next = HealthDate.nextOccurrenceDay(for: schedule) { try value.followUps[index].setDueDays(anchor: schedule.$anchorDate, next: next) }
             else { value.followUps[index].enabled = false }
-            value.followUps[index].updatedAt = Date()
+            value.followUps[index].updatedAt = now
         }
     }
 
@@ -345,7 +397,7 @@ final class HealthStore: ObservableObject {
         let cleanUnit = medication.doseUnit.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty, cleanName.count <= 100, !cleanAmount.isEmpty, cleanAmount.count <= 30,
               !cleanUnit.isEmpty, cleanUnit.count <= 20 else { errorMessage = "药名、剂量或单位为空，或长度超过限制"; return false }
-        if let end = medication.endDate, end < HealthDate.calendar.startOfDay(for: medication.startDate) {
+        if let end = medication.$endDate, end < medication.$startDate {
             errorMessage = "结束日期不能早于开始日期"; return false
         }
         let normalized = Array(Set(times.filter(Self.validTime))).sorted()
@@ -364,8 +416,8 @@ final class HealthStore: ObservableObject {
                     value.medicationSchedules.append(MedicationSchedule(
                         medicationId: item.id,
                         localTime: time,
-                        effectiveFrom: HealthDate.day(item.startDate),
-                        effectiveTo: item.endDate.map(HealthDate.day),
+                        effectiveFrom: item.$startDate,
+                        effectiveTo: item.$endDate,
                         doseAmountSnapshot: item.doseAmount,
                         doseUnitSnapshot: item.doseUnit
                     ))
@@ -381,15 +433,18 @@ final class HealthStore: ObservableObject {
         guard !medication.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !medication.doseAmount.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !medication.doseUnit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { errorMessage = "请填写药名、剂量和单位"; return false }
-        guard effectiveDate >= HealthDate.calendar.startOfDay(for: medication.startDate) else { errorMessage = "生效日期不能早于疗程开始日期"; return false }
+        guard effectiveDay >= medication.$startDate else { errorMessage = "生效日期不能早于疗程开始日期"; return false }
         guard medication.mode == "AS_NEEDED" || !normalized.isEmpty else { errorMessage = "计划用药至少需要一个时间"; return false }
-        if state.medicationLogs.contains(where: { $0.medicationId == medication.id && HealthDate.day($0.scheduledAt) == effectiveDay }) {
-            errorMessage = "该生效日期已有用药记录，请改为次日生效"
+        if state.medicationLogs.contains(where: { $0.medicationId == medication.id && String($0.$scheduledAt.prefix(10)) >= effectiveDay }) {
+            errorMessage = "该生效日期或之后已有用药记录，不能覆盖历史计划，请选择更晚的生效日期"
             return false
         }
         return mutate { value in
             guard let index = value.medications.firstIndex(where: { $0.id == medication.id }) else { return }
-            let prior = HealthDate.calendar.date(byAdding: .day, value: -1, to: effectiveDate).map(HealthDate.day)
+            let prior = HealthDate.addingDays(-1, to: effectiveDay)
+            // Re-editing a future version replaces only unrecorded future plans.
+            // Referenced historical versions are never deleted (guard above).
+            value.medicationSchedules.removeAll { $0.medicationId == medication.id && $0.effectiveFrom >= effectiveDay }
             for scheduleIndex in value.medicationSchedules.indices where value.medicationSchedules[scheduleIndex].medicationId == medication.id
                 && value.medicationSchedules[scheduleIndex].effectiveFrom < effectiveDay
                 && (value.medicationSchedules[scheduleIndex].effectiveTo == nil || value.medicationSchedules[scheduleIndex].effectiveTo! >= effectiveDay) {
@@ -406,7 +461,7 @@ final class HealthStore: ObservableObject {
                         medicationId: updated.id,
                         localTime: time,
                         effectiveFrom: effectiveDay,
-                        effectiveTo: updated.endDate.map(HealthDate.day),
+                        effectiveTo: updated.$endDate,
                         doseAmountSnapshot: updated.doseAmount,
                         doseUnitSnapshot: updated.doseUnit
                     ))
@@ -425,13 +480,13 @@ final class HealthStore: ObservableObject {
             for schedule in schedules {
                 guard let planned = HealthDate.at(date, time: schedule.localTime) else { continue }
                 let log = state.medicationLogs.first {
-                    $0.medicationId == medication.id && $0.scheduleId == schedule.id && HealthDate.calendar.isDate($0.scheduledAt, equalTo: planned, toGranularity: .minute)
+                    $0.medicationId == medication.id && $0.scheduleId == schedule.id && String($0.$scheduledAt.prefix(16)) == "\(day)T\(schedule.localTime)"
                 }
                 result.append(MedicationDayEntry(medication: medication, schedule: schedule, log: log, plannedAt: planned, actualAt: log?.actualAt, status: log?.status ?? "UNRECORDED"))
             }
             let scheduledIds = Set(schedules.map(\.id))
             let extraLogs = state.medicationLogs.filter {
-                $0.medicationId == medication.id && HealthDate.calendar.isDate($0.scheduledAt, inSameDayAs: date)
+                $0.medicationId == medication.id && String($0.$scheduledAt.prefix(10)) == day
                     && ($0.scheduleId == nil || !scheduledIds.contains($0.scheduleId!))
             }
             extraLogs.forEach { log in result.append(MedicationDayEntry(medication: medication, schedule: nil, log: log, plannedAt: log.scheduledAt, actualAt: log.actualAt, status: log.status)) }
@@ -439,29 +494,61 @@ final class HealthStore: ObservableObject {
         return result.sorted { ($0.plannedAt ?? $0.actualAt ?? .distantPast) < ($1.plannedAt ?? $1.actualAt ?? .distantPast) }
     }
 
-    func recordDose(medication: Medication, schedule: MedicationSchedule?, scheduledAt: Date, actualAt: Date?, status: String) -> Bool {
+    func recordDose(medication: Medication, schedule: MedicationSchedule?, scheduledAt: Date, actualAt: Date?, status: String, now: Date = Date(), actualLocalTime: String? = nil) -> Bool {
         guard status == "TAKEN" || status == "SKIPPED" else { return false }
+        let day = HealthDate.day(scheduledAt)
+        guard storageReady, let memberId = currentMemberId,
+              state.members.contains(where: { $0.id == memberId && !$0.archived }),
+              let freshMedication = state.medications.first(where: { $0.id == medication.id && $0.memberId == memberId && !$0.archived }),
+              freshMedication == medication,
+              day <= HealthDate.day(now), HealthDate.isWithinCourse(scheduledAt, medication: freshMedication) else { return false }
+        let freshSchedule: MedicationSchedule?
+        if let schedule {
+            guard let fresh = state.medicationSchedules.first(where: { $0.id == schedule.id && $0.medicationId == medication.id }),
+                  fresh == schedule, fresh.enabled, fresh.effectiveFrom <= day,
+                  fresh.effectiveTo == nil || fresh.effectiveTo! >= day else { return false }
+            freshSchedule = fresh
+        } else {
+            guard freshMedication.mode == "AS_NEEDED" else { return false }
+            freshSchedule = nil
+        }
+        let takenAt = status == "TAKEN" ? actualAt ?? now : nil
+        let takenClock = status == "TAKEN" ? actualLocalTime ?? takenAt.map(HealthDate.localDateTime) : nil
+        guard takenClock == nil || (HealthDate.canonicalLocalDateTime(takenClock!) != nil && String(takenClock!.prefix(10)) == day
+                                   && HealthDate.canonicalLocalDateTime(takenClock!)! <= HealthDate.localDateTime(now)) else { return false }
+        let slot = schedule.map { "\(day)T\($0.localTime):00" } ?? takenClock ?? HealthDate.localDateTime(scheduledAt)
         return mutate { value in
-            guard !value.medicationLogs.contains(where: { $0.medicationId == medication.id && HealthDate.calendar.isDate($0.scheduledAt, equalTo: scheduledAt, toGranularity: .minute) }) else {
+            guard !value.medicationLogs.contains(where: { $0.medicationId == medication.id && $0.$scheduledAt.prefix(16) == slot.prefix(16) }) else {
                 throw StoreValidationError.message("这次用药已经记录")
             }
-            value.medicationLogs.append(MedicationLog(
+            var log = MedicationLog(
                 medicationId: medication.id,
-                scheduleId: schedule?.id,
+                scheduleId: freshSchedule?.id,
                 scheduledAt: scheduledAt,
-                actualAt: status == "TAKEN" ? actualAt ?? Date() : nil,
+                actualAt: takenAt,
                 status: status,
-                doseAmountSnapshot: schedule?.doseAmountSnapshot ?? medication.doseAmount,
-                doseUnitSnapshot: schedule?.doseUnitSnapshot ?? medication.doseUnit
-            ))
+                doseAmountSnapshot: freshSchedule?.doseAmountSnapshot ?? freshMedication.doseAmount,
+                doseUnitSnapshot: freshSchedule?.doseUnitSnapshot ?? freshMedication.doseUnit
+            )
+            try log.setLocalTimes(scheduled: slot, actual: takenClock)
+            value.medicationLogs.append(log)
         }
     }
 
-    func correctDose(logId: UUID, status: String, actualAt: Date?) -> Bool {
-        mutate { value in
+    func correctDose(logId: UUID, status: String, actualAt: Date?, actualLocalTime: String? = nil, now: Date = Date()) -> Bool {
+        guard status == "TAKEN" || status == "SKIPPED", let memberId = currentMemberId,
+              state.members.contains(where: { $0.id == memberId && !$0.archived }),
+              let log = state.medicationLogs.first(where: { $0.id == logId }),
+              state.medications.contains(where: { $0.id == log.medicationId && $0.memberId == memberId }) else { return false }
+        let takenAt = status == "TAKEN" ? actualAt ?? now : nil
+        let takenClock = status == "TAKEN" ? actualLocalTime ?? takenAt.map(HealthDate.localDateTime) : nil
+        guard takenClock == nil || (HealthDate.canonicalLocalDateTime(takenClock!) != nil && takenClock!.prefix(10) == log.$scheduledAt.prefix(10)
+                                   && HealthDate.canonicalLocalDateTime(takenClock!)! <= HealthDate.localDateTime(now)) else { return false }
+        return mutate { value in
             guard let index = value.medicationLogs.firstIndex(where: { $0.id == logId }) else { return }
             value.medicationLogs[index].status = status
-            value.medicationLogs[index].actualAt = status == "TAKEN" ? actualAt ?? Date() : nil
+            value.medicationLogs[index].actualAt = takenAt
+            try value.medicationLogs[index].setLocalTimes(scheduled: log.$scheduledAt, actual: takenClock)
             value.medicationLogs[index].updatedAt = Date()
         }
     }

@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { relationalStore } from '@kit.ArkData';
+import { MedicationDayEntry, MedicationHistory } from '../domain/MedicationHistory';
 import { ClinicalRecord, FamilyMember, FollowUpSchedule, HealthState, Medication, MedicationLog, MedicationSchedule, emptyState, normalizeState, validateState } from '../model/Models';
 
 const DATABASE_NAME = 'health_timeline.db';
@@ -11,11 +12,28 @@ export class HealthStore {
   private database?: relationalStore.RdbStore;
   private value: HealthState = emptyState();
   private initialized = false;
+  private initialization?: Promise<void>;
+  private updates: Promise<void> = Promise.resolve();
 
   get state(): HealthState { return this.value; }
 
   async initialize(context: common.UIAbilityContext): Promise<void> {
     if (this.initialized) return;
+    if (this.initialization) return this.initialization;
+    const operation = this.initializeDatabase(context);
+    this.initialization = operation;
+    try { await operation; }
+    catch (error) { this.database = undefined; throw error; }
+    finally { this.initialization = undefined; }
+  }
+
+  async waitUntilInitialized(): Promise<void> {
+    if (this.initialized) return;
+    if (!this.initialization) throw new Error('资料未能安全加载，请重新启动；原有数据库和提醒未清除');
+    await this.initialization;
+  }
+
+  private async initializeDatabase(context: common.UIAbilityContext): Promise<void> {
     const config: relationalStore.StoreConfig = {
       name: DATABASE_NAME,
       securityLevel: relationalStore.SecurityLevel.S3,
@@ -41,7 +59,15 @@ export class HealthStore {
   }
 
   async update(change: (candidate: HealthState) => void): Promise<void> {
-    if (!this.database) throw new Error('数据库尚未初始化');
+    // Clone only after the previous commit completes. Concurrent member changes,
+    // doses and backup imports must not overwrite one another's state snapshots.
+    const operation = this.updates.then(() => this.commitChange(change));
+    this.updates = operation.catch(() => {});
+    return operation;
+  }
+
+  private async commitChange(change: (candidate: HealthState) => void): Promise<void> {
+    if (!this.database || !this.initialized) throw new Error('数据库未安全加载，禁止写入；原有资料没有清除');
     const candidate = JSON.parse(JSON.stringify(this.value)) as HealthState;
     change(candidate);
     normalizeState(candidate);
@@ -67,11 +93,17 @@ export class HealthStore {
   medicationsForCurrentMember(): Medication[] { return this.value.medications.filter(item => item.memberUuid === this.currentMember().uuid); }
 
   schedulesForDay(medication: Medication, day: string): MedicationSchedule[] {
-    return this.value.medicationSchedules.filter(item => item.medicationUuid === medication.uuid && item.enabled && item.effectiveFrom <= day && (!item.effectiveTo || item.effectiveTo >= day));
+    if (medication.memberUuid !== this.currentMember().uuid) return [];
+    return this.value.medicationSchedules.filter(item => item.medicationUuid === medication.uuid && item.effectiveFrom <= day && (!item.effectiveTo || item.effectiveTo >= day));
   }
 
   logsForDay(medication: Medication, day: string): MedicationLog[] {
+    if (medication.memberUuid !== this.currentMember().uuid) return [];
     return this.value.medicationLogs.filter(item => item.medicationUuid === medication.uuid && item.scheduledAt.substring(0, 10) === day);
+  }
+
+  medicationEntriesForDay(day: string): MedicationDayEntry[] {
+    return MedicationHistory.entriesForDay(this.value, this.currentMember().uuid, day);
   }
 
   private async persistNormalizedState(sourcePayload: string): Promise<void> {

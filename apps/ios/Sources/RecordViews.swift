@@ -8,6 +8,7 @@ struct RecordEditor: View {
     let original: ClinicalRecord?
     private let fixedMemberId: UUID?
     @State private var date: Date
+    @State private var dateWasEdited = false
     @State private var title: String
     @State private var conditionName = ""
     @State private var stage: String
@@ -32,7 +33,7 @@ struct RecordEditor: View {
         NavigationStack {
             Form {
                 Section("基本资料") {
-                    DatePicker("日期", selection: $date, displayedComponents: .date)
+                    DatePicker("日期", selection: Binding(get: { date }, set: { date = $0; dateWasEdited = true }), displayedComponents: .date)
                     TextField("标题（病名在前）", text: $title)
                     if original == nil { TextField("病情分类（可选）", text: $conditionName) }
                     Picker("记录类型", selection: $stage) {
@@ -68,7 +69,8 @@ struct RecordEditor: View {
 
     private func save() {
         var value = original ?? ClinicalRecord(memberId: fixedMemberId)
-        value.recordDate = date; value.title = title; value.stage = stage; value.symptoms = symptoms
+        value.applyEditedRecordDate(date, wasEdited: original == nil || dateWasEdited)
+        value.title = title; value.stage = stage; value.symptoms = symptoms
         value.diagnosis = diagnosis; value.treatment = treatment; value.medicationNotes = medicationNotes
         value.hospital = hospital; value.clinician = clinician; value.notes = notes
         let succeeded = original == nil ? store.addRecord(value, conditionName: conditionName) : store.updateRecord(value)
@@ -95,7 +97,7 @@ struct RecordDetail: View {
             if let record {
                 List {
                     Section("病历") {
-                        LabeledContent("日期", value: record.recordDate.formatted(date: .long, time: .omitted))
+                        LabeledContent("日期", value: record.$recordDate)
                         InlineField(label: "症状/病情", value: record.symptoms); InlineField(label: "诊断", value: record.diagnosis)
                         InlineField(label: "治疗方案", value: record.treatment); InlineField(label: "就诊用药记录", value: record.medicationNotes)
                         InlineField(label: "医院", value: record.hospital); InlineField(label: "医生", value: record.clinician)

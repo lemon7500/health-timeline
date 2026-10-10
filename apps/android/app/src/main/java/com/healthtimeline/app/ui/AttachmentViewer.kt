@@ -26,7 +26,6 @@ import com.healthtimeline.app.data.AttachmentKind
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.math.min
 
 @Composable
 fun AttachmentViewerDialog(
@@ -121,10 +120,8 @@ private suspend fun renderPdf(file: File, pageIndex: Int): Bitmap? = withContext
     ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
         PdfRenderer(descriptor).use { renderer ->
             renderer.openPage(pageIndex.coerceIn(0, renderer.pageCount - 1)).use { page ->
-                val scale = min(1600f / page.width, 2000f / page.height).coerceAtLeast(0.1f)
-                val width = (page.width * scale).toInt().coerceAtLeast(1)
-                val height = (page.height * scale).toInt().coerceAtLeast(1)
-                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+                val size = boundedPdfBitmapSize(page.width, page.height)
+                Bitmap.createBitmap(size.width, size.height, Bitmap.Config.ARGB_8888).also { bitmap ->
                     bitmap.eraseColor(android.graphics.Color.WHITE)
                     page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                 }

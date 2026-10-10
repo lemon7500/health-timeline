@@ -87,7 +87,7 @@ struct CalendarHome: View {
                 ForEach(["一", "二", "三", "四", "五", "六", "日"], id: \.self) { Text($0).font(.caption) }
                 ForEach(Array(days.enumerated()), id: \.offset) { _, day in
                     if let day {
-                        let records = memberRecords.filter { HealthDate.calendar.isDate($0.recordDate, inSameDayAs: day) }
+                        let records = memberRecords.filter { $0.$recordDate == HealthDate.day(day) }
                         VStack(alignment: .leading, spacing: 2) {
                             Text("\(HealthDate.calendar.component(.day, from: day))").font(.caption)
                             ForEach(records.prefix(2)) { value in
@@ -111,7 +111,7 @@ struct CalendarHome: View {
             NavigationLink(value: record.id) {
                 VStack(alignment: .leading) {
                     Text(record.title)
-                    Text(record.recordDate.formatted(date: .abbreviated, time: .omitted)).font(.caption).foregroundStyle(.secondary)
+                    Text(record.$recordDate).font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
@@ -123,7 +123,8 @@ struct CalendarHome: View {
         if let value = HealthDate.calendar.date(byAdding: .month, value: delta, to: month) { month = value }
     }
     private func recordOrder(_ lhs: ClinicalRecord, _ rhs: ClinicalRecord) -> Bool {
-        if lhs.recordDate != rhs.recordDate { return lhs.recordDate < rhs.recordDate }
+        let lhsDay = lhs.$recordDate; let rhsDay = rhs.$recordDate
+        if lhsDay != rhsDay { return lhsDay < rhsDay }
         if lhs.dayOrder != rhs.dayOrder { return (lhs.dayOrder ?? 0) < (rhs.dayOrder ?? 0) }
         return lhs.id.uuidString < rhs.id.uuidString
     }

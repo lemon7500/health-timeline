@@ -23,6 +23,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.data.*
 import java.time.Instant
 import java.time.LocalDate
@@ -46,13 +47,15 @@ fun MedicationScreen(
     val cachedMonthData by viewModel.medicationMonthData.collectAsStateWithLifecycle()
     val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val drafts: UiDraftStateViewModel = composeViewModel()
+    val pageScope = "medicationPage/$selectedMemberId"
     val medications = memberScopedEntities(selectedMemberId, cachedMedications) { it.memberId }
     val schedules = childrenOfMember(medications.map { it.id }.toSet(), cachedSchedules) { it.medicationId }
     val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
     val monthData = memberScopedMedicationMonth(selectedMemberId, cachedMonthData)
-    var selectedDate by rememberSaveable(selectedMemberId) { mutableStateOf(LocalDate.now().toString()) }
-    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
-    var editing by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
+    var selectedDate by rememberUiDraftState(pageScope, "selectedDate") { LocalDate.now().toString() }
+    var createForMemberId by rememberUiDraftState<Long?>(pageScope, "creating") { null }
+    var editing by rememberUiDraftState<MedicationEntity?>(pageScope, "editing") { null }
     var archiveTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
     var restoreTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
     var deleteTarget by remember(selectedMemberId) { mutableStateOf<MedicationEntity?>(null) }
@@ -65,11 +68,6 @@ fun MedicationScreen(
     val selectedEntries = monthData.entries(selected)
 
     LaunchedEffect(selectedMemberId) {
-        val today = LocalDate.now()
-        selectedDate = today.toString()
-        viewModel.selectMedicationMonth(YearMonth.from(today))
-        createForMemberId = null
-        editing = null
         archiveTarget = null
         restoreTarget = null
         deleteTarget = null
@@ -78,13 +76,15 @@ fun MedicationScreen(
         addAsNeeded = false
         section = MedicationSection.TODAY
     }
+    LaunchedEffect(selectedMemberId, selectedDate) {
+        // A new member's scope starts today; rotation/unlock reuses the existing day's memory state.
+        viewModel.selectMedicationMonth(YearMonth.from(LocalDate.parse(selectedDate)))
+    }
     LaunchedEffect(navigation?.token, selectedMemberId) {
-        navigation?.let { request ->
-            if (selectedMemberId == request.memberId) {
-                selectedDate = request.date.toString()
-                viewModel.selectMedicationMonth(YearMonth.from(request.date))
-                section = MedicationSection.TODAY
-            }
+        navigation?.takeIf { selectedMemberId == it.memberId }?.let { request ->
+            selectedDate = request.date.toString()
+            viewModel.selectMedicationMonth(YearMonth.from(request.date))
+            section = MedicationSection.TODAY
             onNavigationConsumed(request.token)
         }
     }
@@ -162,8 +162,11 @@ fun MedicationScreen(
                                 if (medication.instructions.isNotBlank()) Text(medication.instructions, style = MaterialTheme.typography.bodySmall)
                                 Row {
                                     TextButton(onClick = { editing = medication }) { Text("编辑") }
-                                    TextButton(onClick = { archiveTarget = medication }) { Text("结束疗程") }
+                                    TextButton(onClick = { archiveTarget = medication }, enabled = !LocalDate.parse(medication.startDate).isAfter(today)) { Text("结束疗程") }
                                     TextButton(onClick = { deleteTarget = medication }) { Text("删除") }
+                                }
+                                if (LocalDate.parse(medication.startDate).isAfter(today)) {
+                                    Text("疗程尚未开始；开始日期后可结束，取消此计划可移入回收站。", style = MaterialTheme.typography.bodySmall)
                                 }
                             }
                         }
@@ -211,7 +214,7 @@ fun MedicationScreen(
             existing = visibleEditing,
             memberId = visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember),
             existingTimes = visibleEditing?.let { med ->
-                val effectiveDate = LocalDate.now().plusDays(1)
+                val effectiveDate = defaultMedicationEffectiveDate(LocalDate.now(), LocalDate.parse(med.startDate))
                 schedules.filter { it.medicationId == med.id && scheduleEffectiveOn(it, effectiveDate) }
                     .map { LocalTime.parse(it.localTime) }
             }.orEmpty(),
@@ -220,10 +223,16 @@ fun MedicationScreen(
                 if (viewModel.selectedMemberId.value != medication.memberId) { onFailed() } else
                 viewModel.saveMedication(
                     medication, times, effectiveDate,
-                    { createForMemberId = null; editing = null }, onFailed
+                    {
+                        drafts.clearScope(medicationDraftScope(medication.memberId, visibleEditing?.uuid))
+                        createForMemberId = null; editing = null
+                    }, onFailed
                 )
             },
-            onDismiss = { createForMemberId = null; editing = null }
+            onDismiss = {
+                drafts.clearScope(medicationDraftScope(visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember), visibleEditing?.uuid))
+                createForMemberId = null; editing = null
+            }
         )
     }
     archiveTarget?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
@@ -327,22 +336,35 @@ private fun MedicationEditorDialog(
     onSave: (MedicationEntity, List<LocalTime>, LocalDate?, () -> Unit) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var name by remember(existing) { mutableStateOf(existing?.name.orEmpty()) }
-    var amount by remember(existing) { mutableStateOf(existing?.doseAmount.orEmpty()) }
-    var unit by remember(existing) { mutableStateOf(existing?.doseUnit ?: "片") }
-    var instructions by remember(existing) { mutableStateOf(existing?.instructions.orEmpty()) }
-    var start by remember(existing) { mutableStateOf(existing?.startDate ?: LocalDate.now().toString()) }
-    var end by remember(existing) { mutableStateOf(existing?.endDate.orEmpty()) }
-    var effectiveOn by remember(existing) { mutableStateOf(LocalDate.now().plusDays(1).toString()) }
-    var mode by remember(existing) { mutableStateOf(existing?.mode ?: MedicationMode.SCHEDULED.name) }
-    var times by remember(existing, existingTimes) {
-        mutableStateOf(existingTimes.ifEmpty { listOf(LocalTime.of(8, 0), LocalTime.of(20, 0)) }.distinct().sorted())
+    val draftScope = medicationDraftScope(memberId, existing?.uuid)
+    var name by rememberUiDraftState(draftScope, "name") { existing?.name.orEmpty() }
+    var amount by rememberUiDraftState(draftScope, "amount") { existing?.doseAmount.orEmpty() }
+    var unit by rememberUiDraftState(draftScope, "unit") { existing?.doseUnit ?: "片" }
+    var instructions by rememberUiDraftState(draftScope, "instructions") { existing?.instructions.orEmpty() }
+    var start by rememberUiDraftState(draftScope, "start") { existing?.startDate ?: LocalDate.now().toString() }
+    var end by rememberUiDraftState(draftScope, "end") { existing?.endDate.orEmpty() }
+    var effectiveOn by rememberUiDraftState(draftScope, "effectiveOn") {
+        defaultMedicationEffectiveDate(LocalDate.now(), existing?.startDate?.let(LocalDate::parse) ?: LocalDate.now()).toString()
     }
-    var timePickerTarget by remember(existing) { mutableStateOf<Int?>(null) }
-    var addingTime by remember(existing) { mutableStateOf(false) }
-    var conditionId by remember(existing) { mutableStateOf(existing?.conditionId) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var submitting by remember(existing) { mutableStateOf(false) }
+    var mode by rememberUiDraftState(draftScope, "mode") { existing?.mode ?: MedicationMode.SCHEDULED.name }
+    var times by rememberUiDraftState(draftScope, "times") { existingTimes.ifEmpty { listOf(LocalTime.of(8, 0), LocalTime.of(20, 0)) }.distinct().sorted() }
+    var timesModified by rememberUiDraftState(draftScope, "timesModified") { false }
+    var timePickerTarget by rememberUiDraftState<Int?>(draftScope, "timePickerTarget") { null }
+    var addingTime by rememberUiDraftState(draftScope, "addingTime") { false }
+    var conditionId by rememberUiDraftState(draftScope, "condition") { existing?.conditionId }
+    var error by rememberUiDraftState<String?>(draftScope, "error") { null }
+    var submitting by rememberUiDraftState(draftScope, "submitting") { false }
+    LaunchedEffect(existingTimes) {
+        if (existing != null && !timesModified && existingTimes.isNotEmpty()) {
+            val refreshedTimes = existingTimes.distinct().sorted()
+            if (refreshedTimes != times) {
+                // A late Room emission must not keep a picker aimed at a removed/different item.
+                timePickerTarget = null
+                addingTime = false
+                times = refreshedTimes
+            }
+        }
+    }
     val now = Instant.now().toString()
 
     AlertDialog(
@@ -381,7 +403,7 @@ private fun MedicationEditorDialog(
                                         timePickerTarget = index
                                         addingTime = false
                                     }) { Text("修改") }
-                                    TextButton(onClick = { times = times.filterIndexed { itemIndex, _ -> itemIndex != index } }) {
+                                    TextButton(onClick = { timesModified = true; times = times.filterIndexed { itemIndex, _ -> itemIndex != index } }) {
                                         Text("删除", color = MaterialTheme.colorScheme.error)
                                     }
                                 }
@@ -406,7 +428,7 @@ private fun MedicationEditorDialog(
                         effectiveOn,
                         { effectiveOn = it.take(10) },
                         label = { Text("新计划生效日期") },
-                        supportingText = { Text("默认明天；今天已有记录时不能改为今天") },
+                        supportingText = { Text("默认明天或疗程开始日（取较晚者）；今天已有记录时不能改为今天") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -428,6 +450,7 @@ private fun MedicationEditorDialog(
                     end.isNotBlank() && endDate == null -> error = "结束日期格式不正确"
                     existing != null && effectiveDate == null -> error = "生效日期格式不正确"
                     effectiveDate != null && effectiveDate.isBefore(LocalDate.now()) -> error = "生效日期不能早于今天"
+                    effectiveDate != null && effectiveDate.isBefore(startDate) -> error = "生效日期不能早于疗程开始日期"
                     endDate != null && endDate.isBefore(startDate) -> error = "结束日期不能早于开始日期"
                     existing != null && endDate != null && endDate.isBefore(LocalDate.now()) -> error = "已有疗程不能追溯结束到今天以前"
                     mode == MedicationMode.SCHEDULED.name && effectiveDate != null && endDate != null && endDate.isBefore(effectiveDate) -> error = "新计划生效日期不能晚于疗程结束日期"
@@ -453,17 +476,24 @@ private fun MedicationEditorDialog(
         dismissButton = { TextButton(onClick = onDismiss, enabled = !submitting) { Text("取消") } }
     )
 
-    if (addingTime || timePickerTarget != null) {
-        val initial = timePickerTarget?.let { times[it] } ?: roundToFiveMinutes(LocalTime.now())
+    val editingTime = medicationTimeForEditing(times, timePickerTarget)
+    if (addingTime || editingTime != null) {
+        val initial = editingTime ?: roundToFiveMinutes(LocalTime.now())
         MedicationTimePickerDialog(
             initial = initial,
             onConfirm = { selected ->
+                if (!addingTime && medicationTimeForEditing(times, timePickerTarget) == null) {
+                    error = "提醒时间已更新，请重新选择"
+                    timePickerTarget = null
+                    return@MedicationTimePickerDialog
+                }
                 val duplicate = times.withIndex().any { (index, value) ->
                     value == selected && index != timePickerTarget
                 }
                 if (duplicate) {
                     error = "这个提醒时间已经添加"
                 } else {
+                    timesModified = true
                     times = if (timePickerTarget == null) {
                         (times + selected).distinct().sorted()
                     } else {

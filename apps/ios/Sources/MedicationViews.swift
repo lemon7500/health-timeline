@@ -68,8 +68,8 @@ struct MedicationHome: View {
                     ForEach(entries) { entry in
                         VStack(alignment: .leading, spacing: 4) {
                             Text("\(entry.medication.name) \(entry.schedule?.doseAmountSnapshot ?? entry.log?.doseAmountSnapshot ?? entry.medication.doseAmount) \(entry.schedule?.doseUnitSnapshot ?? entry.log?.doseUnitSnapshot ?? entry.medication.doseUnit)").font(.headline)
-                            if let planned = entry.plannedAt { Text("计划：\(planned.formatted(date: .omitted, time: .shortened))") }
-                            if let actual = entry.actualAt { Text("实际：\(actual.formatted(date: .omitted, time: .shortened))") }
+                            if let planned = entry.schedule?.localTime ?? entry.log.map({ String($0.$scheduledAt.dropFirst(11).prefix(5)) }) { Text("计划：\(planned)") }
+                            if let actual = entry.log?.$actualAt { Text("实际：\(String(actual.dropFirst(11).prefix(5)))") }
                             Text(statusText(entry.status)).foregroundStyle(entry.status == "TAKEN" ? .green : entry.status == "SKIPPED" ? .orange : .secondary)
                             if selectedDay <= Date() {
                                 HStack {
@@ -134,8 +134,10 @@ private struct DoseEditor: View {
     init(action: DoseAction, selectedDay: Date) {
         self.action = action; self.selectedDay = selectedDay
         let value = action.entry.actualAt ?? Date()
-        _hour = State(initialValue: HealthDate.calendar.component(.hour, from: value))
-        _minute = State(initialValue: (HealthDate.calendar.component(.minute, from: value) / 5) * 5)
+        let rawClock = action.entry.log?.$actualAt.map { String($0.dropFirst(11).prefix(5)) }
+        let rawParts = rawClock?.split(separator: ":").compactMap { Int($0) } ?? []
+        _hour = State(initialValue: rawParts.first ?? HealthDate.calendar.component(.hour, from: value))
+        _minute = State(initialValue: ((rawParts.count == 2 ? rawParts[1] : HealthDate.calendar.component(.minute, from: value)) / 5) * 5)
     }
     var body: some View {
         NavigationStack {
@@ -154,11 +156,13 @@ private struct DoseEditor: View {
     }
     private func save() {
         let actual = action.status == "TAKEN" ? HealthDate.calendar.date(bySettingHour: hour, minute: minute, second: 0, of: selectedDay) : nil
+        let day = action.entry.log.map { String($0.$scheduledAt.prefix(10)) } ?? HealthDate.day(selectedDay)
+        let actualClock = action.status == "TAKEN" ? "\(day)T\(String(format: "%02d:%02d:00", hour, minute))" : nil
         let success: Bool
-        if let log = action.entry.log { success = store.correctDose(logId: log.id, status: action.status, actualAt: actual) }
-        else if let planned = action.entry.plannedAt { success = store.recordDose(medication: action.entry.medication, schedule: action.entry.schedule, scheduledAt: planned, actualAt: actual, status: action.status) }
+        if let log = action.entry.log { success = store.correctDose(logId: log.id, status: action.status, actualAt: actual, actualLocalTime: actualClock) }
+        else if let planned = action.entry.plannedAt { success = store.recordDose(medication: action.entry.medication, schedule: action.entry.schedule, scheduledAt: planned, actualAt: actual, status: action.status, actualLocalTime: actualClock) }
         else if action.entry.schedule == nil, let actual {
-            success = store.recordDose(medication: action.entry.medication, schedule: nil, scheduledAt: actual, actualAt: actual, status: action.status)
+            success = store.recordDose(medication: action.entry.medication, schedule: nil, scheduledAt: actual, actualAt: actual, status: action.status, actualLocalTime: actualClock)
         } else { success = false }
         if success { dismiss() }
     }
@@ -174,8 +178,10 @@ private struct MedicationEditor: View {
     @State private var unit = "片"
     @State private var instructions = ""
     @State private var startDate = Date()
+    @State private var startDateWasEdited = false
     @State private var hasEndDate = false
     @State private var endDate = Date()
+    @State private var endDateWasEdited = false
     @State private var asNeeded = false
     @State private var times: [TimeValue] = [TimeValue(hour: 8, minute: 0)]
     @State private var effectiveDate = HealthDate.calendar.date(byAdding: .day, value: 1, to: Date()) ?? Date()
@@ -200,9 +206,11 @@ private struct MedicationEditor: View {
                 Section("药物") {
                     TextField("药名", text: $name); TextField("剂量", text: $amount); TextField("单位", text: $unit)
                     TextField("服用说明", text: $instructions, axis: .vertical)
-                    DatePicker("开始日期", selection: $startDate, displayedComponents: .date)
+                    DatePicker("开始日期", selection: Binding(get: { startDate }, set: { startDate = $0; startDateWasEdited = true }), displayedComponents: .date)
                     Toggle("设置结束日期", isOn: $hasEndDate)
-                    if hasEndDate { DatePicker("结束日期", selection: $endDate, in: startDate..., displayedComponents: .date) }
+                    if hasEndDate {
+                        DatePicker("结束日期", selection: Binding(get: { endDate }, set: { endDate = $0; endDateWasEdited = true }), in: startDate..., displayedComponents: .date)
+                    }
                     Toggle("按需服用", isOn: $asNeeded)
                     if original != nil { DatePicker("新设置生效日期", selection: $effectiveDate, in: Date()..., displayedComponents: .date) }
                 }
@@ -222,8 +230,10 @@ private struct MedicationEditor: View {
                     Button("保存") {
                         var medication = original ?? Medication(memberId: memberId)
                         medication.name = name; medication.doseAmount = amount; medication.doseUnit = unit
-                        medication.instructions = instructions; medication.startDate = startDate
-                        medication.endDate = hasEndDate ? endDate : nil; medication.mode = asNeeded ? "AS_NEEDED" : "SCHEDULED"
+                        medication.instructions = instructions
+                        medication.applyEditedCourseDates(start: startDate, startWasEdited: original == nil || startDateWasEdited,
+                                                          includeEnd: hasEndDate, end: endDate, endWasEdited: original == nil || endDateWasEdited)
+                        medication.mode = asNeeded ? "AS_NEEDED" : "SCHEDULED"
                         let values = times.map { String(format: "%02d:%02d", $0.hour, $0.minute) }
                         let succeeded = original == nil ? store.addMedication(medication, times: values) : store.updateMedication(medication, times: values, effectiveDate: effectiveDate)
                         if succeeded { dismiss() }

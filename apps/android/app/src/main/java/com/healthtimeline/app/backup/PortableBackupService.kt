@@ -19,6 +19,7 @@ import com.healthtimeline.shared.PortableJson
 import com.healthtimeline.shared.PortableSnapshot
 import com.healthtimeline.shared.PortableFamilyMember
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -118,7 +119,7 @@ class PortableBackupService(
                         )
                         val preview = MergePlanner.preview(local, imported)
                         val merged = MergePlanner.merge(local, imported, decisions)
-                        installPortable(merged, imported, currentEntities, prepared.root, decisions)
+                        installPortable(merged, imported, currentEntities, prepared.root)
                         preview
                     }
                 }
@@ -149,8 +150,7 @@ class PortableBackupService(
                                 imported,
                                 imported,
                                 current,
-                                prepared.root,
-                                imported.allConflictKeys().associateWith { MergeChoice.USE_IMPORTED }
+                                prepared.root
                             )
                         }
                     }
@@ -177,7 +177,7 @@ class PortableBackupService(
     }
 
     private fun writeZip(target: File, portable: PortableSnapshot, attachments: List<AttachmentEntity>) {
-        val files = attachments.associateBy { it.uuid }
+        val files = attachments.associateBy { it.uuid.lowercase() }
         ZipOutputStream(FileOutputStream(target)).use { zip ->
             zip.putNextEntry(ZipEntry("manifest.json"))
             zip.write(PortableJson.encode(portable).toByteArray(Charsets.UTF_8))
@@ -251,11 +251,14 @@ class PortableBackupService(
                     return PreparedImport(root, null)
                 }
                 val portable = PortableJson.decode(json)
+                val archiveEntries = zip.entries().asSequence().toList()
+                val entriesByPath = archiveEntries.associateBy { it.name.lowercase() }
+                require(entriesByPath.size == archiveEntries.size) { "备份包含重复文件路径" }
                 val totalSize = portable.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
                 require(context.filesDir.usableSpace > totalSize + 20L * 1024L * 1024L) { "手机存储空间不足" }
                 val staged = File(root, "files").apply { require(mkdirs()) { "无法创建附件临时目录" } }
                 portable.attachments.forEach { attachment ->
-                    val entry = zip.getEntry(attachment.archivePath) ?: error("附件缺失：${attachment.displayName}")
+                    val entry = entriesByPath[attachment.archivePath.lowercase()] ?: error("附件缺失：${attachment.displayName}")
                     require(entry.size in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常：${attachment.displayName}" }
                     val destination = File(staged, attachment.uuid)
                     copyVerified(zip, entry.name, destination, attachment)
@@ -291,43 +294,58 @@ class PortableBackupService(
         merged: PortableSnapshot,
         imported: PortableSnapshot,
         current: BackupSnapshot,
-        preparedRoot: File,
-        decisions: Map<String, MergeChoice>
+        preparedRoot: File
     ) {
         val importedById = imported.attachments.associateBy { it.uuid }
-        val localById = current.attachments.associateBy { it.uuid }
+        val localById = current.attachments.associateBy { it.uuid.lowercase() }
         val installId = UUID.randomUUID().toString()
         val relativeRoot = "restored_attachments/$installId"
         val installed = File(context.filesDir, relativeRoot)
         require(installed.mkdirs()) { "无法创建附件恢复目录" }
         val importedPaths = hashMapOf<String, String>()
+        var databaseCommitted = false
         try {
             merged.attachments.forEach { attachment ->
                 val incoming = importedById[attachment.uuid]
                 val local = localById[attachment.uuid]
-                val usesIncoming = incoming != null && (local == null || decisions["attachment:${attachment.uuid}"] == MergeChoice.USE_IMPORTED ||
-                    (local.sha256 == incoming.sha256 && local.sizeBytes == incoming.sizeBytes))
-                if (usesIncoming && (local == null || local.sha256 != attachment.sha256 || !repository.attachmentStore.file(local).isFile)) {
+                // The merge choice controls metadata. Bytes with the chosen hash are
+                // interchangeable, so a verified backup can repair a corrupt local copy.
+                val usesIncoming = incoming != null && incoming.sha256 == attachment.sha256 &&
+                    incoming.sizeBytes == attachment.sizeBytes
+                val localVerified = local != null && local.sha256 == attachment.sha256 &&
+                    local.sizeBytes == attachment.sizeBytes &&
+                    runCatching { repository.attachmentStore.verifyStored(local) }.getOrDefault(false)
+                if (usesIncoming && !localVerified) {
                     val source = File(preparedRoot, "files/${attachment.uuid}")
                     require(source.isFile) { "附件临时文件缺失：${attachment.displayName}" }
                     val destination = File(installed, attachment.uuid)
                     source.inputStream().use { input ->
                         FileOutputStream(destination).use { output -> input.copyTo(output); output.fd.sync() }
                     }
+                    require(destination.length() == attachment.sizeBytes && sha256(destination) == attachment.sha256) {
+                        "安装附件校验失败：${attachment.displayName}"
+                    }
                     importedPaths[attachment.uuid] = "$relativeRoot/${attachment.uuid}"
+                } else {
+                    require(localVerified) { "本机附件已损坏或缺失，请选择备份中的导入版本：${attachment.displayName}" }
                 }
             }
             val entities = PortableSnapshotMapper.toEntities(merged, current) { attachment, local ->
                 importedPaths[attachment.uuid] ?: requireNotNull(local?.relativePath) { "附件没有可用的本地文件：${attachment.displayName}" }
             }
-            replaceDatabase(entities)
+            // Cancellation after a successful commit must never remove files
+            // that the new database already references.
+            withContext(NonCancellable) {
+                replaceDatabase(entities)
+                databaseCommitted = true
+            }
             val livePaths = entities.attachments.mapTo(hashSetOf()) { it.relativePath }
             current.attachments.filter { it.relativePath !in livePaths }.forEach { old ->
                 runCatching { repository.attachmentStore.file(old).delete() }
             }
             if (importedPaths.isEmpty()) installed.deleteRecursively()
         } catch (error: Throwable) {
-            installed.deleteRecursively()
+            if (!databaseCommitted) installed.deleteRecursively()
             throw error
         }
     }
@@ -439,7 +457,6 @@ class PortableBackupService(
         override fun close() { root.deleteRecursively() }
     }
 }
-
 private object InstallationIdentity {
     fun getOrCreate(context: Context): String {
         val prefs = context.getSharedPreferences("installation_identity", Context.MODE_PRIVATE)
@@ -448,16 +465,4 @@ private object InstallationIdentity {
         check(prefs.edit().putString("uuid", value).commit()) { "无法保存设备安装标识" }
         return value
     }
-}
-
-private fun PortableSnapshot.allConflictKeys(): List<String> = buildList {
-    members.forEach { add("member:${it.uuid}") }
-    conditions.forEach { add("condition:${it.uuid}") }
-    records.forEach { add("record:${it.uuid}") }
-    attachments.forEach { add("attachment:${it.uuid}") }
-    followUps.forEach { add("followUp:${it.uuid}") }
-    occurrences.forEach { add("occurrence:${it.uuid}") }
-    medications.forEach { add("medication:${it.uuid}") }
-    medicationSchedules.forEach { add("medicationSchedule:${it.uuid}") }
-    medicationLogs.forEach { add("medicationLog:${it.uuid}") }
 }

@@ -9,7 +9,10 @@ import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-class AppLockManager(private val context: Context) {
+class AppLockManager(
+    private val context: Context,
+    private val elapsedRealtime: () -> Long = SystemClock::elapsedRealtime
+) {
     private val preferences = context.getSharedPreferences("app_lock", Context.MODE_PRIVATE)
     private val enabledMutable = MutableStateFlow(preferences.getBoolean(KEY_ENABLED, false))
     private val lockedMutable = MutableStateFlow(enabledMutable.value)
@@ -24,35 +27,43 @@ class AppLockManager(private val context: Context) {
         enabledMutable.value = value
         lockedMutable.value = false
         backgroundAt = null
+        externalActivityDepth = 0
     }
 
     fun unlock() {
         lockedMutable.value = false
         backgroundAt = null
+        externalActivityDepth = 0
     }
 
     fun lock() {
         if (enabledMutable.value) lockedMutable.value = true
+        externalActivityDepth = 0
     }
 
     fun onAppBackgrounded() {
-        if (externalActivityDepth == 0 && enabledMutable.value) backgroundAt = SystemClock.elapsedRealtime()
+        if (externalActivityDepth == 0 && enabledMutable.value) backgroundAt = elapsedRealtime()
     }
 
     fun onAppForegrounded() {
+        // A picker callback may be lost when its Compose launcher is removed/recreated.
+        // Its exemption is for one external round-trip, never all future background trips.
+        externalActivityDepth = 0
         val leftAt = backgroundAt ?: return
-        if (enabledMutable.value && SystemClock.elapsedRealtime() - leftAt >= RELOCK_DELAY_MS) lock()
+        if (enabledMutable.value && elapsedRealtime() - leftAt >= RELOCK_DELAY_MS) lock()
         backgroundAt = null
     }
 
     fun beginExternalActivity() {
-        externalActivityDepth++
+        externalActivityDepth = 1
         backgroundAt = null
     }
 
     fun endExternalActivity() {
-        if (externalActivityDepth > 0) externalActivityDepth--
-        backgroundAt = null
+        if (externalActivityDepth > 0) {
+            externalActivityDepth = 0
+            backgroundAt = null
+        }
     }
 
     fun shouldShowIntroduction(): Boolean = !preferences.getBoolean(KEY_INTRO_SHOWN, false)

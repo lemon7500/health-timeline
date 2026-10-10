@@ -26,7 +26,7 @@ struct ClinicalRecord: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var memberId: UUID?
     var conditionId: UUID?
-    var recordDate = Date()
+    @CalendarDay var recordDate = Date()
     var dayOrder: Int64?
     var title = ""
     var stage = "OTHER"
@@ -39,6 +39,11 @@ struct ClinicalRecord: Codable, Identifiable, Hashable {
     var notes = ""
     var createdAt = Date()
     var updatedAt = Date()
+
+    mutating func setRecordDay(_ day: String) throws { try _recordDate.assignCanonical(day) }
+    mutating func applyEditedRecordDate(_ date: Date, wasEdited: Bool) {
+        if wasEdited { recordDate = date }
+    }
 }
 
 struct Attachment: Codable, Identifiable, Hashable {
@@ -61,26 +66,33 @@ struct FollowUpSchedule: Codable, Identifiable, Hashable {
     var title = ""
     var recurrenceType = "ONCE"
     var interval = 1
-    var anchorDate = Date()
+    @CalendarDay var anchorDate = Date()
     var anchorDayOfMonth = 1
     var weekday: Int?
     var reminderHour = 9
     var reminderMinute = 0
     var leadDays = 3
-    var nextDueDate = Date()
+    @CalendarDay var nextDueDate = Date()
     var enabled = true
     var createdAt = Date()
     var updatedAt = Date()
+
+    mutating func setDueDays(anchor: String, next: String) throws {
+        try _anchorDate.assignCanonical(anchor)
+        try _nextDueDate.assignCanonical(next)
+    }
 }
 
 struct FollowUpOccurrence: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var scheduleId: UUID
-    var dueDate = Date()
+    @CalendarDay var dueDate = Date()
     var status = "PENDING"
     var completedAt: Date?
     var createdAt = Date()
     var updatedAt = Date()
+
+    mutating func setDueDay(_ day: String) throws { try _dueDate.assignCanonical(day) }
 }
 
 struct Medication: Codable, Identifiable, Hashable {
@@ -91,16 +103,27 @@ struct Medication: Codable, Identifiable, Hashable {
     var doseAmount = ""
     var doseUnit = ""
     var instructions = ""
-    var startDate = Date()
-    var endDate: Date?
+    @CalendarDay var startDate = Date()
+    @OptionalCalendarDay var endDate: Date? = nil
     var endedAt: Date?
-    var archivedPreviousEndDate: Date?
+    @OptionalCalendarDay var archivedPreviousEndDate: Date? = nil
     var mode = "SCHEDULED"
     var archived = false
     // 仅用于读取早期 iOS 原型数据。新版本使用 MedicationSchedule 保存历史计划。
     var times: [String] = []
     var createdAt = Date()
     var updatedAt = Date()
+
+    mutating func setCourseDays(start: String, end: String?, previousEnd: String?) throws {
+        try _startDate.assignCanonical(start)
+        try _endDate.assignCanonical(end)
+        try _archivedPreviousEndDate.assignCanonical(previousEnd)
+    }
+    mutating func applyEditedCourseDates(start: Date, startWasEdited: Bool, includeEnd: Bool, end: Date, endWasEdited: Bool) {
+        if startWasEdited { startDate = start }
+        if !includeEnd { endDate = nil }
+        else if endWasEdited || $endDate == nil { endDate = end }
+    }
 }
 
 struct MedicationSchedule: Codable, Identifiable, Hashable {
@@ -118,7 +141,7 @@ struct MedicationSchedule: Codable, Identifiable, Hashable {
 
 extension MedicationSchedule {
     private enum CodingKeys: String, CodingKey {
-        case id, medicationId, localTime, enabled, effectiveFrom, effectiveTo, doseAmountSnapshot, doseUnitSnapshot, updatedAt
+        case id, medicationId, localTime, enabled, effectiveFrom, effectiveTo, doseAmountSnapshot, doseUnitSnapshot, updatedAt, pausedByCourseEnd
     }
 
     init(from decoder: Decoder) throws {
@@ -132,6 +155,7 @@ extension MedicationSchedule {
         doseAmountSnapshot = try container.decodeIfPresent(String.self, forKey: .doseAmountSnapshot) ?? ""
         doseUnitSnapshot = try container.decodeIfPresent(String.self, forKey: .doseUnitSnapshot) ?? ""
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+        pausedByCourseEnd = try container.decodeIfPresent(Bool.self, forKey: .pausedByCourseEnd) ?? false
     }
 }
 
@@ -139,13 +163,18 @@ struct MedicationLog: Codable, Identifiable, Hashable {
     var id: UUID = UUID()
     var medicationId: UUID
     var scheduleId: UUID?
-    var scheduledAt: Date
-    var actualAt: Date?
+    @LocalWallTime var scheduledAt: Date
+    @OptionalLocalWallTime var actualAt: Date? = nil
     var status: String
     var doseAmountSnapshot: String
     var doseUnitSnapshot: String
     var createdAt = Date()
     var updatedAt = Date()
+
+    mutating func setLocalTimes(scheduled: String, actual: String?) throws {
+        try _scheduledAt.assignCanonical(scheduled)
+        try _actualAt.assignCanonical(actual)
+    }
 }
 
 struct MedicationDayEntry: Identifiable, Hashable {
@@ -165,6 +194,8 @@ struct MedicationDayEntry: Identifiable, Hashable {
 
 struct HealthState: Codable, Equatable {
     var schemaVersion = 4
+    // Local storage encoding only; portable backup schema remains unchanged.
+    var calendarDateEncodingVersion = 1
     var installationId = UUID()
     var selectedMemberId: UUID?
     var members: [FamilyMember] = []
@@ -178,7 +209,7 @@ struct HealthState: Codable, Equatable {
     var medicationLogs: [MedicationLog] = []
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, installationId, selectedMemberId, members, conditions, records, attachments
+        case schemaVersion, calendarDateEncodingVersion, installationId, selectedMemberId, members, conditions, records, attachments
         case followUps, occurrences, medications, medicationSchedules, medicationLogs
     }
 
@@ -187,6 +218,7 @@ struct HealthState: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        calendarDateEncodingVersion = try container.decodeIfPresent(Int.self, forKey: .calendarDateEncodingVersion) ?? 0
         installationId = try container.decodeIfPresent(UUID.self, forKey: .installationId) ?? UUID()
         selectedMemberId = try container.decodeIfPresent(UUID.self, forKey: .selectedMemberId)
         members = try container.decodeIfPresent([FamilyMember].self, forKey: .members) ?? []
@@ -201,8 +233,9 @@ struct HealthState: Codable, Equatable {
     }
 
     mutating func normalizeLegacyData() -> Bool {
-        var changed = schemaVersion != 4
+        var changed = schemaVersion != 4 || calendarDateEncodingVersion != 1
         schemaVersion = 4
+        calendarDateEncodingVersion = 1
         if members.isEmpty {
             let member = FamilyMember()
             members = [member]
@@ -221,16 +254,16 @@ struct HealthState: Codable, Equatable {
         var nextOrder: [String: Int64] = [:]
         for record in records {
             guard let dayOrder = record.dayOrder else { continue }
-            let key = "\(record.memberId?.uuidString ?? fallback.uuidString):\(Self.dayKey(record.recordDate))"
+            let key = "\(record.memberId?.uuidString ?? fallback.uuidString):\(record.$recordDate)"
             nextOrder[key] = max(nextOrder[key, default: 0], dayOrder + 1)
         }
         let sorted = records.indices.sorted {
-            if records[$0].recordDate != records[$1].recordDate { return records[$0].recordDate < records[$1].recordDate }
+            if records[$0].$recordDate != records[$1].$recordDate { return records[$0].$recordDate < records[$1].$recordDate }
             if records[$0].updatedAt != records[$1].updatedAt { return records[$0].updatedAt > records[$1].updatedAt }
             return records[$0].id.uuidString < records[$1].id.uuidString
         }
         for index in sorted where records[index].dayOrder == nil {
-            let key = "\(records[index].memberId?.uuidString ?? fallback.uuidString):\(Self.dayKey(records[index].recordDate))"
+            let key = "\(records[index].memberId?.uuidString ?? fallback.uuidString):\(records[index].$recordDate)"
             records[index].dayOrder = nextOrder[key, default: 0]
             nextOrder[key, default: 0] += 1
             changed = true
@@ -241,8 +274,8 @@ struct HealthState: Codable, Equatable {
                     medicationSchedules.append(MedicationSchedule(
                         medicationId: medication.id,
                         localTime: time,
-                        effectiveFrom: Self.dayKey(medication.startDate),
-                        effectiveTo: medication.endDate.map(Self.dayKey),
+                        effectiveFrom: medication.$startDate,
+                        effectiveTo: medication.$endDate,
                         doseAmountSnapshot: medication.doseAmount,
                         doseUnitSnapshot: medication.doseUnit,
                         updatedAt: medication.updatedAt
@@ -254,8 +287,8 @@ struct HealthState: Codable, Equatable {
         for index in medicationSchedules.indices {
             guard let medication = medications.first(where: { $0.id == medicationSchedules[index].medicationId }) else { continue }
             if medicationSchedules[index].effectiveFrom.isEmpty {
-                medicationSchedules[index].effectiveFrom = Self.dayKey(medication.startDate)
-                medicationSchedules[index].effectiveTo = medication.endDate.map(Self.dayKey)
+                medicationSchedules[index].effectiveFrom = medication.$startDate
+                medicationSchedules[index].effectiveTo = medication.$endDate
                 changed = true
             }
             if medicationSchedules[index].doseAmountSnapshot.isEmpty {

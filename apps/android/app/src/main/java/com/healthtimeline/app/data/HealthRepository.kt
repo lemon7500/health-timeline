@@ -275,7 +275,7 @@ class HealthRepository(
         val resolvedValue = if (value.id == 0L) {
             value.copy(
                 conditionId = resolvedConditionId,
-                dayOrder = records.maxDayOrder(value.memberId, value.recordDate) + 1L
+                dayOrder = nextDayOrder(value.memberId, value.recordDate)
             )
         } else {
             val existing = requireNotNull(records.byId(value.id)) { "病历不存在" }
@@ -285,7 +285,7 @@ class HealthRepository(
                 dayOrder = if (existing.recordDate == value.recordDate) {
                     existing.dayOrder
                 } else {
-                    records.maxDayOrder(value.memberId, value.recordDate) + 1L
+                    nextDayOrder(value.memberId, value.recordDate)
                 }
             )
         }
@@ -297,6 +297,14 @@ class HealthRepository(
             records.update(resolvedValue)
             resolvedValue.id
         }
+    }
+
+    private suspend fun nextDayOrder(memberId: Long, recordDate: String): Long {
+        val maximum = records.maxDayOrder(memberId, recordDate)
+        require(maximum >= -1L && maximum < Long.MAX_VALUE) {
+            "当天病历顺序编号异常或已达上限，请先导出备份并核对当天记录顺序；本次保存未提交"
+        }
+        return maximum + 1L
     }
 
     suspend fun deleteRecord(value: ClinicalRecordEntity) = mutationMutex.withLock {
@@ -409,8 +417,16 @@ class HealthRepository(
                 require(endsOn == null || !endsOn.isBefore(today)) { "不能把已有疗程追溯结束到今天以前" }
             }
             val changeDate = if (value.id == 0L) startsOn else (effectiveDate ?: today.plusDays(1))
+            require(!changeDate.isBefore(startsOn)) { "新计划生效日期不能早于疗程开始日期" }
             if (value.id != 0L) {
                 require(!changeDate.isBefore(today)) { "不能追溯修改过去的用药计划" }
+                val earliestScheduleDate = medications.schedulesForMedication(value.id)
+                    .minOfOrNull { LocalDate.parse(it.effectiveFrom) }
+                val earliestLogDate = medications.earliestLogDate(value.id)?.let(LocalDate::parse)
+                val earliestHistoryDate = listOfNotNull(earliestScheduleDate, earliestLogDate).minOrNull()
+                require(earliestHistoryDate == null || !startsOn.isAfter(earliestHistoryDate)) {
+                    "开始日期不能晚于已有用药计划或记录，否则会影响历史资料"
+                }
                 if (changeDate == today) {
                     require(
                         medications.logCountBetween(
@@ -442,7 +458,9 @@ class HealthRepository(
                             val replacementEnd = listOfNotNull(changeDate.minusDays(1), endsOn).minOrNull()
                             medications.updateSchedule(
                                 schedule.copy(
-                                    enabled = false,
+                                    // The old plan still owns dates before the new plan starts.
+                                    // Its effectiveTo bounds reminders without cancelling today's remaining doses.
+                                    enabled = true,
                                     effectiveTo = replacementEnd.toString(),
                                     updatedAt = now
                                 )
@@ -466,6 +484,19 @@ class HealthRepository(
                             updatedAt = now
                         )
                     )
+                }
+            }
+            medications.schedulesForMedication(id).forEach { retained ->
+                val retainedStart = LocalDate.parse(retained.effectiveFrom)
+                val retainedEnd = retained.effectiveTo?.let(LocalDate::parse)
+                require(retainedEnd == null || !retainedEnd.isBefore(retainedStart)) {
+                    "修改日期会使已有时间表的结束日期早于生效日期，请核对疗程和生效日期"
+                }
+                require(
+                    endsOn == null || retained.pausedByCourseEnd ||
+                        (retainedEnd != null && !retainedEnd.isAfter(endsOn))
+                ) {
+                    "结束日期会截断已保留的历史时间表，请保留原结束日期并核对时间表"
                 }
             }
             MedicationSaveResult(id, replacedIds)
@@ -523,8 +554,19 @@ class HealthRepository(
             val now = Instant.now().toString()
             val medication = requireNotNull(medications.medicationById(id)) { "药物不存在" }
             require(medication.deletedAt == null) { "药物已在回收站，请先恢复" }
+            requireActiveMember(medication.memberId)
             if (medication.archived) return@withTransaction
-            medications.schedulesForMedication(id).filter { it.enabled }.forEach { schedule ->
+            require(!LocalDate.parse(medication.startDate).isAfter(today)) {
+                "疗程尚未开始，不能记录今天结束；如需取消请删除该疗程"
+            }
+            val schedules = medications.schedulesForMedication(id)
+            require(schedules.none {
+                !it.enabled && !it.pausedByCourseEnd &&
+                    (it.effectiveTo == null || LocalDate.parse(it.effectiveTo).isAfter(today))
+            }) {
+                "已有停用时间表的保留区间尚未结束，请先核对历史计划；当前操作不会修改资料"
+            }
+            schedules.filter { it.enabled }.forEach { schedule ->
                 medications.updateSchedule(
                     schedule.copy(enabled = false, updatedAt = now, pausedByCourseEnd = true)
                 )

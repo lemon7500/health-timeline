@@ -5,7 +5,9 @@ package com.healthtimeline.shared
 import kotlin.time.Instant
 
 object MergePlanner {
-    fun preview(local: PortableSnapshot, imported: PortableSnapshot): BackupImportPreview {
+    fun preview(localSource: PortableSnapshot, importedSource: PortableSnapshot): BackupImportPreview {
+        val local = localSource.canonicalized()
+        val imported = importedSource.canonicalized()
         PortableSnapshotValidator.validate(local)
         PortableSnapshotValidator.validate(imported)
         var additions = 0
@@ -26,7 +28,8 @@ object MergePlanner {
                 val current = localById[id]
                 when {
                     current == null -> additions++
-                    current == incoming -> duplicates++
+                    current == incoming || (current is PortableClinicalRecord && incoming is PortableClinicalRecord &&
+                        current.copy(dayOrder = incoming.dayOrder) == incoming) -> duplicates++
                     else -> {
                         val localTime = updatedAt(current)
                         val importedTime = updatedAt(incoming)
@@ -51,17 +54,25 @@ object MergePlanner {
     }
 
     fun merge(
-        local: PortableSnapshot,
-        imported: PortableSnapshot,
+        localSource: PortableSnapshot,
+        importedSource: PortableSnapshot,
         decisions: Map<String, MergeChoice> = emptyMap()
     ): PortableSnapshot {
+        val local = localSource.canonicalized()
+        val imported = importedSource.canonicalized()
+        PortableSnapshotValidator.validate(local)
+        PortableSnapshotValidator.validate(imported)
+        val canonicalDecisions = decisions.mapKeys { (key, _) ->
+            val separator = key.indexOf(':')
+            if (separator < 0) key else key.substring(0, separator + 1) + key.substring(separator + 1).lowercase()
+        }
         fun key(type: String, uuid: String) = "$type:$uuid"
         fun <T> mergeList(type: String, localValues: List<T>, incomingValues: List<T>, uuid: (T) -> String): List<T> {
             val incomingById = incomingValues.associateBy(uuid)
             val merged = localValues.map { current ->
                 val id = uuid(current)
                 val incoming = incomingById[id]
-                if (incoming != null && decisions[key(type, id)] == MergeChoice.USE_IMPORTED) incoming else current
+                if (incoming != null && canonicalDecisions[key(type, id)] == MergeChoice.USE_IMPORTED) incoming else current
             }.toMutableList()
             val localIds = localValues.mapTo(hashSetOf(), uuid)
             merged += incomingValues.filter { uuid(it) !in localIds }
@@ -72,7 +83,7 @@ object MergePlanner {
             exportedAt = imported.exportedAt,
             members = mergeList("member", local.members, imported.members) { it.uuid },
             conditions = mergeList("condition", local.conditions, imported.conditions) { it.uuid },
-            records = mergeList("record", local.records, imported.records) { it.uuid },
+            records = mergeRecords(local.records, imported.records, canonicalDecisions),
             attachments = mergeList("attachment", local.attachments, imported.attachments) { it.uuid },
             followUps = mergeList("followUp", local.followUps, imported.followUps) { it.uuid },
             occurrences = mergeList("occurrence", local.occurrences, imported.occurrences) { it.uuid },
@@ -82,5 +93,30 @@ object MergePlanner {
         )
         PortableSnapshotValidator.validate(result)
         return result
+    }
+
+    private fun mergeRecords(
+        local: List<PortableClinicalRecord>,
+        imported: List<PortableClinicalRecord>,
+        decisions: Map<String, MergeChoice>
+    ): List<PortableClinicalRecord> {
+        val importedById = imported.associateBy { it.uuid }
+        val localIds = local.mapTo(hashSetOf()) { it.uuid }
+        val retained = local.withIndex().sortedWith(compareBy({ it.value.dayOrder }, { it.index })).map { (_, current) ->
+            importedById[current.uuid]?.takeIf { decisions["record:${current.uuid}"] == MergeChoice.USE_IMPORTED }
+                ?.copy(dayOrder = current.dayOrder) ?: current
+        }
+        val additions = imported.withIndex().filter { it.value.uuid !in localIds }
+            .sortedWith(compareBy({ it.value.dayOrder }, { it.index })).map { it.value }
+        val combined = retained + additions
+        val denseDays = combined.filter { it.dayOrder == Long.MAX_VALUE }.mapTo(hashSetOf()) { it.memberUuid to it.recordDate }
+        val nextOrder = mutableMapOf<Pair<String?, String>, Long>()
+        return combined.map { record ->
+            val day = record.memberUuid to record.recordDate
+            val next = nextOrder[day] ?: 0L
+            val order = if (day in denseDays) next else maxOf(record.dayOrder, next)
+            nextOrder[day] = order + 1L
+            record.copy(dayOrder = order)
+        }
     }
 }

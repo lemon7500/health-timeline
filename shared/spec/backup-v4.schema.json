@@ -63,7 +63,7 @@
         "memberUuid": { "$ref": "#/$defs/uuid" },
         "conditionUuid": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
         "recordDate": { "$ref": "#/$defs/date" },
-        "dayOrder": { "type": "integer", "minimum": 0 },
+        "dayOrder": { "type": "integer", "minimum": 0, "maximum": 9223372036854675807 },
         "title": { "type": "string", "minLength": 1, "maxLength": 100 },
         "stage": { "enum": ["BEFORE_VISIT", "AFTER_VISIT", "CHECKUP", "SURGERY", "OTHER"] },
         "symptoms": { "type": "string", "maxLength": 20000 },

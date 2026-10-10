@@ -6,6 +6,28 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class PortableSnapshotMapperTest {
+    @Test fun uppercaseLegacyUuidsKeepNumericIdsAndAttachmentPaths() {
+        val now = "2026-09-03T00:00:00Z"
+        val member = FamilyMemberEntity(23, "本人", "本人", "本人", false, now, now,
+            "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")
+        val record = ClinicalRecordEntity(id = 31, memberId = member.id, recordDate = "2026-09-03",
+            title = "测试病历", createdAt = now, updatedAt = now,
+            uuid = "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB")
+        val attachment = AttachmentEntity(id = 47, recordId = record.id, kind = "PDF", displayName = "测试.pdf",
+            mimeType = "application/pdf", relativePath = "attachments/legacy.pdf", sizeBytes = 3,
+            sha256 = "a".repeat(64), createdAt = now, uuid = "CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC")
+        val source = BackupSnapshot(emptyList(), listOf(record), listOf(attachment), emptyList(), emptyList(),
+            emptyList(), emptyList(), emptyList(), listOf(member))
+        val portable = PortableSnapshotMapper.toPortable(source, "DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD", now)
+        val restored = PortableSnapshotMapper.toEntities(portable, source) { _, local -> requireNotNull(local).relativePath }
+        assertEquals(23L, restored.members.single().id)
+        assertEquals(31L, restored.records.single().id)
+        assertEquals(47L, restored.attachments.single().id)
+        assertEquals(31L, restored.attachments.single().recordId)
+        assertEquals("attachments/legacy.pdf", restored.attachments.single().relativePath)
+        assertEquals(record.uuid.lowercase(), restored.records.single().uuid)
+    }
+
     @Test fun roundTripPreservesStableIdsAndReferences() {
         val now = "2026-09-03T00:00:00Z"
         val member = FamilyMemberEntity(

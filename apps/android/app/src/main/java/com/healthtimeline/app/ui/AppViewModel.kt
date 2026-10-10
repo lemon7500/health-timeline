@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.healthtimeline.app.backup.PortableBackupService
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.reminders.AlarmScheduler
+import com.healthtimeline.app.reminders.NotificationReviewRequest
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +24,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import java.time.Instant
 import java.time.ZoneId
 import java.time.LocalTime
@@ -133,6 +135,39 @@ class AppViewModel(
     fun onOverviewBackgrounded() {
         foregroundClockJob?.cancel()
         foregroundClockJob = null
+    }
+
+    suspend fun reviewMedicationNotification(request: NotificationReviewRequest): TodayNavigation.MedicationDay? {
+        return try {
+            resolveMedicationNotification(request)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            messages.send("无法读取提醒对应的资料，请重新打开应用后核对；未记录用药")
+            null
+        }
+    }
+
+    private suspend fun resolveMedicationNotification(request: NotificationReviewRequest): TodayNavigation.MedicationDay? {
+        val planned = request.plannedTimeOrNull() ?: return null
+        val medication = repository.medicationById(request.medicationId)
+            ?.takeIf { it.deletedAt == null } ?: return null
+        val member = repository.memberForMedication(medication.id)?.takeUnless { it.archived } ?: return null
+        val schedule = repository.allMedicationSchedulesForAlarmMaintenance()
+            .firstOrNull { it.id == request.scheduleId && it.medicationId == medication.id } ?: return null
+        val date = planned.toLocalDate()
+        if (date.isAfter(LocalDate.now()) || date.isBefore(LocalDate.parse(schedule.effectiveFrom)) ||
+            schedule.effectiveTo?.let { date.isAfter(LocalDate.parse(it)) } == true ||
+            date.isBefore(LocalDate.parse(medication.startDate)) ||
+            medication.endDate?.let { date.isAfter(LocalDate.parse(it)) } == true ||
+            planned.toLocalTime() != LocalTime.parse(schedule.localTime)
+        ) return null
+        // Always read the authoritative member above; the UI flow may still be
+        // loading at cold start. No dose is recorded by opening a notification.
+        memberSelection.write(member.id)
+        selectedMemberIdMutable.value = member.id
+        messages.send(if (medication.archived) "疗程已结束，可核对历史用药记录" else "请核对用药信息后再记录")
+        return TodayNavigation.MedicationDay(member.id, date)
     }
 
     fun recordOverviewDose(value: MedicationDayEntry, status: MedicationLogStatus, actualAt: LocalDateTime?) =
@@ -329,7 +364,10 @@ class AppViewModel(
 
     fun archiveMedication(id: Long) = launch("结束疗程") {
         repository.archiveMedication(id)
-        medicationSchedules.value.filter { it.medicationId == id }.forEach { scheduler.cancelMedication(it.id) }
+        repository.allMedicationSchedulesForAlarmMaintenance().filter { it.medicationId == id }.forEach {
+            scheduler.cancelMedication(it.id)
+            scheduler.cancelMedicationNotification(it.id)
+        }
         runCatching { scheduler.rescheduleAll() }
             .onFailure { messages.send("疗程已结束，但系统提醒刷新失败；请检查通知权限并重新打开应用") }
     }
@@ -341,8 +379,11 @@ class AppViewModel(
     }
 
     fun deleteMedication(value: MedicationEntity) = launch("将药物移入回收站") {
-        medicationSchedules.value.filter { it.medicationId == value.id }.forEach { scheduler.cancelMedication(it.id) }
         repository.deleteMedication(value.id)
+        repository.allMedicationSchedulesForAlarmMaintenance().filter { it.medicationId == value.id }.forEach {
+            scheduler.cancelMedication(it.id)
+            scheduler.cancelMedicationNotification(it.id)
+        }
         messages.send("药物及其历史记录已移入回收站，可在 30 天内恢复")
     }
 

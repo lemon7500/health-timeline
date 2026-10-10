@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.domain.RecurrenceCalculator
 import java.time.Instant
@@ -29,18 +30,18 @@ fun FollowUpScreen(
     val cachedOccurrences by viewModel.occurrences.collectAsStateWithLifecycle()
     val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val drafts: UiDraftStateViewModel = composeViewModel()
+    val pageScope = "followUpPage/$selectedMemberId"
     val schedules = memberScopedEntities(selectedMemberId, cachedSchedules) { it.memberId }
     val occurrences = childrenOfMember(schedules.map { it.id }.toSet(), cachedOccurrences) { it.scheduleId }
     val conditions = memberScopedEntities(selectedMemberId, cachedConditions) { it.memberId }
-    var createForMemberId by remember(selectedMemberId) { mutableStateOf<Long?>(null) }
-    var editing by remember(selectedMemberId) { mutableStateOf<FollowUpScheduleEntity?>(null) }
+    var createForMemberId by rememberUiDraftState<Long?>(pageScope, "creating") { null }
+    var editing by rememberUiDraftState<FollowUpScheduleEntity?>(pageScope, "editing") { null }
     var deleting by remember(selectedMemberId) { mutableStateOf<FollowUpScheduleEntity?>(null) }
     var overviewDetail by remember(selectedMemberId) { mutableStateOf<TodayFollowUpItem?>(null) }
     val pendingOccurrences = occurrences.filter { it.status == OccurrenceStatus.PENDING.name }
 
     LaunchedEffect(selectedMemberId) {
-        createForMemberId = null
-        editing = null
         deleting = null
         overviewDetail = null
     }
@@ -122,9 +123,15 @@ fun FollowUpScreen(
             conditions = conditions.filter { !it.archived },
             onSave = { value, onFailed ->
                 if (viewModel.selectedMemberId.value != value.memberId) { onFailed() } else
-                viewModel.saveFollowUp(value, { createForMemberId = null; editing = null }, onFailed)
+                viewModel.saveFollowUp(value, {
+                    drafts.clearScope(followUpDraftScope(value.memberId, visibleEditing?.uuid))
+                    createForMemberId = null; editing = null
+                }, onFailed)
             },
-            onDismiss = { createForMemberId = null; editing = null }
+            onDismiss = {
+                drafts.clearScope(followUpDraftScope(visibleEditing?.memberId ?: requireNotNull(visibleCreateForMember), visibleEditing?.uuid))
+                createForMemberId = null; editing = null
+            }
         )
     }
     deleting?.takeIf { target -> target.memberId == selectedMemberId && schedules.any { it.id == target.id && it.uuid == target.uuid } }?.let { target ->
@@ -145,16 +152,17 @@ private fun FollowUpEditorDialog(
     onSave: (FollowUpScheduleEntity, () -> Unit) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var title by remember(existing) { mutableStateOf(existing?.title.orEmpty()) }
-    var conditionId by remember(existing) { mutableStateOf(existing?.conditionId) }
-    var rule by remember(existing) { mutableStateOf(existing?.recurrenceType ?: RecurrenceType.ONCE.name) }
-    var interval by remember(existing) { mutableStateOf((existing?.interval ?: 1).toString()) }
-    var anchor by remember(existing) { mutableStateOf(existing?.anchorDate ?: LocalDate.now().toString()) }
-    var weekday by remember(existing) { mutableStateOf(existing?.weekday ?: LocalDate.now().dayOfWeek.value) }
-    var time by remember(existing) { mutableStateOf(existing?.reminderTime ?: "09:00") }
-    var lead by remember(existing) { mutableIntStateOf(existing?.leadDays ?: 3) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var submitting by remember(existing) { mutableStateOf(false) }
+    val draftScope = followUpDraftScope(memberId, existing?.uuid)
+    var title by rememberUiDraftState(draftScope, "title") { existing?.title.orEmpty() }
+    var conditionId by rememberUiDraftState(draftScope, "condition") { existing?.conditionId }
+    var rule by rememberUiDraftState(draftScope, "rule") { existing?.recurrenceType ?: RecurrenceType.ONCE.name }
+    var interval by rememberUiDraftState(draftScope, "interval") { (existing?.interval ?: 1).toString() }
+    var anchor by rememberUiDraftState(draftScope, "anchor") { existing?.anchorDate ?: LocalDate.now().toString() }
+    var weekday by rememberUiDraftState(draftScope, "weekday") { existing?.weekday ?: LocalDate.now().dayOfWeek.value }
+    var time by rememberUiDraftState(draftScope, "time") { existing?.reminderTime ?: "09:00" }
+    var lead by rememberUiDraftState(draftScope, "lead") { existing?.leadDays ?: 3 }
+    var error by rememberUiDraftState<String?>(draftScope, "error") { null }
+    var submitting by rememberUiDraftState(draftScope, "submitting") { false }
     val now = Instant.now().toString()
 
     AlertDialog(

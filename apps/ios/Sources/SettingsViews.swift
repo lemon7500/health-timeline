@@ -185,10 +185,10 @@ private struct BackupPreviewView: View {
         case "record": return versions(local.records.first { $0.id == conflict.uuid }?.title, imported.records.first { $0.id == conflict.uuid }?.title)
         case "attachment": return versions(local.attachments.first { $0.id == conflict.uuid }?.displayName, imported.attachments.first { $0.id == conflict.uuid }?.displayName)
         case "followup": return versions(local.followUps.first { $0.id == conflict.uuid }?.title, imported.followUps.first { $0.id == conflict.uuid }?.title)
-        case "occurrence": return versions(local.occurrences.first { $0.id == conflict.uuid }.map { HealthDate.day($0.dueDate) }, imported.occurrences.first { $0.id == conflict.uuid }.map { HealthDate.day($0.dueDate) })
+        case "occurrence": return versions(local.occurrences.first { $0.id == conflict.uuid }.map { $0.$dueDate }, imported.occurrences.first { $0.id == conflict.uuid }.map { $0.$dueDate })
         case "medication": return versions(local.medications.first { $0.id == conflict.uuid }?.name, imported.medications.first { $0.id == conflict.uuid }?.name)
         case "medicationSchedule": return versions(local.medicationSchedules.first { $0.id == conflict.uuid }?.localTime, imported.medicationSchedules.first { $0.id == conflict.uuid }?.localTime)
-        case "medicationLog": return versions(local.medicationLogs.first { $0.id == conflict.uuid }.map { HealthDate.localDateTime($0.scheduledAt) }, imported.medicationLogs.first { $0.id == conflict.uuid }.map { HealthDate.localDateTime($0.scheduledAt) })
+        case "medicationLog": return versions(local.medicationLogs.first { $0.id == conflict.uuid }.map { $0.$scheduledAt }, imported.medicationLogs.first { $0.id == conflict.uuid }.map { $0.$scheduledAt })
         default: return "内容不同"
         }
     }

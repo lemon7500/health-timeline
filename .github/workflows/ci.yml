@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   harmony-protocol:
     runs-on: ubuntu-latest
@@ -31,6 +34,16 @@ jobs:
         with:
           name: android-debug-apk
           path: apps/android/app/build/outputs/apk/debug/*.apk
+      - name: Upload JVM test and release lint reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: jvm-tests-and-release-lint
+          if-no-files-found: warn
+          path: |
+            apps/android/app/build/test-results/testDebugUnitTest/
+            shared/core/build/test-results/testDebugUnitTest/
+            apps/android/app/build/reports/lint-results-release.*
 
   android-instrumentation:
     runs-on: ubuntu-latest
@@ -139,7 +152,7 @@ jobs:
             exit 1
           fi
           echo "Using iPhone simulator $simulator_id"
-          xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_id" CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$RUNNER_TEMP/ios-test.log"
+          xcodebuild -workspace HealthTimeline.xcworkspace -scheme HealthTimeline -sdk iphonesimulator -destination "platform=iOS Simulator,id=$simulator_id" -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult" CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$RUNNER_TEMP/ios-test.log"
         working-directory: apps/ios
       - name: Publish iOS test errors
         if: failure() && steps.ios-tests.outcome == 'failure'
@@ -157,8 +170,11 @@ jobs:
             done <<< "$error_lines"
           fi
       - name: Upload iOS test log
-        if: failure() && steps.ios-tests.outcome == 'failure'
+        if: always() && steps.ios-tests.outcome != 'skipped'
         uses: actions/upload-artifact@v5
         with:
-          name: ios-test-log
-          path: ${{ runner.temp }}/ios-test.log
+          name: ios-test-report
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/ios-test.log
+            ${{ runner.temp }}/ios-tests.xcresult/

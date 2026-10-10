@@ -172,10 +172,11 @@ object PortableJson {
     }
 
     fun encode(snapshot: PortableSnapshot): String {
-        PortableSnapshotValidator.validate(snapshot)
-        return json.encodeToString(PortableSnapshot.serializer(), snapshot)
+        val canonical = snapshot.canonicalized()
+        PortableSnapshotValidator.validate(canonical)
+        return json.encodeToString(PortableSnapshot.serializer(), canonical)
     }
 
     fun decode(value: String): PortableSnapshot =
-        json.decodeFromString(PortableSnapshot.serializer(), value).also(PortableSnapshotValidator::validate)
+        json.decodeFromString(PortableSnapshot.serializer(), value).canonicalized().also(PortableSnapshotValidator::validate)
 }
