@@ -3,6 +3,7 @@ package com.healthtimeline.app.ui
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import android.net.Uri
 import androidx.lifecycle.ViewModelStore
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -18,10 +19,14 @@ import com.healthtimeline.app.data.SafetyCenterService
 import com.healthtimeline.app.data.SafetyStatusStore
 import com.healthtimeline.app.reminders.AlarmScheduler
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -85,6 +90,49 @@ class AppViewModelMemberTest {
         assertEquals(2, members.size)
         assertTrue(members.first { it.id == firstId }.archived)
         assertTrue(!members.first { it.id == secondId }.archived)
+    }
+
+    @Test fun cancellingPreviewWhileProgressMessageIsBlockedClearsBusyAndPassword() = runBlocking {
+        assertBlockedProgressCancellation { model, password ->
+            model.previewBackup(Uri.fromFile(File(context.cacheDir, "unopened.htbackup")), password,
+                onReady = { error("Cancelled preview must not complete") })
+        }
+    }
+
+    @Test fun cancellingExportWhileProgressMessageIsBlockedClearsBusyAndPassword() = runBlocking {
+        assertBlockedProgressCancellation { model, password ->
+            model.exportBackup(Uri.fromFile(File(context.cacheDir, "unopened.htbackup")), password)
+        }
+    }
+
+    @Test fun cancellingIntegrityCheckWhileProgressMessageIsBlockedClearsBusy() = runBlocking {
+        assertBlockedProgressCancellation(requirePasswordWipe = false) { model, _ -> model.runSafetyIntegrityCheck() }
+    }
+
+    private suspend fun assertBlockedProgressCancellation(
+        requirePasswordWipe: Boolean = true,
+        start: (AppViewModel, CharArray) -> Job
+    ) {
+        val member = repository.ensureDefaultMember()
+        selection.write(member.id)
+        val model = createViewModel()
+        withTimeout(10_000) { model.selectedMemberId.first { it == member.id } }
+        val password = "synthetic-password-only".toCharArray()
+        lateinit var job: Job
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            // Deliberately simulate a screen with no snackbar collector and a full message buffer.
+            val field = AppViewModel::class.java.getDeclaredField("messages").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST") val channel = field.get(model) as Channel<String>
+            while (channel.trySend("synthetic progress").isSuccess) { }
+            job = start(model, password)
+            assertTrue(model.busy.value)
+        }
+        withTimeout(10_000) { job.cancelAndJoin() }
+        InstrumentationRegistry.getInstrumentation().runOnMainSync { assertFalse(model.busy.value) }
+        if (requirePasswordWipe) assertTrue(password.all { it == '\u0000' })
+        password.fill('\u0000') // Scanning has no password; clear this test-owned unused array too.
+        assertFalse(File(context.cacheDir, "unopened.htbackup").exists())
+        assertEquals(listOf(member), database.familyMemberDao().all())
     }
 
     private fun createViewModel(): AppViewModel {

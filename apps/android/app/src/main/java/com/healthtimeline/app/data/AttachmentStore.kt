@@ -8,12 +8,34 @@ import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
+
+/** Cooperative cancellation is required around blocking provider reads, not only at Room calls. */
+internal suspend fun copyAttachmentBytes(input: InputStream, output: OutputStream, digest: MessageDigest) {
+    val copyContext = currentCoroutineContext()
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var total = 0L
+    while (true) {
+        copyContext.ensureActive()
+        val read = input.read(buffer)
+        copyContext.ensureActive()
+        if (read < 0) break
+        total += read
+        require(total <= AttachmentStore.MAX_FILE_BYTES) { "单个文件不能超过 100 MB" }
+        output.write(buffer, 0, read)
+        digest.update(buffer, 0, read)
+    }
+}
 
 class AttachmentStore(
     private val context: Context,
@@ -33,6 +55,7 @@ class AttachmentStore(
 
     suspend fun import(recordId: Long, uri: Uri): Result<AttachmentEntity> = withContext(Dispatchers.IO) {
         runCatching {
+            currentCoroutineContext().ensureActive()
             val resolver = context.contentResolver
             val metadata = metadata(resolver, uri)
             require(metadata.size in 0..MAX_FILE_BYTES) { "单个文件不能超过 100 MB" }
@@ -52,22 +75,15 @@ class AttachmentStore(
             val partial = File(destination.parentFile, "${destination.name}.partial")
             val digest = MessageDigest.getInstance("SHA-256")
             var moved = false
+            var committed = false
             try {
                 resolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(partial).use { output ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        var total = 0L
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            total += read
-                            require(total <= MAX_FILE_BYTES) { "单个文件不能超过 100 MB" }
-                            output.write(buffer, 0, read)
-                            digest.update(buffer, 0, read)
-                        }
+                        copyAttachmentBytes(input, output, digest)
                         output.fd.sync()
                     }
                 } ?: error("无法读取所选文件")
+                currentCoroutineContext().ensureActive()
                 require(partial.renameTo(destination)) { "无法保存附件" }
                 moved = true
                 validateContent(destination, kind)
@@ -81,10 +97,17 @@ class AttachmentStore(
                     sha256 = digest.digest().joinToString("") { "%02x".format(it) },
                     createdAt = Instant.now().toString()
                 )
-                val id = dao.insert(entity)
-                entity.copy(id = id)
+                currentCoroutineContext().ensureActive()
+                // Finish only the database commit and its local acknowledgement atomically with
+                // respect to cancellation. A caller may still be cancelled on the outer IO return,
+                // but a committed row must never lose its already-validated report file.
+                withContext(NonCancellable) {
+                    val id = dao.insert(entity)
+                    committed = true
+                    entity.copy(id = id)
+                }
             } catch (error: Throwable) {
-                if (moved) destination.delete()
+                if (moved && !committed) destination.delete()
                 throw error
             } finally {
                 partial.delete()

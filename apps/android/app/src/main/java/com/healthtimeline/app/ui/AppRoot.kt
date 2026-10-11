@@ -34,6 +34,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.reminders.NotificationReviewRequest
+import com.healthtimeline.app.data.CameraCaptureStore
+import com.healthtimeline.app.data.ClinicalRecordEntity
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -77,28 +79,88 @@ fun HealthTimelineRoot(
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val members by viewModel.members.collectAsStateWithLifecycle()
+    val selectedMemberUuid = members.firstOrNull { it.id == selectedMemberId && !it.archived }?.uuid
     val backupFlow: BackupExportFlowViewModel = composeViewModel()
-    backupFlow.bindMember(selectedMemberId)
-    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
-        appLockManager.endExternalActivity()
-        backupFlow.receive(uri?.toString())
+    val externalFlow: ExternalImportFlowViewModel = composeViewModel()
+    val captures = remember(context.applicationContext) { CameraCaptureStore(context.applicationContext) }
+    backupFlow.bindMember(selectedMemberId, selectedMemberUuid, memberListLoaded = members.isNotEmpty())
+    externalFlow.bindMember(selectedMemberId, selectedMemberUuid, memberListLoaded = members.isNotEmpty())
+    DisposableEffect(viewModel, backupFlow, externalFlow) {
+        val unsubscribe = viewModel.observeMemberSelectionChanges { id ->
+            backupFlow.bindMember(id)
+            externalFlow.bindMember(id, null)
+        }
+        onDispose { unsubscribe() }
     }
-    val safetyExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
-        appLockManager.endExternalActivity()
-        backupFlow.receive(uri?.toString())
+    // These collectors stay alive through locking and external activities. A -> B -> A is not a reset.
+    LaunchedEffect(viewModel, backupFlow, externalFlow) {
+        launch {
+            viewModel.selectedMemberId.collect { id ->
+                backupFlow.bindMember(id)
+                externalFlow.bindMember(id, null)
+            }
+        }
+        launch {
+            viewModel.members.collect { loaded ->
+                val id = viewModel.selectedMemberId.value
+                val uuid = loaded.firstOrNull { it.id == id && !it.archived }?.uuid
+                backupFlow.bindMember(id, uuid, memberListLoaded = loaded.isNotEmpty())
+                externalFlow.bindMember(id, uuid, memberListLoaded = loaded.isNotEmpty())
+            }
+        }
     }
-    fun beginBackupExport(kind: BackupExportKind, password: CharArray, source: Uri? = null) {
-        if (!backupFlow.begin(kind, viewModel.selectedMemberId.value, password, source?.toString())) {
+    val externalActions = rememberExternalImportActions(
+        flow = externalFlow,
+        memberId = selectedMemberId,
+        memberUuid = selectedMemberUuid,
+        locked = locked,
+        canProcess = { !appLockManager.locked.value && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) },
+        onExternalStarted = appLockManager::beginExternalActivity,
+        onExternalFinished = appLockManager::endExternalActivity,
+        onAttachmentsReady = { target, uris, cameraUri ->
+            val job = viewModel.importAttachments(target, uris)
+            cameraUri?.let { captures.discardAfter(job, it) }
+        },
+        onBackupReady = { tab = Tab.SETTINGS },
+        discardCamera = { captures.discard(it) }
+    )
+    fun beginAttachmentImport(record: ClinicalRecordEntity, memberUuid: String, fromCamera: Boolean) {
+        if (busy || backupFlow.busy.value || externalFlow.busy.value || externalFlow.backupSource.value != null || appLockManager.locked.value) return
+        val selectionEpoch = externalFlow.selectionEpoch
+        // Identity is fixed before awaiting the repository, never inferred from a picker result.
+        uiScope.launch {
+            val target = viewModel.captureAttachmentImportTarget(record, memberUuid) ?: return@launch
+            if (appLockManager.locked.value || !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) ||
+                externalFlow.selectionEpoch != selectionEpoch ||
+                viewModel.selectedMemberId.value != target.memberId ||
+                viewModel.members.value.none { it.id == target.memberId && it.uuid == target.memberUuid && !it.archived }) return@launch
+            if (fromCamera) {
+                runCatching { captures.createUri() }.fold(
+                    onSuccess = { externalActions.camera(target, it) },
+                    onFailure = { externalFlow.abortMessage.value = "无法创建拍照临时文件，未保存报告。请检查手机剩余空间后重试。" }
+                )
+            } else externalActions.attachments(target)
+        }
+    }
+    val backupActions = rememberBackupDocumentActions(
+        flow = backupFlow,
+        onExternalStarted = appLockManager::beginExternalActivity,
+        onExternalFinished = appLockManager::endExternalActivity,
+        canLaunch = { !appLockManager.locked.value && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) }
+    )
+    fun beginBackupExport(kind: BackupExportKind, password: CharArray, source: Uri? = null, frozenMember: ExternalImportMember? = null) {
+        val id = viewModel.selectedMemberId.value
+        val member = frozenMember ?: viewModel.members.value.firstOrNull { it.id == id && !it.archived }?.let { ExternalImportMember(it.id, it.uuid) }
+        if (appLockManager.locked.value || viewModel.busy.value || externalFlow.busy.value || externalFlow.backupSource.value != null || backupFlow.abortedDestinations.value.isNotEmpty() ||
+            member == null || member.id != id || viewModel.members.value.none { it.id == member.id && it.uuid == member.uuid && !it.archived } ||
+            !backupFlow.begin(kind, member.id, password, source?.toString(), member.uuid)) {
+            password.fill('\u0000')
             uiScope.launch { snackbar.showSnackbar("已有备份选择操作，或尚未选择成员。请完成当前操作后重试。") }
             return
         }
-        appLockManager.beginExternalActivity()
-        runCatching {
-            if (kind == BackupExportKind.EXPORT) exportLauncher.launch("病程日历-${LocalDate.now()}.htbackup")
-            else safetyExportLauncher.launch("病程日历-替换前安全备份-${LocalDate.now()}.htbackup")
-        }.onFailure {
-            appLockManager.endExternalActivity()
-            backupFlow.cancelAfterLaunchFailure()
+        val name = if (kind == BackupExportKind.EXPORT) "病程日历-${LocalDate.now()}.htbackup" else "病程日历-替换前安全备份-${LocalDate.now()}.htbackup"
+        if (!backupActions.launch(kind, name)) {
             uiScope.launch { snackbar.showSnackbar("无法打开保存位置，备份操作未执行，请重试。") }
         }
     }
@@ -110,34 +172,46 @@ fun HealthTimelineRoot(
             backupFlow.acknowledgeAbort(message)
         }
     }
-    LaunchedEffect(locked, backupFlow.revision.value, selectedMemberId) {
-        if (!locked) when (val completion = backupFlow.takeCompletion(viewModel.selectedMemberId.value)) {
+    LaunchedEffect(locked, backupFlow.revision.value, selectedMemberId, selectedMemberUuid, backupFlow.abortedDestinations.value) {
+        if (!locked && !appLockManager.locked.value && backupFlow.abortedDestinations.value.isEmpty()) when (val completion = backupFlow.takeCompletion(viewModel.selectedMemberId.value, selectedMemberUuid)) {
             is BackupExportFlowViewModel.Completion.Ready -> {
                 if (completion.kind == BackupExportKind.EXPORT) {
                     viewModel.exportBackup(Uri.parse(completion.destination), completion.password)
                 } else {
                     viewModel.restoreBackupWithSafetyExport(
                         Uri.parse(completion.destination), Uri.parse(requireNotNull(completion.source)), completion.password,
-                        completion.memberId
+                        completion.memberId, targetMemberUuid = completion.memberUuid
                     )
                 }
             }
-            is BackupExportFlowViewModel.Completion.Aborted -> {
-                // Delete only a provably empty document, never an existing valid backup.
-                withContext(Dispatchers.IO) {
-                    completion.destination?.let { destination ->
-                        runCatching {
-                            val uri = Uri.parse(destination)
-                            val empty = context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                                val column = cursor.getColumnIndex(OpenableColumns.SIZE)
-                                cursor.moveToFirst() && column >= 0 && !cursor.isNull(column) && cursor.getLong(column) == 0L
-                            } == true
-                            if (empty && DocumentsContract.isDocumentUri(context, uri)) DocumentsContract.deleteDocument(context.contentResolver, uri)
-                        }
+            is BackupExportFlowViewModel.Completion.Aborted -> Unit // Durable cleanup queue below.
+            else -> Unit
+        }
+    }
+    LaunchedEffect(locked, busy, backupFlow.abortedDestinations.value) {
+        if (!locked && !appLockManager.locked.value && !viewModel.busy.value) backupFlow.abortedDestinations.value.forEach { destination ->
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    val uri = Uri.parse(destination)
+                    val empty = context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                        val column = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        cursor.moveToFirst() && column >= 0 && !cursor.isNull(column) && cursor.getLong(column) == 0L
+                    } == true
+                    // Don't trust an incomplete provider size alone, and don't touch existing backups.
+                    if (empty && DocumentsContract.isDocumentUri(context, uri) &&
+                        context.contentResolver.openInputStream(uri)?.use { it.read() == -1 } == true) {
+                        DocumentsContract.deleteDocument(context.contentResolver, uri)
                     }
                 }
             }
-            else -> Unit
+            // Cancellation during rotation/locking retains the candidate for a later harmless recheck.
+            backupFlow.acknowledgeAbortedDestination(destination)
+        }
+    }
+    LaunchedEffect(locked, externalFlow.abortMessage.value) {
+        if (!locked) externalFlow.abortMessage.value?.let { message ->
+            snackbar.showSnackbar(message)
+            externalFlow.acknowledgeAbort(message)
         }
     }
     // Bind before composing forms; clearing afterward could discard a just-created draft on rotation.
@@ -220,7 +294,6 @@ fun HealthTimelineRoot(
     }
 
     val overview by viewModel.todayOverview.collectAsStateWithLifecycle()
-    val members by viewModel.members.collectAsStateWithLifecycle()
     val todayActionBusy by viewModel.todayActionBusy.collectAsStateWithLifecycle()
     // The selection flow changes before a new database snapshot arrives.
     val visibleOverview = overview.copy(
@@ -279,7 +352,11 @@ fun HealthTimelineRoot(
                     busy = busy || todayActionBusy,
                     onRetry = viewModel::refreshTodayOverview
                 )
-                Tab.CALENDAR -> CalendarScreen(viewModel, padding, navigation as? TodayNavigation.AddRecord, ::consumeNavigation)
+                Tab.CALENDAR -> CalendarScreen(
+                    viewModel, padding, navigation as? TodayNavigation.AddRecord, ::consumeNavigation,
+                    importPickerBusy = busy || backupFlow.busy.value || externalFlow.busy.value || externalFlow.backupSource.value != null,
+                    onImportAttachments = ::beginAttachmentImport
+                )
                 Tab.FOLLOW_UP -> FollowUpScreen(viewModel, padding, navigation as? TodayNavigation.FollowUpDetail, ::consumeNavigation)
                 Tab.MEDICATION -> MedicationScreen(viewModel, padding, navigation as? TodayNavigation.MedicationDay, ::consumeNavigation)
                 Tab.SETTINGS -> SettingsScreen(
@@ -291,9 +368,16 @@ fun HealthTimelineRoot(
                     },
                     navigation = navigation as? TodayNavigation.Safety,
                     onNavigationConsumed = ::consumeNavigation,
-                    backupPickerBusy = backupFlow.busy.value,
+                    backupPickerBusy = busy || backupFlow.busy.value || backupFlow.abortedDestinations.value.isNotEmpty() || externalFlow.busy.value || externalFlow.backupSource.value != null,
+                    pendingBackupImport = externalFlow.backupSource.value,
+                    onImportRequest = {
+                        viewModel.members.value.firstOrNull { it.id == viewModel.selectedMemberId.value && !it.archived }?.let { member ->
+                            if (!busy && !backupFlow.busy.value) externalActions.backup(ExternalImportMember(member.id, member.uuid))
+                        }
+                    },
+                    onImportFinished = externalFlow::finishBackup,
                     onExportRequest = { beginBackupExport(BackupExportKind.EXPORT, it) },
-                    onSafetyExportRequest = { source, password -> beginBackupExport(BackupExportKind.SAFETY_BEFORE_REPLACE, password, source) }
+                    onSafetyExportRequest = { source, password, member -> beginBackupExport(BackupExportKind.SAFETY_BEFORE_REPLACE, password, source, member) }
                 )
             }
             if (busy) LinearProgressIndicator()

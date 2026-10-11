@@ -5,6 +5,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.healthtimeline.app.backup.PortableBackupService
+import com.healthtimeline.app.backup.withBackupReminderRecovery
+import com.healthtimeline.app.backup.eraseBackupPasswordOnCompletion
 import com.healthtimeline.app.data.*
 import com.healthtimeline.app.reminders.AlarmScheduler
 import com.healthtimeline.app.reminders.NotificationReviewRequest
@@ -44,6 +46,7 @@ class AppViewModel(
 ) : ViewModel() {
     val members = repository.memberFlow.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     private val selectedMemberIdMutable = MutableStateFlow(memberSelection.read())
+    private val selectionChangeListeners = MemberSelectionChangeListeners()
     val selectedMemberId = selectedMemberIdMutable
     val selectedMember = combine(members, selectedMemberId) { values, id -> values.firstOrNull { it.id == id } }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -165,7 +168,7 @@ class AppViewModel(
         // Always read the authoritative member above; the UI flow may still be
         // loading at cold start. No dose is recorded by opening a notification.
         memberSelection.write(member.id)
-        selectedMemberIdMutable.value = member.id
+        updateSelectedMember(member.id)
         messages.send(if (medication.archived) "疗程已结束，可核对历史用药记录" else "请核对用药信息后再记录")
         return TodayNavigation.MedicationDay(member.id, date)
     }
@@ -227,7 +230,7 @@ class AppViewModel(
                     // separately shared members flow may still hold its initial
                     // empty list (or the previous list) during startup/archival.
                     val fallback = active.firstOrNull()?.id
-                    selectedMemberIdMutable.value = fallback
+                    updateSelectedMember(fallback)
                     if (fallback != null) runCatching { memberSelection.write(fallback) }
                         .onFailure { messages.send(it.userMessage("无法保存默认成员选择")) }
                 }
@@ -237,11 +240,27 @@ class AppViewModel(
 
     fun selectMember(memberId: Long) {
         if (members.value.any { it.id == memberId && !it.archived }) {
-            selectedMemberIdMutable.value = memberId
+            updateSelectedMember(memberId)
             runCatching { memberSelection.write(memberId) }.onFailure {
                 viewModelScope.launch { messages.send(it.userMessage("无法保存成员选择")) }
             }
         }
+    }
+
+    internal fun observeMemberSelectionChanges(listener: (Long?) -> Unit): () -> Unit =
+        selectionChangeListeners.observe(listener)
+
+    private fun updateSelectedMember(memberId: Long?) {
+        if (selectedMemberIdMutable.value != memberId) {
+            // Notify before publishing, including quick switches that observers of StateFlow miss.
+            selectionChangeListeners.changed(memberId)
+            selectedMemberIdMutable.value = memberId
+        }
+    }
+
+    override fun onCleared() {
+        selectionChangeListeners.clear()
+        super.onCleared()
     }
 
     fun selectMedicationMonth(month: YearMonth) {
@@ -303,11 +322,21 @@ class AppViewModel(
         messages.send("病历已移入回收站，可在 30 天内恢复")
     }
 
-    fun importAttachments(record: ClinicalRecordEntity, memberUuid: String, uris: List<Uri>) = viewModelScope.launch {
-        busyChannel.value = true
+    suspend fun captureAttachmentImportTarget(record: ClinicalRecordEntity, memberUuid: String): AttachmentImportTarget? =
         try {
             require(selectedMemberId.value == record.memberId) { "当前成员已变化，未导入报告。请重新选择病历" }
-            val target = repository.captureAttachmentTarget(record, memberUuid)
+            repository.captureAttachmentTarget(record, memberUuid)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            messages.trySend(error.userMessage("无法开始导入报告，请重新选择病历"))
+            null
+        }
+
+    fun importAttachments(target: AttachmentImportTarget, uris: List<Uri>) = viewModelScope.launch {
+        busyChannel.value = true
+        try {
+            require(selectedMemberId.value == target.memberId) { "当前成员已变化，未导入报告。请重新选择病历" }
             var imported = 0
             for (uri in uris) {
                 if (selectedMemberId.value != target.memberId) {
@@ -436,63 +465,96 @@ class AppViewModel(
 
     fun exportBackup(uri: Uri, password: CharArray) = launchResult("正在导出备份", "备份已导出") {
         backupService.export(uri, password).getOrThrow()
-    }
+    }.eraseBackupPasswordOnCompletion(password)
 
     fun previewBackup(
         uri: Uri,
         password: CharArray,
         onReady: (BackupImportPreview) -> Unit,
-        onFailed: () -> Unit = {}
+        onFailed: () -> Unit = {},
+        targetMemberId: Long? = selectedMemberId.value,
+        targetMemberUuid: String? = selectedMember.value?.uuid
     ) = viewModelScope.launch {
         busyChannel.value = true
-        messages.send("正在验证备份")
         try {
-            backupService.previewImport(uri, password, selectedMemberId.value).fold(
+            messages.send("正在验证备份")
+            backupService.previewImport(uri, password, targetMemberId, targetMemberUuid).fold(
                 onSuccess = onReady,
                 onFailure = { onFailed(); messages.send(it.userMessage("备份验证失败")) }
             )
         } finally { busyChannel.value = false }
-    }
+    }.eraseBackupPasswordOnCompletion(password)
 
-    fun mergeBackup(uri: Uri, password: CharArray, decisions: Map<String, MergeChoice>) =
+    fun mergeBackup(
+        uri: Uri,
+        password: CharArray,
+        decisions: Map<String, MergeChoice>,
+        targetMemberId: Long? = selectedMemberId.value,
+        targetMemberUuid: String? = selectedMember.value?.uuid
+    ) =
         launchResult("正在安全合并", "备份已合并") {
-            scheduler.cancelAllPersisted()
-            scheduler.cancelAllNotifications()
             try {
-                backupService.mergeImport(uri, password, decisions, selectedMemberId.value).getOrThrow()
+                recoverBackupReminders(pauseExisting = true) {
+                    backupService.mergeImport(uri, password, decisions, targetMemberId, targetMemberUuid).getOrThrow()
+                }
             } finally {
-                runCatching { scheduler.rescheduleAll() }
-                    .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
+                password.fill('\u0000')
             }
-        }
+        }.eraseBackupPasswordOnCompletion(password)
 
-    fun importLegacyBackupAsNew(uri: Uri, password: CharArray) =
+    fun importLegacyBackupAsNew(
+        uri: Uri,
+        password: CharArray,
+        targetMemberId: Long? = selectedMemberId.value,
+        targetMemberUuid: String? = selectedMember.value?.uuid
+    ) =
         launchResult("正在作为新资料导入", "旧版备份已作为新资料导入") {
-            backupService.importLegacyAsNew(uri, password, selectedMemberId.value).getOrThrow()
-            runCatching { scheduler.rescheduleAll() }
-                .onFailure { messages.send("资料已导入，但部分系统提醒安排失败；请重新打开应用") }
-        }
+            try {
+                recoverBackupReminders(pauseExisting = false) {
+                    backupService.importLegacyAsNew(uri, password, targetMemberId, targetMemberUuid).getOrThrow()
+                }
+            } finally {
+                password.fill('\u0000')
+            }
+        }.eraseBackupPasswordOnCompletion(password)
 
     fun restoreBackupWithSafetyExport(
         safetyDestination: Uri,
         source: Uri,
         password: CharArray,
-        targetMemberId: Long? = selectedMemberId.value
+        targetMemberId: Long? = selectedMemberId.value,
+        targetMemberUuid: String? = selectedMember.value?.uuid
     ) = launchResult("正在导出安全备份并恢复", "安全备份已导出，数据已恢复") {
         try {
-            backupService.export(safetyDestination, password.copyOf()).getOrThrow()
-            scheduler.cancelAllPersisted()
-            scheduler.cancelAllNotifications()
+            val exportPassword = password.copyOf()
             try {
-                backupService.replaceFromBackup(source, password, targetMemberId).getOrThrow()
+                backupService.export(safetyDestination, exportPassword).getOrThrow()
             } finally {
-                runCatching { scheduler.rescheduleAll() }
-                    .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
+                // Also wipe if cancellation prevents the service's IO body from starting.
+                exportPassword.fill('\u0000')
+            }
+            recoverBackupReminders(pauseExisting = true) {
+                backupService.replaceFromBackup(source, password, targetMemberId, targetMemberUuid).getOrThrow()
             }
         } finally {
             password.fill('\u0000')
         }
-    }
+    }.eraseBackupPasswordOnCompletion(password)
+
+    private suspend fun <T> recoverBackupReminders(pauseExisting: Boolean, operation: suspend () -> T): T =
+        withBackupReminderRecovery(
+            pause = {
+                if (pauseExisting) {
+                    scheduler.cancelAllPersisted()
+                    scheduler.cancelAllNotifications()
+                }
+            },
+            rebuild = { scheduler.rescheduleAll() },
+            onRebuildFailed = {
+                messages.trySend("系统提醒重建失败；请重新打开应用并检查提醒权限与提醒状态")
+            },
+            operation = operation
+        )
 
     fun recordDose(
         value: MedicationDayEntry,
@@ -529,8 +591,8 @@ class AppViewModel(
 
     fun runSafetyIntegrityCheck() = viewModelScope.launch {
         busyChannel.value = true
-        messages.send("正在检查数据库和全部附件，请保持应用开启")
         try {
+            messages.send("正在检查数据库和全部附件，请保持应用开启")
             runCatching { safetyCenter.runIntegrityCheck() }
                 .onSuccess { result ->
                     messages.send(
@@ -559,8 +621,8 @@ class AppViewModel(
 
     private fun launchResult(progress: String, success: String, block: suspend () -> Unit) = viewModelScope.launch {
         busyChannel.value = true
-        messages.send(progress)
         try {
+            messages.send(progress)
             runCatching { block() }
                 .onSuccess { messages.send(success) }
                 .onFailure { messages.send(it.userMessage("操作失败")) }

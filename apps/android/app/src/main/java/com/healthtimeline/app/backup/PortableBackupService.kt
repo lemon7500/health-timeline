@@ -34,7 +34,6 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class PortableBackupService(
@@ -79,10 +78,12 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun previewImport(source: Uri, password: CharArray, targetMemberId: Long?): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
+    suspend fun previewImport(source: Uri, password: CharArray, targetMemberId: Long?,
+        expectedTargetMemberUuid: String? = null): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runBackupCatching {
+                    requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                     prepare(source, password).use { prepared ->
                         if (prepared.portable == null) {
                             BackupImportPreview(0, 0, 0, emptyList(), legacyReplacementOnly = true)
@@ -108,11 +109,13 @@ class PortableBackupService(
         source: Uri,
         password: CharArray,
         decisions: Map<String, MergeChoice>,
-        targetMemberId: Long?
+        targetMemberId: Long?,
+        expectedTargetMemberUuid: String? = null
     ): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runBackupCatching {
+                    requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                     prepare(source, password).use { prepared ->
                         val rawImported = requireNotNull(prepared.portable) { "旧版备份不能与现有数据自动合并，请选择安全替换" }
                         val currentEntities = loadEntities()
@@ -134,22 +137,29 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun replaceFromBackup(source: Uri, password: CharArray, targetMemberId: Long?): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun replaceFromBackup(source: Uri, password: CharArray, targetMemberId: Long?,
+        expectedTargetMemberUuid: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             runBackupCatching {
                 // Determine the manifest version only after authenticating and validating the archive.
                 prepare(source, password).use { prepared ->
                     if (prepared.portable == null) {
                         val target = repository.mutationMutex.withLock {
+                            requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                             val current = loadEntities()
-                            writeSafetyBackup(password, current)
                             current.members.firstOrNull { it.id == targetMemberId && !it.archived }
                                 ?: current.members.firstOrNull { !it.archived }
                                 ?: error("没有可用的家庭成员")
                         }
-                        legacy.restore(source, password.copyOf(), target.id).getOrThrow()
+                        val legacyPassword = password.copyOf()
+                        try {
+                            legacy.restore(source, legacyPassword, target.id,
+                                expectedTargetMemberUuid = target.uuid,
+                                beforeReplace = { writeSafetyBackup(password, loadEntities()) }).getOrThrow()
+                        } finally { legacyPassword.fill('\u0000') }
                     } else {
                         repository.mutationMutex.withLock {
+                            requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                             val current = loadEntities()
                             val imported = normalizeForFamily(prepared.portable, null, createDefaultMember = true)
                             writeSafetyBackup(password, current)
@@ -166,12 +176,22 @@ class PortableBackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun importLegacyAsNew(source: Uri, password: CharArray, targetMemberId: Long?): Result<Int> {
+    suspend fun importLegacyAsNew(source: Uri, password: CharArray, targetMemberId: Long?,
+        expectedTargetMemberUuid: String? = null): Result<Int> {
         val target = targetMemberId ?: run {
             password.fill('\u0000')
             return Result.failure(IllegalArgumentException("请选择旧版备份要导入到的家庭成员"))
         }
-        return legacy.importAsNew(source, password, target)
+        return legacy.importAsNew(source, password, target, expectedTargetMemberUuid)
+    }
+
+    /** Called only while the repository mutation mutex is held. A reused ID is not the same person. */
+    private suspend fun requireExpectedTargetMember(id: Long?, expectedUuid: String?) {
+        if (expectedUuid == null) return
+        val member = id?.let { database.familyMemberDao().byId(it) }
+        require(member != null && !member.archived && member.uuid.equals(expectedUuid, ignoreCase = true)) {
+            "导入时选择的家庭成员已改变或归档，请重新选择并核对"
+        }
     }
 
     private suspend fun loadEntities() = database.withTransaction {
@@ -262,47 +282,26 @@ class PortableBackupService(
             } catch (error: Throwable) {
                 throw IllegalArgumentException("密码错误或备份文件已损坏", error)
             }
-            ZipFile(zipFile).use { zip ->
-                val manifestEntry = zip.getEntry("manifest.json") ?: error("备份缺少清单")
-                require(manifestEntry.size in 1..BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单大小异常" }
-                val json = zip.getInputStream(manifestEntry).use(budget::readManifest)
-                if (JSONObject(json).optInt("schemaVersion", -1) == 1) {
-                    // The legacy service performs its own complete validation before replacement.
-                    return PreparedImport(root, null)
-                }
-                val portable = PortableJson.decode(json)
-                val entriesByPath = hashMapOf<String, ZipEntry>()
-                zip.entries().asSequence().forEach { entry ->
-                    budget.checkpoint()
-                    require(entriesByPath.size <= portable.attachments.size) { "备份包含多余文件" }
-                    require(entriesByPath.put(entry.name.lowercase(), entry) == null) { "备份包含重复文件路径" }
-                }
-                val totalSize = portable.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
-                budget.requireSpace(totalSize)
-                val staged = File(root, "files").apply { require(mkdirs()) { "无法创建附件临时目录" } }
-                portable.attachments.forEach { attachment ->
-                    val entry = entriesByPath[attachment.archivePath.lowercase()] ?: error("附件缺失：${attachment.displayName}")
-                    require(entry.size in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常：${attachment.displayName}" }
-                    val destination = File(staged, attachment.uuid)
-                    copyVerified(zip, entry.name, destination, attachment, budget)
-                }
-                return PreparedImport(root, portable)
+            val zip = BoundedBackupZip.open(zipFile, budget, availableStorageBytes())
+            val json = zip.readManifest()
+            if (JSONObject(json).optInt("schemaVersion", -1) == 1) {
+                // The legacy service performs its own complete validation before replacement.
+                return PreparedImport(root, null)
             }
+            val portable = PortableJson.decode(json)
+            val totalSize = portable.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
+            budget.requireSpace(totalSize)
+            val staged = File(root, "files").apply { require(mkdirs()) { "无法创建附件临时目录" } }
+            val targets = portable.attachments.associate { attachment ->
+                val destination = File(staged, attachment.uuid)
+                attachment.archivePath to BoundedBackupZip.Target(destination, attachment.sizeBytes, attachment.sha256)
+            }
+            zip.extract(targets)
+            return PreparedImport(root, portable)
         } catch (error: Throwable) {
             root.deleteRecursively()
             throw error
         }
-    }
-
-    private fun copyVerified(zip: ZipFile, entryName: String, destination: File, attachment: PortableAttachment, budget: BackupResourceBudget) {
-        val entry = requireNotNull(zip.getEntry(entryName))
-        zip.getInputStream(entry).use { input ->
-            FileOutputStream(destination).use { output ->
-                budget.copy(input, budget.limitOutput(output), minOf(attachment.sizeBytes, AttachmentStore.MAX_FILE_BYTES))
-                output.fd.sync()
-            }
-        }
-        require(destination.length() == attachment.sizeBytes && sha256(destination, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
     }
 
     private suspend fun installPortable(

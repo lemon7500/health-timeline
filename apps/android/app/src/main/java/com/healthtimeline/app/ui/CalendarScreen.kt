@@ -3,9 +3,6 @@ package com.healthtimeline.app.ui
 import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -37,7 +34,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.data.*
-import com.healthtimeline.app.HealthTimelineApplication
 import com.healthtimeline.app.domain.AiRecordFormattingPromptBuilder
 import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.IssueSeverity
@@ -53,7 +49,9 @@ fun CalendarScreen(
     viewModel: AppViewModel,
     padding: PaddingValues,
     navigation: TodayNavigation.AddRecord? = null,
-    onNavigationConsumed: (String) -> Unit = {}
+    onNavigationConsumed: (String) -> Unit = {},
+    importPickerBusy: Boolean = false,
+    onImportAttachments: (ClinicalRecordEntity, String, Boolean) -> Unit
 ) {
     val cachedRecords by viewModel.records.collectAsStateWithLifecycle()
     val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
@@ -241,6 +239,8 @@ fun CalendarScreen(
             condition = conditions.firstOrNull { it.id == record.conditionId },
             attachments = attachments.filter { it.recordId == record.id },
             viewModel = viewModel,
+            importPickerBusy = importPickerBusy,
+            onImportAttachments = { frozenMemberUuid, fromCamera -> onImportAttachments(record, frozenMemberUuid, fromCamera) },
             onEdit = { editing = record; details = null },
             onDelete = { deleteTarget = record; details = null },
             onDismiss = { details = null }
@@ -1264,6 +1264,8 @@ private fun RecordDetailDialog(
     condition: ConditionEntity?,
     attachments: List<AttachmentEntity>,
     viewModel: AppViewModel,
+    importPickerBusy: Boolean,
+    onImportAttachments: (String, Boolean) -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit
@@ -1272,24 +1274,6 @@ private fun RecordDetailDialog(
     val importMemberUuid = remember(record.uuid) { memberUuid }
     var viewer by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
     var attachmentDeleteTarget by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
-    var cameraUriText by rememberSaveable(record.uuid) { mutableStateOf<String?>(null) }
-    val context = LocalContext.current
-    val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
-    val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        appLockManager.endExternalActivity()
-        if (uris.isNotEmpty()) viewModel.importAttachments(record, importMemberUuid, uris)
-    }
-    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        appLockManager.endExternalActivity()
-        cameraUriText?.let { text ->
-            val uri = Uri.parse(text)
-            val captures = com.healthtimeline.app.data.CameraCaptureStore(context.applicationContext)
-            if (success && viewModel.selectedMemberId.value == record.memberId) {
-                captures.discardAfter(viewModel.importAttachments(record, importMemberUuid, listOf(uri)), uri)
-            } else captures.discard(uri)
-        }
-        cameraUriText = null
-    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(record.title) },
@@ -1302,26 +1286,12 @@ private fun RecordDetailDialog(
                 HorizontalDivider()
                 Text("检查报告（${attachments.size}）", fontWeight = FontWeight.SemiBold)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = {
-                        appLockManager.beginExternalActivity()
-                        documentPicker.launch(arrayOf("image/*", "application/pdf"))
-                    }) {
+                    OutlinedButton(enabled = !importPickerBusy, onClick = { onImportAttachments(importMemberUuid, false) }) {
                         Icon(Icons.Outlined.AttachFile, null); Text("选择文件")
                     }
-                    OutlinedButton(enabled = cameraUriText == null, onClick = {
-                        val captures = com.healthtimeline.app.data.CameraCaptureStore(context.applicationContext)
-                        runCatching {
-                            val uri = captures.createUri()
-                            cameraUriText = uri.toString()
-                            appLockManager.beginExternalActivity()
-                            camera.launch(uri)
-                        }.onFailure {
-                            appLockManager.endExternalActivity()
-                            cameraUriText?.let { captures.discard(Uri.parse(it)) }
-                            cameraUriText = null
-                            android.widget.Toast.makeText(context, "无法打开相机，请检查可用相机及手机剩余空间。", android.widget.Toast.LENGTH_LONG).show()
-                        }
-                    }) { Icon(Icons.Outlined.CameraAlt, null); Text("拍照") }
+                    OutlinedButton(enabled = !importPickerBusy, onClick = { onImportAttachments(importMemberUuid, true) }) {
+                        Icon(Icons.Outlined.CameraAlt, null); Text("拍照")
+                    }
                 }
                 attachments.forEach { attachment ->
                     ListItem(

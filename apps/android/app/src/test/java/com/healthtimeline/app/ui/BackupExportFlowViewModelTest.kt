@@ -6,6 +6,54 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BackupExportFlowViewModelTest {
+    @Test fun frozenUuidWaitsForDatabaseLoadAndSurvivesRecreation() {
+        val model = BackupExportFlowViewModel()
+        assertTrue(model.begin(BackupExportKind.SAFETY_BEFORE_REPLACE, 1, "test-password".toCharArray(), "content://test/source", "member-a"))
+        model.receive("content://test/destination")
+        assertNull(model.takeCompletion(1))
+        val result = model.takeCompletion(1, "member-a") as BackupExportFlowViewModel.Completion.Ready
+        assertEquals("member-a", result.memberUuid)
+        result.password.fill('\u0000')
+    }
+
+    @Test fun restoringSameNumericMemberIdWithDifferentUuidInvalidatesSafetyExport() {
+        val model = BackupExportFlowViewModel()
+        val password = "test-password".toCharArray()
+        assertTrue(model.begin(BackupExportKind.SAFETY_BEFORE_REPLACE, 1, password, "content://test/source", "member-a"))
+        model.bindMember(1, "member-restored")
+        model.bindMember(1, "member-a")
+        model.receive("content://test/destination")
+        assertTrue(model.takeCompletion(1, "member-a") is BackupExportFlowViewModel.Completion.Aborted)
+        assertTrue(password.all { it == '\u0000' })
+    }
+
+    @Test fun loadedMissingMemberAbortsInsteadOfWaitingForUuidForever() {
+        val model = BackupExportFlowViewModel()
+        assertTrue(model.begin(BackupExportKind.EXPORT, 1, "test-password".toCharArray(), memberUuid = "member-a"))
+        model.receive("content://test/destination")
+        assertNull(model.takeCompletion(1))
+        val revision = model.revision.value
+        model.bindMember(1, null, memberListLoaded = true)
+        assertTrue(model.revision.value > revision)
+        assertTrue(model.takeCompletion(1) is BackupExportFlowViewModel.Completion.Aborted)
+        assertFalse(model.busy.value)
+        assertEquals(listOf("content://test/destination"), model.abortedDestinations.value)
+    }
+
+    @Test fun processDeathOrphanOnlyQueuesCleanupAndDoesNotCompleteNewExport() {
+        val model = BackupExportFlowViewModel()
+        val password = "test-new-password".toCharArray()
+        assertTrue(model.begin(BackupExportKind.EXPORT, 1, password, memberUuid = "member-a"))
+        model.reportInterruptedProcess("content://test/old-destination")
+        assertTrue(model.busy.value)
+        assertNull(model.takeCompletion(1, "member-a"))
+        assertEquals(listOf("content://test/old-destination"), model.abortedDestinations.value)
+        model.receive("content://test/new-destination")
+        val completion = model.takeCompletion(1, "member-a") as BackupExportFlowViewModel.Completion.Ready
+        assertEquals("content://test/new-destination", completion.destination)
+        completion.password.fill('\u0000')
+    }
+
     @Test fun pickerRequestSurvivesRecreationOfThePageOwner() {
         val store = ViewModelStore()
         val first = ViewModelProvider(store, ViewModelProvider.NewInstanceFactory())[BackupExportFlowViewModel::class.java]

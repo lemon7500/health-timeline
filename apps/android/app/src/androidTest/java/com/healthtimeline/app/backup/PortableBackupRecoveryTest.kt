@@ -1,6 +1,7 @@
 package com.healthtimeline.app.backup
 
 import android.content.Context
+import android.content.ContextWrapper
 import android.net.Uri
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -8,6 +9,11 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.healthtimeline.app.data.*
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -19,6 +25,9 @@ import java.io.ByteArrayInputStream
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -117,6 +126,179 @@ class PortableBackupRecoveryTest {
         assertTrue(service.mergeImport(Uri.fromFile(backup), "wrong-password".toCharArray(), emptyMap(), memberId).isFailure)
         assertEquals(before, database.attachmentDao().all())
         assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+    }
+
+    @Test fun manifestCentralDirectoryCrcMismatchIsRejectedWithoutChangingData() = runBlocking {
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        val beforeStaging = stagingDirectories()
+        val plain = File.createTempFile("audit-central-crc-", ".zip", context.cacheDir)
+        try {
+            backup.inputStream().use { input -> plain.outputStream().use { BackupCrypto.decrypt(input, it, password()) } }
+            val bytes = plain.readBytes()
+            val central = (0..bytes.size - 46).first { position ->
+                bytes[position] == 0x50.toByte() && bytes[position + 1] == 0x4b.toByte() &&
+                    bytes[position + 2] == 0x01.toByte() && bytes[position + 3] == 0x02.toByte()
+            }
+            val nameLength = (bytes[central + 28].toInt() and 0xff) or
+                ((bytes[central + 29].toInt() and 0xff) shl 8)
+            assertEquals("manifest.json", String(bytes, central + 46, nameLength, Charsets.UTF_8))
+            bytes[central + 16] = (bytes[central + 16].toInt() xor 1).toByte()
+            plain.writeBytes(bytes)
+            // Old ZipFile permits reading this malformed CRC: this is the regression contrast,
+            // not an assertion that an instrumented device has run this test locally.
+            ZipFile(plain).use { oldReader ->
+                val manifest = oldReader.getInputStream(oldReader.getEntry("manifest.json")).use { it.readBytes() }
+                assertTrue(JSONObject(String(manifest, Charsets.UTF_8)).getInt("schemaVersion") >= 2)
+            }
+            ByteArrayInputStream(bytes).use { input -> backup.outputStream().use { BackupCrypto.encrypt(input, it, password()) } }
+            assertTrue(service.previewImport(Uri.fromFile(backup), password(), memberId).isFailure)
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+            assertEquals(beforeStaging, stagingDirectories())
+        } finally { plain.delete() }
+    }
+
+    @Test fun reusedNumericMemberIdCannotReceiveFrozenPortableImportOrReplacement() = runBlocking {
+        val old = requireNotNull(database.familyMemberDao().byId(memberId))
+        database.familyMemberDao().update(old.copy(uuid = UUID.randomUUID().toString(), name = "另一个虚构成员"))
+        val beforeMembers = database.familyMemberDao().all()
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        assertTrue(service.previewImport(Uri.fromFile(backup), password(), memberId, old.uuid).isFailure)
+        assertTrue(service.mergeImport(Uri.fromFile(backup), password(), emptyMap(), memberId, old.uuid).isFailure)
+        assertTrue(service.replaceFromBackup(Uri.fromFile(backup), password(), memberId, old.uuid).isFailure)
+        assertEquals(beforeMembers, database.familyMemberDao().all())
+        assertEquals(beforeRecords, database.clinicalRecordDao().all())
+        assertEquals(beforeAttachments, database.attachmentDao().all())
+        assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+    }
+
+    @Test fun reusedNumericMemberIdCannotReceiveFrozenLegacyImportOrRestore() = runBlocking {
+        val legacyFile = File.createTempFile("audit-legacy-member-", ".htbackup", context.cacheDir)
+        try {
+            val legacy = BackupService(context, repository)
+            legacy.export(Uri.fromFile(legacyFile), password()).getOrThrow()
+            val old = requireNotNull(database.familyMemberDao().byId(memberId))
+            database.familyMemberDao().update(old.copy(uuid = UUID.randomUUID().toString(), name = "另一个虚构成员"))
+            val beforeMembers = database.familyMemberDao().all()
+            val beforeRecords = database.clinicalRecordDao().all()
+            val beforeAttachments = database.attachmentDao().all()
+            assertTrue(legacy.importAsNew(Uri.fromFile(legacyFile), password(), memberId, old.uuid).isFailure)
+            assertTrue(legacy.restore(Uri.fromFile(legacyFile), password(), memberId, old.uuid).isFailure)
+            assertTrue(service.importLegacyAsNew(Uri.fromFile(legacyFile), password(), memberId, old.uuid).isFailure)
+            assertTrue(service.replaceFromBackup(Uri.fromFile(legacyFile), password(), memberId, old.uuid).isFailure)
+            assertEquals(beforeMembers, database.familyMemberDao().all())
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+        } finally { legacyFile.delete() }
+    }
+
+    @Test fun archivedFrozenTargetCannotPassPreviewEvenWhenUuidStillMatches() = runBlocking {
+        val old = requireNotNull(database.familyMemberDao().byId(memberId))
+        database.familyMemberDao().update(old.copy(archived = true))
+        assertTrue(service.previewImport(Uri.fromFile(backup), password(), memberId, old.uuid).isFailure)
+        assertEquals(old.copy(archived = true), database.familyMemberDao().byId(memberId))
+        assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+    }
+
+    @Test fun aliasedLegacyAttachmentDestinationsFailBeforeReplacingAnyData() = runBlocking {
+        val legacyFile = File.createTempFile("audit-legacy-alias-", ".htbackup", context.cacheDir)
+        val plain = File.createTempFile("audit-legacy-alias-", ".zip", context.cacheDir)
+        try {
+            val legacy = BackupService(context, repository)
+            legacy.export(Uri.fromFile(legacyFile), password()).getOrThrow()
+            legacyFile.inputStream().use { input -> plain.outputStream().use { BackupCrypto.decrypt(input, it, password()) } }
+            val output = ByteArrayOutputStream()
+            val secondBytes = "another synthetic report".toByteArray()
+            ZipFile(plain).use { source ->
+                val json = JSONObject(source.getInputStream(source.getEntry("manifest.json")).bufferedReader().use { it.readText() })
+                val files = json.getJSONArray("attachments")
+                val first = files.getJSONObject(0)
+                val firstId = first.getLong("id")
+                val secondId = firstId + 1
+                val firstPath = "attachments/${first.getLong("recordId")}/report.pdf"
+                first.put("relativePath", firstPath)
+                val second = JSONObject(first.toString()).apply {
+                    if (has("uuid")) put("uuid", UUID.randomUUID().toString())
+                    put("id", secondId); put("relativePath", firstPath.replace("/report.pdf", "/./report.pdf"))
+                    put("sizeBytes", secondBytes.size); put("sha256", hash(secondBytes))
+                }
+                files.put(second)
+                // Raw paths are distinct; their filesystem destinations must still be distinct.
+                ZipOutputStream(output).use { zip ->
+                    zip.putNextEntry(ZipEntry("manifest.json")); zip.write(json.toString().toByteArray()); zip.closeEntry()
+                    zip.putNextEntry(ZipEntry("files/$firstId")); zip.write(original); zip.closeEntry()
+                    zip.putNextEntry(ZipEntry("files/$secondId")); zip.write(secondBytes); zip.closeEntry()
+                }
+            }
+            ByteArrayInputStream(output.toByteArray()).use { input -> legacyFile.outputStream().use { BackupCrypto.encrypt(input, it, password()) } }
+            val beforeMembers = database.familyMemberDao().all()
+            val beforeRecords = database.clinicalRecordDao().all()
+            val beforeAttachments = database.attachmentDao().all()
+            val beforeTemporary = legacyTemporaryFiles()
+            val result = legacy.restore(Uri.fromFile(legacyFile), password(), memberId)
+            assertTrue(result.isFailure)
+            assertTrue(result.exceptionOrNull()?.message.orEmpty().contains("路径重复"))
+            assertEquals(beforeMembers, database.familyMemberDao().all())
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+            assertEquals(beforeTemporary, legacyTemporaryFiles())
+        } finally { legacyFile.delete(); plain.delete() }
+    }
+
+    @Test fun queuedMutationCannotCommitBetweenLegacySafetyBackupAndReplacement() = runBlocking {
+        val legacyFile = File.createTempFile("audit-legacy-queue-", ".htbackup", context.cacheDir)
+        val safetyRoot = File(context.cacheDir, "audit-safety-${UUID.randomUUID()}").apply { check(mkdirs()) }
+        val safetyContext = object : ContextWrapper(context) { override fun getFilesDir(): File = safetyRoot }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val gated = AtomicBoolean(false)
+        val restoredRoot = File(context.filesDir, "restored_attachments")
+        val beforeRestored = restoredRoot.list()?.toSet().orEmpty()
+        try {
+            val legacy = BackupService(context, repository)
+            legacy.export(Uri.fromFile(legacyFile), password()).getOrThrow()
+            val guarded = PortableBackupService(safetyContext, repository, legacy = legacy, availableStorageBytes = {
+                if (repository.mutationMutex.isLocked && gated.compareAndSet(false, true)) {
+                    entered.countDown()
+                    check(release.await(15, TimeUnit.SECONDS)) { "Synthetic safety-backup barrier timed out" }
+                }
+                minOf(context.cacheDir.usableSpace, context.filesDir.usableSpace)
+            })
+            withTimeout(30_000) {
+                val replacing = async(Dispatchers.IO) {
+                    guarded.replaceFromBackup(Uri.fromFile(legacyFile), password(), memberId).getOrThrow()
+                }
+                withContext(Dispatchers.IO) { check(entered.await(15, TimeUnit.SECONDS)) }
+                val now = Instant.now().toString()
+                // UNDISPATCHED reaches the mutex immediately, then suspends while safety/replace owns it.
+                val queued = async(start = CoroutineStart.UNDISPATCHED) {
+                    repository.saveRecord(ClinicalRecordEntity(memberId = memberId, recordDate = "2026-09-04",
+                        title = "替换期间排队的虚构病历", createdAt = now, updatedAt = now))
+                }
+                assertFalse(queued.isCompleted)
+                release.countDown()
+                replacing.await(); queued.await()
+            }
+            assertTrue(database.clinicalRecordDao().all().any { it.title == "替换期间排队的虚构病历" })
+            val safety = requireNotNull(File(safetyRoot, "safety_backups").listFiles()).single { it.extension == "htbackup" }
+            val plain = File.createTempFile("audit-safety-check-", ".zip", context.cacheDir)
+            try {
+                safety.inputStream().use { input -> plain.outputStream().use { BackupCrypto.decrypt(input, it, password()) } }
+                ZipFile(plain).use { zip ->
+                    val saved = JSONObject(zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().use { it.readText() })
+                    assertEquals("虚构报告", saved.getJSONArray("records").getJSONObject(0).getString("title"))
+                    assertEquals(1, saved.getJSONArray("records").length())
+                }
+            } finally { plain.delete() }
+        } finally {
+            release.countDown(); legacyFile.delete(); safetyRoot.deleteRecursively()
+            restoredRoot.listFiles()?.filter { it.name !in beforeRestored }?.forEach { it.deleteRecursively() }
+        }
     }
 
     @Test fun storageBudgetFailureDoesNotChangeDatabaseOrLeaveStagingFiles() = runBlocking {

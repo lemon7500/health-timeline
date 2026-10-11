@@ -24,7 +24,6 @@ import java.time.LocalDateTime
 import java.time.LocalTime
 import java.util.UUID
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class BackupService(
@@ -62,10 +61,12 @@ class BackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun restore(source: Uri, password: CharArray, targetMemberId: Long = 1L): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun restore(source: Uri, password: CharArray, targetMemberId: Long = 1L,
+        expectedTargetMemberUuid: String? = null, beforeReplace: (suspend () -> Unit)? = null): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runBackupCatching {
+                    requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                     val budget = resourceBudget()
                     val decryptedZip = File.createTempFile("health-restore-", ".zip", context.cacheDir)
                     val stagingRoot = File(context.cacheDir, "restore-${UUID.randomUUID()}")
@@ -87,6 +88,10 @@ class BackupService(
                         val snapshot = readAndValidateZip(decryptedZip, stagingRoot, budget)
                         require(database.familyMemberDao().byId(targetMemberId) != null) { "旧版备份的目标家庭成员不存在" }
                         budget.checkpoint()
+                        // Safety snapshot and replacement share this mutation lock; a queued save cannot
+                        // be committed in between and then overwritten without being backed up.
+                        beforeReplace?.invoke()
+                        budget.checkpoint()
                         applySnapshot(
                             snapshot.copy(
                                 conditions = snapshot.conditions.map { it.copy(memberId = targetMemberId) },
@@ -105,10 +110,12 @@ class BackupService(
         } finally { password.fill('\u0000') }
     }
 
-    suspend fun importAsNew(source: Uri, password: CharArray, targetMemberId: Long): Result<Int> = withContext(Dispatchers.IO) {
+    suspend fun importAsNew(source: Uri, password: CharArray, targetMemberId: Long,
+        expectedTargetMemberUuid: String? = null): Result<Int> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
                 runBackupCatching {
+                    requireExpectedTargetMember(targetMemberId, expectedTargetMemberUuid)
                     val budget = resourceBudget()
                     val decryptedZip = File.createTempFile("health-import-new-", ".zip", context.cacheDir)
                     val stagingRoot = File(context.cacheDir, "import-new-${UUID.randomUUID()}")
@@ -152,6 +159,15 @@ class BackupService(
             medicationSchedules = database.medicationDao().allSchedules(),
             medicationLogs = database.medicationDao().allLogs()
         )
+    }
+
+    /** Called only while the repository mutation mutex is held. Numeric IDs can be reused on restore. */
+    private suspend fun requireExpectedTargetMember(id: Long, expectedUuid: String?) {
+        if (expectedUuid == null) return
+        val member = database.familyMemberDao().byId(id)
+        require(member != null && !member.archived && member.uuid.equals(expectedUuid, ignoreCase = true)) {
+            "导入时选择的家庭成员已改变或归档，请重新选择并核对"
+        }
     }
 
     private suspend fun resourceBudget(): BackupResourceBudget {
@@ -206,39 +222,27 @@ class BackupService(
     }
 
     private fun readAndValidateZip(zipFile: File, stagingRoot: File, budget: BackupResourceBudget): BackupSnapshot {
-        ZipFile(zipFile).use { zip ->
-            val manifestEntry = zip.getEntry("manifest.json") ?: error("备份缺少清单")
-            require(manifestEntry.size in 1..BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单大小异常" }
-            val json = zip.getInputStream(manifestEntry).use(budget::readManifest)
-            val snapshot = SnapshotJson.decode(JSONObject(json))
-            BackupSnapshotValidator.validate(snapshot)
-            val totalSize = snapshot.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
-            budget.requireSpace(totalSize)
-            val entries = hashSetOf<String>()
-            zip.entries().asSequence().forEach { entry ->
-                budget.checkpoint()
-                require(entries.size <= snapshot.attachments.size) { "备份包含多余文件" }
-                require(entries.add(entry.name)) { "备份包含重复文件路径" }
-            }
-            val stagedAttachments = File(stagingRoot, "attachments").apply { require(mkdirs()) { "无法创建附件临时目录" } }
-            snapshot.attachments.forEach { attachment ->
-                val entry = zip.getEntry("files/${attachment.id}") ?: error("附件缺失：${attachment.displayName}")
-                require(entry.size in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常：${attachment.displayName}" }
-                val destination = File(stagedAttachments, attachment.relativePath.removePrefix("attachments/"))
-                val rootPath = stagedAttachments.canonicalPath + File.separator
-                require(destination.canonicalPath.startsWith(rootPath)) { "备份包含不安全路径" }
-                require(destination.parentFile?.let { it.isDirectory || it.mkdirs() } == true) { "无法创建恢复目录" }
-                zip.getInputStream(entry).use { input ->
-                    FileOutputStream(destination).use { output ->
-                        budget.copy(input, budget.limitOutput(output), minOf(attachment.sizeBytes, AttachmentStore.MAX_FILE_BYTES))
-                        output.fd.sync()
-                    }
-                }
-                require(destination.length() == attachment.sizeBytes) { "附件大小校验失败：${attachment.displayName}" }
-                require(sha256(destination, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
-            }
-            return snapshot
+        val zip = BoundedBackupZip.open(zipFile, budget, availableStorageBytes())
+        val json = zip.readManifest()
+        val snapshot = SnapshotJson.decode(JSONObject(json))
+        BackupSnapshotValidator.validate(snapshot)
+        val totalSize = snapshot.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
+        budget.requireSpace(totalSize)
+        val stagedAttachments = File(stagingRoot, "attachments").apply { require(mkdirs()) { "无法创建附件临时目录" } }
+        val destinations = hashSetOf<String>()
+        val rootPath = stagedAttachments.canonicalPath + File.separator
+        val targets = snapshot.attachments.associate { attachment ->
+            val destination = File(stagedAttachments, attachment.relativePath.removePrefix("attachments/"))
+            val canonical = destination.canonicalPath
+            require(canonical.startsWith(rootPath)) { "备份包含不安全路径" }
+            require(destinations.add(canonical)) { "备份附件目标路径重复" }
+            "files/${attachment.id}" to BoundedBackupZip.Target(destination, attachment.sizeBytes, attachment.sha256)
         }
+        targets.values.forEach { require(it.file.parentFile?.let { parent -> parent.isDirectory || parent.mkdirs() } == true) {
+            "无法创建恢复目录"
+        } }
+        zip.extract(targets)
+        return snapshot
     }
 
     private suspend fun applySnapshot(snapshot: BackupSnapshot, stagingRoot: File) {

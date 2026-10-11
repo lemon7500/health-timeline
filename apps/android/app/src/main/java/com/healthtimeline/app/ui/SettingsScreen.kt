@@ -54,7 +54,7 @@ import com.healthtimeline.app.data.HealthRepository
 import com.healthtimeline.app.HealthTimelineApplication
 
 @Composable
-fun SettingsScreen(
+internal fun SettingsScreen(
     viewModel: AppViewModel,
     padding: PaddingValues,
     appLockEnabled: Boolean,
@@ -62,11 +62,12 @@ fun SettingsScreen(
     navigation: TodayNavigation.Safety? = null,
     onNavigationConsumed: (String) -> Unit = {},
     backupPickerBusy: Boolean = false,
+    pendingBackupImport: BackupImportSelection? = null,
+    onImportRequest: () -> Unit,
+    onImportFinished: (String) -> Unit,
     onExportRequest: (CharArray) -> Unit,
-    onSafetyExportRequest: (Uri, CharArray) -> Unit
+    onSafetyExportRequest: (Uri, CharArray, ExternalImportMember) -> Unit
 ) {
-    val context = LocalContext.current
-    val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
     var showSafetyCenter by rememberSaveable(selectedMemberId) { mutableStateOf(false) }
     var showTrash by rememberSaveable(selectedMemberId) { mutableStateOf(false) }
@@ -100,7 +101,6 @@ fun SettingsScreen(
     var confirmRestore by remember(selectedMemberId) { mutableStateOf(false) }
     var importPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
     var importPreview by remember(selectedMemberId) { mutableStateOf<BackupImportPreview?>(null) }
-    var importPickerMemberId by remember { mutableStateOf<Long?>(null) }
     val importedChoices = remember(selectedMemberId) { mutableStateMapOf<String, Boolean>() }
     DisposableEffect(selectedMemberId) {
         onDispose {
@@ -114,14 +114,22 @@ fun SettingsScreen(
         restoreUri = null
         importPreview = null
         importedChoices.clear()
+        pendingBackupImport?.token?.let(onImportFinished)
     }
 
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        appLockManager.endExternalActivity()
-        if (uri != null && importPickerMemberId != null && importPickerMemberId == viewModel.selectedMemberId.value) {
-            restoreUri = uri; passwordMode = "restore"
+    // The source URI and its permanent owner stay in the root's memory-only controller.
+    // Passwords deliberately do not survive lock/recreation: re-enter the password for this same source.
+    LaunchedEffect(pendingBackupImport?.token) {
+        val source = pendingBackupImport
+        if (source != null && source.member.id == selectedMemberId &&
+            members.any { it.id == source.member.id && it.uuid == source.member.uuid && !it.archived }) {
+            restoreUri = Uri.parse(source.uri)
+            passwordMode = "restore"
+        } else if (restoreUri != null) {
+            clearPendingImport()
+            if (passwordMode == "restore") passwordMode = null
+            confirmRestore = false
         }
-        importPickerMemberId = null
     }
 
     Column(
@@ -210,11 +218,7 @@ fun SettingsScreen(
         Button(onClick = { passwordMode = "export" }, enabled = !backupPickerBusy) {
             Icon(Icons.Outlined.Download, null); Spacer(Modifier.width(8.dp)); Text("导出加密备份")
         }
-        OutlinedButton(enabled = !backupPickerBusy, onClick = {
-            importPickerMemberId = viewModel.selectedMemberId.value
-            appLockManager.beginExternalActivity()
-            importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-        }) {
+        OutlinedButton(enabled = !backupPickerBusy, onClick = onImportRequest) {
             Icon(Icons.Outlined.Restore, null); Spacer(Modifier.width(8.dp)); Text("导入或恢复备份")
         }
 
@@ -236,7 +240,9 @@ fun SettingsScreen(
                     importPassword?.fill('\u0000')
                     importPassword = password.copyOf()
                     val uri = restoreUri
-                    if (uri != null) {
+                    val owner = pendingBackupImport?.member
+                    if (uri != null && owner != null && owner.id == viewModel.selectedMemberId.value &&
+                        members.any { it.id == owner.id && it.uuid == owner.uuid && !it.archived }) {
                         viewModel.previewBackup(
                             uri,
                             password,
@@ -244,7 +250,9 @@ fun SettingsScreen(
                                 importPreview = preview
                                 importedChoices.clear()
                             },
-                            onFailed = { clearPendingImport() }
+                            onFailed = { clearPendingImport() },
+                            targetMemberId = owner.id,
+                            targetMemberUuid = owner.uuid
                         )
                     } else {
                         password.fill('\u0000')
@@ -288,15 +296,18 @@ fun SettingsScreen(
             onMerge = {
                 val uri = restoreUri
                 val password = importPassword?.copyOf()
+                val owner = pendingBackupImport?.member
                 val decisions = importedChoices.filterValues { it }.keys.associateWith { MergeChoice.USE_IMPORTED }
                 clearPendingImport()
-                if (uri != null && password != null) viewModel.mergeBackup(uri, password, decisions)
+                if (uri != null && password != null && owner != null) viewModel.mergeBackup(uri, password, decisions, owner.id, owner.uuid)
+                else password?.fill('\u0000')
             },
             onImportLegacyAsNew = {
                 val uri = restoreUri
                 val password = importPassword?.copyOf()
+                val owner = pendingBackupImport?.member
                 clearPendingImport()
-                if (uri != null && password != null) viewModel.importLegacyBackupAsNew(uri, password)
+                if (uri != null && password != null && owner != null) viewModel.importLegacyBackupAsNew(uri, password, owner.id, owner.uuid)
                 else password?.fill('\u0000')
             },
             onReplace = {
@@ -313,9 +324,10 @@ fun SettingsScreen(
             onConfirm = {
                 val uri = restoreUri
                 val password = importPassword?.copyOf()
+                val owner = pendingBackupImport?.member
                 clearPendingImport()
-                if (uri != null && password != null) {
-                    onSafetyExportRequest(uri, password)
+                if (uri != null && password != null && owner != null) {
+                    onSafetyExportRequest(uri, password, owner)
                 } else {
                     password?.fill('\u0000')
                 }
