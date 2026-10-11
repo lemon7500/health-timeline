@@ -1,4 +1,10 @@
 pluginManagement {
+    // Kotlin 2.4 requires R8 >= 9.1.29; use a published stable 9.1 patch.
+    // Official override: https://r8.googlesource.com/r8/+/refs/heads/main/README.md
+    buildscript {
+        repositories { google(); mavenCentral() }
+        dependencies { classpath("com.android.tools:r8:9.1.56") }
+    }
     repositories {
         google()
         mavenCentral()

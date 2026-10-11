@@ -11,19 +11,16 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $localJdk = Join-Path $projectRoot '.tooling\jdk-legacy\jdk-17.0.2+8'
 $localAgent = Join-Path $projectRoot '.tooling\pipe-agent\pipe-fallback-agent.jar'
-$localGradle = Join-Path $projectRoot '.tooling\gradle\gradle-8.13\bin\gradle.bat'
+$gradle = Join-Path $projectRoot 'gradlew.bat'
 $localSdk = Join-Path $projectRoot '.tooling\android-sdk'
-if ((Test-Path $localJdk) -and (Test-Path $localAgent) -and (Test-Path $localGradle) -and (Test-Path $localSdk)) {
+if ((Test-Path $localJdk) -and (Test-Path $localAgent) -and (Test-Path $localSdk)) {
     $env:JAVA_HOME = (Resolve-Path $localJdk).Path
     $env:ANDROID_HOME = (Resolve-Path $localSdk).Path
     $agent = (Resolve-Path $localAgent).Path
     $env:JAVA_TOOL_OPTIONS = "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED `"-javaagent:$agent`""
-    $gradle = (Resolve-Path $localGradle).Path
-} else {
-    $gradle = Join-Path $projectRoot 'gradlew.bat'
 }
 
-& $gradle ':androidApp:lintRelease' ':androidApp:assembleRelease' '--no-daemon' '--stacktrace'
+& $gradle ':androidApp:verifyBuildToolchain' ':androidApp:lintRelease' ':androidApp:assembleRelease' '--no-daemon' '--stacktrace'
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $sourceApk = Join-Path $projectRoot 'apps\android\app\build\outputs\apk\release\androidApp-release.apk'
