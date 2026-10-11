@@ -58,6 +58,7 @@ fun CalendarScreen(
     val cachedRecords by viewModel.records.collectAsStateWithLifecycle()
     val cachedConditions by viewModel.conditions.collectAsStateWithLifecycle()
     val cachedAttachments by viewModel.attachments.collectAsStateWithLifecycle()
+    val cachedMembers by viewModel.members.collectAsStateWithLifecycle()
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
     val drafts: UiDraftStateViewModel = composeViewModel()
     val pageScope = "calendar/$selectedMemberId"
@@ -233,8 +234,10 @@ fun CalendarScreen(
         )
     }
     details?.takeIf { target -> target.memberId == selectedMemberId && records.any { it.id == target.id && it.uuid == target.uuid } }?.let { record ->
+        val member = cachedMembers.firstOrNull { it.id == record.memberId && !it.archived } ?: return@let
         RecordDetailDialog(
             record = record,
+            memberUuid = member.uuid,
             condition = conditions.firstOrNull { it.id == record.conditionId },
             attachments = attachments.filter { it.recordId == record.id },
             viewModel = viewModel,
@@ -1257,6 +1260,7 @@ private fun MultiField(label: String, value: String, onChange: (String) -> Unit)
 @Composable
 private fun RecordDetailDialog(
     record: ClinicalRecordEntity,
+    memberUuid: String,
     condition: ConditionEntity?,
     attachments: List<AttachmentEntity>,
     viewModel: AppViewModel,
@@ -1264,6 +1268,8 @@ private fun RecordDetailDialog(
     onDelete: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    // Freeze the member's permanent identity when opening, not after a picker result or restore.
+    val importMemberUuid = remember(record.uuid) { memberUuid }
     var viewer by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
     var attachmentDeleteTarget by remember(record.uuid) { mutableStateOf<AttachmentEntity?>(null) }
     var cameraUriText by rememberSaveable(record.uuid) { mutableStateOf<String?>(null) }
@@ -1271,7 +1277,7 @@ private fun RecordDetailDialog(
     val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
     val documentPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         appLockManager.endExternalActivity()
-        if (uris.isNotEmpty() && viewModel.selectedMemberId.value == record.memberId) viewModel.importAttachments(record.id, uris)
+        if (uris.isNotEmpty()) viewModel.importAttachments(record, importMemberUuid, uris)
     }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         appLockManager.endExternalActivity()
@@ -1279,7 +1285,7 @@ private fun RecordDetailDialog(
             val uri = Uri.parse(text)
             val captures = com.healthtimeline.app.data.CameraCaptureStore(context.applicationContext)
             if (success && viewModel.selectedMemberId.value == record.memberId) {
-                captures.discardAfter(viewModel.importAttachments(record.id, listOf(uri)), uri)
+                captures.discardAfter(viewModel.importAttachments(record, importMemberUuid, listOf(uri)), uri)
             } else captures.discard(uri)
         }
         cameraUriText = null

@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.room.withTransaction
 import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.RecurrenceCalculator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
@@ -26,6 +27,14 @@ sealed interface RecordConditionResolution {
 data class ClinicalRecordSaveRequest(
     val record: ClinicalRecordEntity,
     val conditionResolution: RecordConditionResolution = RecordConditionResolution.Selected
+)
+
+/** Permanent identities captured before importing reports; numeric IDs can be reused by restore. */
+data class AttachmentImportTarget(
+    val recordId: Long,
+    val recordUuid: String,
+    val memberId: Long,
+    val memberUuid: String
 )
 
 class HealthRepository(
@@ -318,8 +327,40 @@ class HealthRepository(
         }
     }
 
-    suspend fun importAttachment(recordId: Long, uri: Uri) = mutationMutex.withLock {
-        attachmentStore.import(recordId, uri)
+    suspend fun captureAttachmentTarget(
+        expectedRecord: ClinicalRecordEntity,
+        expectedMemberUuid: String
+    ): AttachmentImportTarget = mutationMutex.withLock {
+        val current = requireNotNull(records.byId(expectedRecord.id)) { "病历已不存在，请重新选择病历" }
+        require(current.uuid == expectedRecord.uuid && current.memberId == expectedRecord.memberId) {
+            "病历身份或所属成员已变化，未导入报告。请重新选择病历"
+        }
+        require(current.deletedAt == null) { "病历已在回收站，未导入报告" }
+        val member = requireNotNull(members.byId(current.memberId)) { "所属成员已不存在，未导入报告" }
+        require(member.uuid == expectedMemberUuid) { "所属成员身份已变化，未导入报告。请重新选择病历" }
+        require(!member.archived) { "所属成员已归档，未导入报告" }
+        AttachmentImportTarget(current.id, current.uuid, member.id, member.uuid)
+    }
+
+    suspend fun importAttachment(target: AttachmentImportTarget, uri: Uri): Result<AttachmentEntity> = mutationMutex.withLock {
+        try {
+            val current = requireNotNull(records.byId(target.recordId)) { "病历已不存在，未导入报告" }
+            require(current.uuid == target.recordUuid && current.memberId == target.memberId) {
+                "病历身份或所属成员已变化，未导入报告。请重新选择病历"
+            }
+            require(current.deletedAt == null) { "病历已在回收站，未导入报告" }
+            val member = requireNotNull(members.byId(target.memberId)) { "所属成员已不存在，未导入报告" }
+            require(member.uuid == target.memberUuid) { "所属成员身份已变化，未导入报告。请重新选择病历" }
+            require(!member.archived) { "所属成员已归档，未导入报告" }
+            attachmentStore.import(target.recordId, uri).also { result ->
+                // AttachmentStore may have caught cancellation as a Result; never continue the batch.
+                (result.exceptionOrNull() as? CancellationException)?.let { throw it }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
     }
     suspend fun deleteAttachment(value: AttachmentEntity): AttachmentDeleteResult = mutationMutex.withLock {
         val current = attachments.byId(value.id) ?: return@withLock AttachmentDeleteResult.ALREADY_DELETED

@@ -303,16 +303,29 @@ class AppViewModel(
         messages.send("病历已移入回收站，可在 30 天内恢复")
     }
 
-    fun importAttachments(recordId: Long, uris: List<Uri>) = viewModelScope.launch {
+    fun importAttachments(record: ClinicalRecordEntity, memberUuid: String, uris: List<Uri>) = viewModelScope.launch {
         busyChannel.value = true
         try {
+            require(selectedMemberId.value == record.memberId) { "当前成员已变化，未导入报告。请重新选择病历" }
+            val target = repository.captureAttachmentTarget(record, memberUuid)
             var imported = 0
-            uris.forEach { uri ->
-                repository.importAttachment(recordId, uri)
-                    .onSuccess { imported++ }
-                    .onFailure { messages.send(it.userMessage("导入附件失败")) }
+            for (uri in uris) {
+                if (selectedMemberId.value != target.memberId) {
+                    messages.send("当前成员已变化，已停止导入剩余报告。请重新选择病历")
+                    break
+                }
+                val result = repository.importAttachment(target, uri)
+                if (result.isFailure) {
+                    messages.send(requireNotNull(result.exceptionOrNull()).userMessage("导入附件失败"))
+                    break
+                }
+                imported++
             }
-            if (imported > 0) messages.send("已导入 $imported 份报告")
+            if (imported > 0) messages.send("已导入 $imported / ${uris.size} 份报告")
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            messages.send(error.userMessage("导入附件失败"))
         } finally { busyChannel.value = false }
     }
 
