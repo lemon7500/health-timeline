@@ -31,21 +31,30 @@ internal fun hasSourceRecord(value: String): Boolean {
 
 /** Never prefill AI summaries or the whole batch as the event's original narrative. */
 internal fun initialSourceRecordText(notes: String): String {
-    val marker = sourceMarker.find(notes) ?: return ""
-    return notes.substring(marker.range.last + 1).trim()
+    val normalized = normalizeSourceNewlines(notes)
+    val marker = sourceMarker.find(normalized) ?: return ""
+    // Remove only the template's one structural newline, not whitespace in the source.
+    return normalized.substring(marker.range.last + 1).removePrefix("\n")
 }
+
+private fun normalizeSourceNewlines(value: String): String = value.replace("\r\n", "\n").replace('\r', '\n')
 
 /** Explicit user-supplied original text only; retains existing notes without truncation. */
 internal fun completeSourceRecordNotes(notes: String, originalText: String): String {
-    val normalized = originalText.replace("\r\n", "\n").replace('\r', '\n').trim()
-    val leadingMarker = sourceMarker.find(normalized)?.takeIf { it.range.first == 0 }
-    val source = if (leadingMarker != null) normalized.substring(leadingMarker.range.last + 1).trim() else normalized
+    val normalized = normalizeSourceNewlines(originalText)
+    val leadingMarker = sourceMarker.find(normalized)?.takeIf {
+        normalized.substring(0, it.range.first).isBlank()
+    }
+    val source = if (leadingMarker != null) {
+        normalized.substring(0, leadingMarker.range.first) +
+            normalized.substring(leadingMarker.range.last + 1).removePrefix("\n")
+    } else normalized
     require(source.isNotBlank()) { "请粘贴这条事件对应的原始病程，不能只填写“原文记录：”。" }
     val prefixed = "${ClinicalRecordQuickParser.SOURCE_PREFIX}\n$source"
-    val existing = notes.replace("\r\n", "\n").replace('\r', '\n').trim()
-    val markerOnly = sourceMarker.matchEntire(existing) != null
+    val existing = normalizeSourceNewlines(notes)
+    val markerOnly = sourceMarker.matchEntire(existing.trim()) != null
     val completed = when {
-        existing.isEmpty() || markerOnly || existing == source || existing == prefixed -> prefixed
+        existing.isBlank() || markerOnly || existing == source || existing == prefixed -> prefixed
         else -> "$prefixed\n\n补充备注：\n$existing"
     }
     require(completed.length <= ClinicalRecordQuickParser.MAX_NARRATIVE_LENGTH) {

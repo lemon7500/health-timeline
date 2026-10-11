@@ -5,6 +5,10 @@ import android.net.Uri
 import androidx.room.withTransaction
 import com.healthtimeline.app.data.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -12,6 +16,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FileDescriptor
 import java.security.MessageDigest
 import java.time.Instant
 import java.time.LocalDate
@@ -24,27 +29,30 @@ import java.util.zip.ZipOutputStream
 
 class BackupService(
     private val context: Context,
-    private val repository: HealthRepository
+    private val repository: HealthRepository,
+    private val availableStorageBytes: () -> Long = { minOf(context.cacheDir.usableSpace, context.filesDir.usableSpace) },
+    private val availableDestinationStorageBytes: (FileDescriptor) -> Long? = BackupDestinationStorage::availableBytes
 ) {
     private val database = repository.database
 
     suspend fun export(destination: Uri, password: CharArray): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
                     require(password.size >= 8) { "备份密码至少需要 8 位" }
                     val tempZip = File.createTempFile("health-backup-", ".zip", context.cacheDir)
                     val encrypted = File.createTempFile("health-backup-", ".encrypted", context.cacheDir)
                     try {
                         val snapshot = loadSnapshot()
-                        writeZip(tempZip, snapshot)
+                        val budget = resourceBudget()
+                        writeZip(tempZip, snapshot, budget)
                         FileInputStream(tempZip).use { input ->
                             FileOutputStream(encrypted).use { output ->
-                                BackupCrypto.encrypt(input, output, password)
+                                BackupCrypto.encrypt(input, output, password, budget)
                                 output.fd.sync()
                             }
                         }
-                        writeDestination(destination, encrypted)
+                        writeDestination(destination, encrypted, budget)
                     } finally {
                         tempZip.delete()
                         encrypted.delete()
@@ -57,24 +65,28 @@ class BackupService(
     suspend fun restore(source: Uri, password: CharArray, targetMemberId: Long = 1L): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
+                    val budget = resourceBudget()
                     val decryptedZip = File.createTempFile("health-restore-", ".zip", context.cacheDir)
                     val stagingRoot = File(context.cacheDir, "restore-${UUID.randomUUID()}")
                     try {
                         try {
                             context.contentResolver.openInputStream(source)?.use { input ->
                                 FileOutputStream(decryptedZip).use { output ->
-                                    BackupCrypto.decrypt(input, output, password)
+                                    BackupCrypto.decrypt(input, output, password, budget)
                                     output.fd.sync()
                                 }
                             } ?: error("无法读取备份文件")
+                        } catch (error: CancellationException) {
+                            throw error
                         } catch (error: IllegalArgumentException) {
                             throw error
                         } catch (error: Throwable) {
                             throw IllegalArgumentException("密码错误或备份文件已损坏", error)
                         }
-                        val snapshot = readAndValidateZip(decryptedZip, stagingRoot)
+                        val snapshot = readAndValidateZip(decryptedZip, stagingRoot, budget)
                         require(database.familyMemberDao().byId(targetMemberId) != null) { "旧版备份的目标家庭成员不存在" }
+                        budget.checkpoint()
                         applySnapshot(
                             snapshot.copy(
                                 conditions = snapshot.conditions.map { it.copy(memberId = targetMemberId) },
@@ -96,17 +108,20 @@ class BackupService(
     suspend fun importAsNew(source: Uri, password: CharArray, targetMemberId: Long): Result<Int> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
+                    val budget = resourceBudget()
                     val decryptedZip = File.createTempFile("health-import-new-", ".zip", context.cacheDir)
                     val stagingRoot = File(context.cacheDir, "import-new-${UUID.randomUUID()}")
                     try {
                         try {
                             context.contentResolver.openInputStream(source)?.use { input ->
                                 FileOutputStream(decryptedZip).use { output ->
-                                    BackupCrypto.decrypt(input, output, password)
+                                    BackupCrypto.decrypt(input, output, password, budget)
                                     output.fd.sync()
                                 }
                             } ?: error("无法读取备份文件")
+                        } catch (error: CancellationException) {
+                            throw error
                         } catch (error: IllegalArgumentException) {
                             throw error
                         } catch (error: Throwable) {
@@ -114,7 +129,9 @@ class BackupService(
                         }
                         val member = requireNotNull(database.familyMemberDao().byId(targetMemberId)) { "目标家庭成员不存在" }
                         require(!member.archived) { "目标家庭成员已归档" }
-                        appendSnapshotAsNew(readAndValidateZip(decryptedZip, stagingRoot), stagingRoot, targetMemberId)
+                        val snapshot = readAndValidateZip(decryptedZip, stagingRoot, budget)
+                        budget.checkpoint()
+                        appendSnapshotAsNew(snapshot, stagingRoot, targetMemberId)
                     } finally {
                         decryptedZip.delete()
                         stagingRoot.deleteRecursively()
@@ -137,13 +154,22 @@ class BackupService(
         )
     }
 
-    private fun writeDestination(destination: Uri, encrypted: File) {
+    private suspend fun resourceBudget(): BackupResourceBudget {
+        val coroutineContext = currentCoroutineContext()
+        return BackupResourceBudget(availableStorageBytes, { coroutineContext.ensureActive() })
+    }
+
+    private fun writeDestination(destination: Uri, encrypted: File, budget: BackupResourceBudget) {
         try {
             val descriptor = context.contentResolver.openFileDescriptor(destination, "rwt")
                 ?: error("无法创建备份文件")
             descriptor.use {
+                val targetBudget = BackupDestinationStorage.budget(it.fileDescriptor,
+                    availableDestinationStorageBytes, availableStorageBytes, budget::checkpoint)
                 FileOutputStream(it.fileDescriptor).use { output ->
-                    encrypted.inputStream().use { input -> input.copyTo(output) }
+                    encrypted.inputStream().use { input ->
+                        targetBudget.copy(input, targetBudget.limitOutput(output), encrypted.length())
+                    }
                     output.fd.sync()
                 }
             }
@@ -153,8 +179,9 @@ class BackupService(
         }
     }
 
-    private fun writeZip(target: File, snapshot: BackupSnapshot) {
-        ZipOutputStream(FileOutputStream(target)).use { zip ->
+    private fun writeZip(target: File, snapshot: BackupSnapshot, budget: BackupResourceBudget) {
+        FileOutputStream(target).use { fileOutput ->
+        ZipOutputStream(budget.limitOutput(fileOutput)).use { zip ->
             val portableSnapshot = snapshot.copy(
                 attachments = snapshot.attachments.map { attachment ->
                     attachment.copy(relativePath = "attachments/${attachment.recordId}/${File(attachment.relativePath).name}")
@@ -162,29 +189,38 @@ class BackupService(
             )
             BackupSnapshotValidator.validate(portableSnapshot)
             zip.putNextEntry(ZipEntry("manifest.json"))
-            zip.write(SnapshotJson.encode(portableSnapshot).toString().toByteArray(Charsets.UTF_8))
+            val manifest = SnapshotJson.encode(portableSnapshot).toString().toByteArray(Charsets.UTF_8)
+            require(manifest.size.toLong() <= BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单超过可恢复的大小，请分批整理资料" }
+            zip.write(manifest)
             zip.closeEntry()
             snapshot.attachments.forEach { attachment ->
                 val file = repository.attachmentStore.file(attachment)
                 require(file.isFile) { "附件缺失：${attachment.displayName}" }
-                require(sha256(file) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
+                require(file.length() == attachment.sizeBytes && sha256(file, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
                 zip.putNextEntry(ZipEntry("files/${attachment.id}"))
-                file.inputStream().use { it.copyTo(zip) }
+                file.inputStream().use { budget.copy(it, zip, attachment.sizeBytes) }
                 zip.closeEntry()
             }
         }
+        }
     }
 
-    private fun readAndValidateZip(zipFile: File, stagingRoot: File): BackupSnapshot {
+    private fun readAndValidateZip(zipFile: File, stagingRoot: File, budget: BackupResourceBudget): BackupSnapshot {
         ZipFile(zipFile).use { zip ->
             val manifestEntry = zip.getEntry("manifest.json") ?: error("备份缺少清单")
-            require(manifestEntry.size in 1..10_000_000) { "备份清单大小异常" }
-            val json = zip.getInputStream(manifestEntry).bufferedReader().use { it.readText() }
+            require(manifestEntry.size in 1..BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单大小异常" }
+            val json = zip.getInputStream(manifestEntry).use(budget::readManifest)
             val snapshot = SnapshotJson.decode(JSONObject(json))
             BackupSnapshotValidator.validate(snapshot)
             val totalSize = snapshot.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
-            require(context.filesDir.usableSpace > totalSize + 20L * 1024L * 1024L) { "手机存储空间不足" }
-            val stagedAttachments = File(stagingRoot, "attachments").apply { mkdirs() }
+            budget.requireSpace(totalSize)
+            val entries = hashSetOf<String>()
+            zip.entries().asSequence().forEach { entry ->
+                budget.checkpoint()
+                require(entries.size <= snapshot.attachments.size) { "备份包含多余文件" }
+                require(entries.add(entry.name)) { "备份包含重复文件路径" }
+            }
+            val stagedAttachments = File(stagingRoot, "attachments").apply { require(mkdirs()) { "无法创建附件临时目录" } }
             snapshot.attachments.forEach { attachment ->
                 val entry = zip.getEntry("files/${attachment.id}") ?: error("附件缺失：${attachment.displayName}")
                 require(entry.size in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常：${attachment.displayName}" }
@@ -194,28 +230,19 @@ class BackupService(
                 require(destination.parentFile?.let { it.isDirectory || it.mkdirs() } == true) { "无法创建恢复目录" }
                 zip.getInputStream(entry).use { input ->
                     FileOutputStream(destination).use { output ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        var copied = 0L
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            copied = Math.addExact(copied, read.toLong())
-                            require(copied <= attachment.sizeBytes && copied <= AttachmentStore.MAX_FILE_BYTES) {
-                                "附件大小校验失败：${attachment.displayName}"
-                            }
-                            output.write(buffer, 0, read)
-                        }
+                        budget.copy(input, budget.limitOutput(output), minOf(attachment.sizeBytes, AttachmentStore.MAX_FILE_BYTES))
                         output.fd.sync()
                     }
                 }
                 require(destination.length() == attachment.sizeBytes) { "附件大小校验失败：${attachment.displayName}" }
-                require(sha256(destination) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
+                require(sha256(destination, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
             }
             return snapshot
         }
     }
 
     private suspend fun applySnapshot(snapshot: BackupSnapshot, stagingRoot: File) {
+        currentCoroutineContext().ensureActive()
         val staged = File(stagingRoot, "attachments")
         val restoreId = UUID.randomUUID().toString()
         val restoredParent = File(context.filesDir, "restored_attachments")
@@ -231,7 +258,9 @@ class BackupService(
             }
         )
         var previousAttachments = emptyList<AttachmentEntity>()
+        var databaseCommitted = false
         try {
+            withContext(NonCancellable) {
             database.withTransaction {
                 previousAttachments = database.attachmentDao().all()
                 database.medicationDao().clearLogs()
@@ -251,8 +280,10 @@ class BackupService(
                 database.medicationDao().insertSchedules(restoredSnapshot.medicationSchedules)
                 database.medicationDao().insertLogs(restoredSnapshot.medicationLogs)
             }
+            databaseCommitted = true
+            }
         } catch (error: Throwable) {
-            installed.deleteRecursively()
+            if (!databaseCommitted) installed.deleteRecursively()
             throw error
         }
         // Database commit now points exclusively at the new, already-synced files.
@@ -268,6 +299,7 @@ class BackupService(
         stagingRoot: File,
         targetMemberId: Long
     ): Int {
+        currentCoroutineContext().ensureActive()
         val staged = File(stagingRoot, "attachments")
         val importId = UUID.randomUUID().toString()
         val restoredParent = File(context.filesDir, "restored_attachments")
@@ -275,7 +307,9 @@ class BackupService(
         val installed = File(restoredParent, importId)
         require(staged.renameTo(installed)) { "无法安装已验证的附件" }
         val relativePrefix = "restored_attachments/$importId"
+        var databaseCommitted = false
         try {
+            withContext(NonCancellable) {
             database.withTransaction {
                 val conditionIds = mutableMapOf<Long, Long>()
                 snapshot.conditions.forEach { value ->
@@ -363,8 +397,10 @@ class BackupService(
                     ) { "无法导入用药记录" }
                 }
             }
+            databaseCommitted = true
+            }
         } catch (error: Throwable) {
-            installed.deleteRecursively()
+            if (!databaseCommitted) installed.deleteRecursively()
             throw error
         }
         return snapshot.conditions.size + snapshot.records.size + snapshot.attachments.size +
@@ -372,11 +408,12 @@ class BackupService(
             snapshot.medicationSchedules.size + snapshot.medicationLogs.size
     }
 
-    private fun sha256(file: File): String {
+    private fun sha256(file: File, budget: BackupResourceBudget): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
+                budget.checkpoint()
                 val read = input.read(buffer)
                 if (read < 0) break
                 digest.update(buffer, 0, read)

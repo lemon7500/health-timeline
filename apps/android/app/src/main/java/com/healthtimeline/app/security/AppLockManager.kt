@@ -22,12 +22,13 @@ class AppLockManager(
     val enabled = enabledMutable.asStateFlow()
     val locked = lockedMutable.asStateFlow()
 
-    fun setEnabled(value: Boolean) {
-        check(preferences.edit().putBoolean(KEY_ENABLED, value).commit()) { "无法保存应用保护设置" }
+    fun setEnabled(value: Boolean): Boolean {
+        if (!writeBoolean(KEY_ENABLED, value)) return false
         enabledMutable.value = value
         lockedMutable.value = false
         backgroundAt = null
         externalActivityDepth = 0
+        return true
     }
 
     fun unlock() {
@@ -68,8 +69,17 @@ class AppLockManager(
 
     fun shouldShowIntroduction(): Boolean = !preferences.getBoolean(KEY_INTRO_SHOWN, false)
 
-    fun markIntroductionShown() {
-        check(preferences.edit().putBoolean(KEY_INTRO_SHOWN, true).commit()) { "无法保存应用保护提示状态" }
+    fun markIntroductionShown(): Boolean = writeBoolean(KEY_INTRO_SHOWN, true)
+
+    private fun writeBoolean(key: String, value: Boolean): Boolean {
+        val previous = preferences.getBoolean(key, false)
+        val saved = runCatching { preferences.edit().putBoolean(key, value).commit() }.getOrDefault(false)
+        if (!saved) {
+            // SharedPreferences can update its in-memory value even when commit fails.
+            // Keep the session's lock state unchanged and best-effort restore that value.
+            runCatching { preferences.edit().putBoolean(key, previous).commit() }
+        }
+        return saved
     }
 
     fun registerScreenOffReceiver() {

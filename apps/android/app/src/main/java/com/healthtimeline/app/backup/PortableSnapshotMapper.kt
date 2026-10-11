@@ -183,7 +183,7 @@ internal object PortableSnapshotMapper {
                     it.doseAmount, it.doseUnit, it.instructions, it.startDate, it.endDate, it.mode,
                     it.archived, it.createdAt, it.updatedAt, it.uuid,
                     memberIds.getValue(requireNotNull(it.memberUuid)),
-                    it.endedAt ?: if (it.archived) it.updatedAt else null,
+                    it.endedAt ?: if (it.archived && !isLegacyMedicationHistoryCopy(it.name, it.instructions)) it.updatedAt else null,
                     it.archivedPreviousEndDate,
                     it.deletedAt
                 )

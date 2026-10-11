@@ -181,26 +181,12 @@ fun MedicationScreen(
                     ended.forEach { medication ->
                         val historicalTimes = schedules.filter { it.medicationId == medication.id }
                             .map { it.localTime }.distinct().sorted().joinToString("、")
-                        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                                Text(medication.name, fontWeight = FontWeight.SemiBold)
-                                Text("${medication.doseAmount} ${medication.doseUnit}")
-                                Text("开始日期：${medication.startDate}")
-                                Text("结束时间：${formatMedicationEndedAt(medication)}", color = MaterialTheme.colorScheme.primary)
-                                medication.archivedPreviousEndDate?.let { Text("原计划结束日期：$it") }
-                                Text(
-                                    if (medication.mode == MedicationMode.AS_NEEDED.name) "原疗程：按需记录"
-                                    else "原服药时间：${historicalTimes.ifBlank { "无固定时间" }}",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                if (medication.instructions.isNotBlank()) Text(medication.instructions, style = MaterialTheme.typography.bodySmall)
-                                Text("历史计划和服药记录仍可在上方日历中查询。", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Row {
-                                    TextButton(onClick = { restoreTarget = medication }) { Text("恢复疗程") }
-                                    TextButton(onClick = { deleteTarget = medication }) { Text("删除") }
-                                }
-                            }
-                        }
+                        EndedMedicationCard(
+                            medication = medication,
+                            historicalTimes = historicalTimes,
+                            onRestore = { restoreTarget = medication },
+                            onDelete = { deleteTarget = medication }
+                        )
                     }
                 }
             }
@@ -247,7 +233,7 @@ fun MedicationScreen(
             { archiveTarget = null }
         )
     }
-    restoreTarget?.takeIf { target -> target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
+    restoreTarget?.takeIf { target -> !isLegacyMedicationHistoryCopy(target) && target.memberId == selectedMemberId && medications.any { it.id == target.id && it.uuid == target.uuid } }?.let { medication ->
         ConfirmDialog(
             "恢复疗程？",
             if (medication.archivedPreviousEndDate == null) {
@@ -275,13 +261,11 @@ fun MedicationScreen(
         )
     }
     takeTarget?.takeIf { it.medication.memberId == selectedMemberId && it in selectedEntries }?.let { entry ->
-        MedicationTimePickerDialog(
-            title = "选择实际服药时间",
-            initial = roundToFiveMinutes(
-                if (selected == LocalDate.now()) LocalTime.now() else entry.plannedAt?.toLocalTime() ?: LocalTime.NOON
-            ),
-            onConfirm = { time ->
-                if (viewModel.selectedMemberId.value == entry.medication.memberId) viewModel.recordDose(entry, MedicationLogStatus.TAKEN, selected.atTime(time))
+        MedicationActualTimeDialog(
+            date = selected,
+            plannedAt = entry.plannedAt,
+            onConfirm = { actualAt ->
+                if (viewModel.selectedMemberId.value == entry.medication.memberId) viewModel.recordDose(entry, MedicationLogStatus.TAKEN, actualAt)
                 takeTarget = null
             },
             onDismiss = { takeTarget = null }
@@ -609,8 +593,8 @@ private fun MedicationDayCard(
     }
 }
 
-private fun medicationActiveOn(value: MedicationEntity, date: LocalDate): Boolean =
-    !date.isBefore(LocalDate.parse(value.startDate)) &&
+internal fun medicationActiveOn(value: MedicationEntity, date: LocalDate): Boolean =
+    !isLegacyMedicationHistoryCopy(value) && !date.isBefore(LocalDate.parse(value.startDate)) &&
         (value.endDate == null || !date.isAfter(LocalDate.parse(value.endDate)))
 
 private fun scheduleEffectiveOn(value: MedicationScheduleEntity, date: LocalDate): Boolean =
@@ -670,15 +654,16 @@ private fun MedicationCorrectionDialog(
 }
 
 @Composable
-private fun AsNeededRecordDialog(
+internal fun AsNeededRecordDialog(
     medications: List<MedicationEntity>,
     date: LocalDate,
     onConfirm: (MedicationEntity, LocalDateTime) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    now: LocalDateTime = LocalDateTime.now()
 ) {
     var medicationId by remember(medications) { mutableStateOf(medications.firstOrNull()?.id) }
     var time by remember(date) {
-        mutableStateOf(roundToFiveMinutes(if (date == LocalDate.now()) LocalTime.now() else LocalTime.NOON))
+        mutableStateOf(defaultMedicationActualTime(date, now = now))
     }
     var showPicker by remember(date) { mutableStateOf(false) }
     AlertDialog(
@@ -718,6 +703,68 @@ private fun AsNeededRecordDialog(
 
 private val TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 internal val MEDICATION_MINUTE_OPTIONS: List<Int> = (0..55 step 5).toList()
+
+@Composable
+internal fun EndedMedicationCard(
+    medication: MedicationEntity,
+    historicalTimes: String,
+    onRestore: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val legacyHistory = isLegacyMedicationHistoryCopy(medication)
+    val instructions = if (legacyHistory) medication.instructions.substringAfter('\n') else medication.instructions
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text(medication.name, fontWeight = FontWeight.SemiBold)
+            Text("${medication.doseAmount} ${medication.doseUnit}")
+            Text("开始日期：${medication.startDate}")
+            Text(
+                if (legacyHistory) "旧版迁移归档，实际停药时间未知"
+                else "结束时间：${formatMedicationEndedAt(medication)}",
+                color = MaterialTheme.colorScheme.primary
+            )
+            medication.archivedPreviousEndDate?.let { Text("原计划结束日期：$it") }
+            Text(
+                if (medication.mode == MedicationMode.AS_NEEDED.name) "原疗程：按需记录"
+                else "原服药时间：${historicalTimes.ifBlank { "无固定时间" }}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (instructions.isNotBlank()) Text(instructions, style = MaterialTheme.typography.bodySmall)
+            Text("历史计划和服药记录仍可在上方日历中查询。", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row {
+                if (!legacyHistory) TextButton(onClick = onRestore) { Text("恢复疗程") }
+                TextButton(onClick = onDelete) { Text("删除") }
+            }
+        }
+    }
+}
+
+// Actual dose defaults must never round forward into a different day or a future time.
+internal fun defaultMedicationActualTime(
+    date: LocalDate,
+    plannedAt: LocalDateTime? = null,
+    now: LocalDateTime = LocalDateTime.now()
+): LocalTime {
+    val time = if (date == now.toLocalDate()) now.toLocalTime()
+        else plannedAt?.toLocalTime() ?: LocalTime.NOON
+    return LocalTime.of(time.hour, (time.minute / 5) * 5)
+}
+
+@Composable
+internal fun MedicationActualTimeDialog(
+    date: LocalDate,
+    plannedAt: LocalDateTime? = null,
+    onConfirm: (LocalDateTime) -> Unit,
+    onDismiss: () -> Unit,
+    now: LocalDateTime = LocalDateTime.now()
+) {
+    MedicationTimePickerDialog(
+        title = "选择实际服药时间",
+        initial = defaultMedicationActualTime(date, plannedAt, now),
+        onConfirm = { onConfirm(date.atTime(it)) },
+        onDismiss = onDismiss
+    )
+}
 
 internal fun roundToFiveMinutes(time: LocalTime): LocalTime {
     val roundedMinute = ((time.minute + 2) / 5) * 5

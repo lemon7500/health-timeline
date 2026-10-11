@@ -339,9 +339,15 @@ class AppViewModel(
     }
 
     fun deleteFollowUp(value: FollowUpScheduleEntity) = launch("将复查计划移入回收站") {
-        scheduler.cancelFollowUp(value.id)
-        repository.deleteFollowUp(value)
-        messages.send("复查计划已移入回收站，可在 30 天内恢复")
+        val remindersUpdated = commitFollowUpDeletionThenRefresh(
+            deleteData = { repository.deleteFollowUp(value) },
+            cancelReminder = { scheduler.cancelFollowUp(value.id) },
+            rebuildReminders = { scheduler.rescheduleAll() }
+        )
+        messages.send(
+            if (remindersUpdated) "复查计划已移入回收站，可在 30 天内恢复"
+            else "复查计划已移入回收站，但系统提醒刷新失败；请检查权限并重新打开应用"
+        )
     }
 
     fun completeOccurrence(id: Long, skipped: Boolean = false) = launch("更新复查状态") {
@@ -457,14 +463,15 @@ class AppViewModel(
     fun restoreBackupWithSafetyExport(
         safetyDestination: Uri,
         source: Uri,
-        password: CharArray
+        password: CharArray,
+        targetMemberId: Long? = selectedMemberId.value
     ) = launchResult("正在导出安全备份并恢复", "安全备份已导出，数据已恢复") {
         try {
             backupService.export(safetyDestination, password.copyOf()).getOrThrow()
             scheduler.cancelAllPersisted()
             scheduler.cancelAllNotifications()
             try {
-                backupService.replaceFromBackup(source, password, selectedMemberId.value).getOrThrow()
+                backupService.replaceFromBackup(source, password, targetMemberId).getOrThrow()
             } finally {
                 runCatching { scheduler.rescheduleAll() }
                     .onFailure { messages.send("数据状态已保持完整，但部分系统提醒安排失败；请重新打开应用") }
@@ -563,4 +570,30 @@ class AppViewModel(
         override fun <T : ViewModel> create(modelClass: Class<T>): T =
             AppViewModel(repository, scheduler, backup, memberSelection, safetyCenter) as T
     }
+}
+
+/** Alarm side effects happen only after the database has committed the deletion. */
+internal suspend fun commitFollowUpDeletionThenRefresh(
+    deleteData: suspend () -> Unit,
+    cancelReminder: () -> Unit,
+    rebuildReminders: suspend () -> Unit
+): Boolean {
+    deleteData()
+    var remindersUpdated = true
+    try {
+        cancelReminder()
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        remindersUpdated = false
+    }
+    // Even if cancellation fails, rebuild the remaining reminders from committed data.
+    try {
+        rebuildReminders()
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        remindersUpdated = false
+    }
+    return remindersUpdated
 }

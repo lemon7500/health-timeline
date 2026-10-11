@@ -89,6 +89,29 @@ object ClinicalRecordQuickParser {
         aliases(Field.NOTES, "其他备注", "备注", "其他")
     }
 
+    private data class FieldMarker(val field: Field, val start: Int, val valueStart: Int)
+    private data class RecordBoundary(val start: Int, val previousEnd: Int)
+
+    // Match segment starts without rewriting their separators. In particular, source notes may
+    // contain semicolons, field labels and dates which are data, not new form fields.
+    private fun fieldMarkers(input: String): List<FieldMarker> =
+        Regex("(?m)(?:^|(?<=[；;]))[\\t 　]*([^\\n；;：:]+)[：:]")
+            .findAll(input)
+            .mapNotNull { match ->
+                aliases[normalizeLabel(match.groupValues[1])]?.let { field ->
+                    FieldMarker(field, match.range.first, match.range.last + 1)
+                }
+            }
+            .toList()
+
+    private fun normalizeNewlines(input: String): String = input.replace("\r\n", "\n").replace('\r', '\n')
+
+    private val structuredFields = setOf(Field.DATE, Field.TITLE, Field.CONDITION, Field.STAGE)
+    private val standardTemplateFields = Field.entries.toList()
+    private val narrativeStart = Regex(
+        "(?m)(?:^|(?<=[；;]))[\\t 　]*(?=(?:(?:\\d{4}年)?\\d{1,2}月\\d{1,2}[日号]|\\d{4}[-/]\\d{1,2}[-/]\\d{1,2})(?!\\d))"
+    )
+
     fun parse(input: String, referenceDate: LocalDate = LocalDate.now()): ParsedClinicalRecordDraft {
         val issues = mutableListOf<QuickEntryIssue>()
         if (input.isBlank()) {
@@ -103,14 +126,12 @@ object ClinicalRecordQuickParser {
         val values = mutableMapOf<Field, MutableList<String>>()
         val unrecognized = mutableListOf<String>()
         var currentField: Field? = null
-        val normalizedInput = input.replace("\r\n", "\n").replace('\r', '\n')
-        val hasStructuredFields = Regex(
-            "(?m)^\\s*(?:日期|就诊日期|记录日期|标题|小标题|病情分类|疾病分类|记录类型|就诊类型)\\s*[：:]"
-        ).containsMatchIn(normalizedInput)
-        val terminalNotes = if (hasStructuredFields) {
-            Regex("(?m)^\\s*(?:其他备注|备注|其他)\\s*[：:]").find(normalizedInput)
-        } else null
-        val parsableInput = terminalNotes?.let { normalizedInput.substring(0, it.range.first) } ?: normalizedInput
+        val normalizedInput = normalizeNewlines(input)
+        val markers = fieldMarkers(normalizedInput)
+        val terminalNotes = markers.firstOrNull { marker ->
+            marker.field == Field.NOTES && markers.any { it.start < marker.start && it.field in structuredFields }
+        }
+        val parsableInput = terminalNotes?.let { normalizedInput.substring(0, it.start) } ?: normalizedInput
         parsableInput
             .split(Regex("[\n；;]+"))
             .forEach { rawSegment ->
@@ -135,7 +156,7 @@ object ClinicalRecordQuickParser {
                 }
             }
         terminalNotes?.let { marker ->
-            val rawNotes = normalizedInput.substring(marker.range.last + 1).trim()
+            val rawNotes = normalizedInput.substring(marker.valueStart)
             values.getOrPut(Field.NOTES) { mutableListOf() } += rawNotes
         }
 
@@ -193,10 +214,7 @@ object ClinicalRecordQuickParser {
         )
     }
 
-    /**
-     * Splits a long entry whenever a new labelled date starts, then parses every block independently.
-     * This keeps the single-record parser strict while allowing several days to be reviewed and saved together.
-     */
+    /** Split record boundaries on the original text, never on rewritten medical source content. */
     fun parseMany(input: String, referenceDate: LocalDate = LocalDate.now()): ParsedClinicalRecordBatch {
         val formatIssues = buildList {
             if (input.contains("```")) {
@@ -213,32 +231,15 @@ object ClinicalRecordQuickParser {
         if (input.length > MAX_INPUT_LENGTH || input.isBlank()) {
             return ParsedClinicalRecordBatch(listOf(parse(input, referenceDate)), formatIssues)
         }
-        val normalized = input.replace("\r\n", "\n").replace('\r', '\n')
-            .replace('；', '\n').replace(';', '\n')
-        val dateStarts = Regex("(?m)^\\s*(?:日期|就诊日期|记录日期)\\s*[：:]")
-            .findAll(normalized)
-            .map { it.range.first }
-            .toList()
-        val starts = if (dateStarts.size > 1) {
-            dateStarts
-        } else {
-            Regex("(?m)^\\s*(?=(?:(?:\\d{4}年)?\\d{1,2}月\\d{1,2}[日号]|\\d{4}[-/]\\d{1,2}[-/]\\d{1,2})(?!\\d))")
-                .findAll(normalized)
-                .map { it.range.first }
-                .distinct()
-                .toList()
+        val normalized = normalizeNewlines(input)
+        val boundaryIssues = mutableListOf<QuickEntryIssue>()
+        val blocks = splitExplicitRecords(normalized, boundaryIssues).flatMap { (offset, section) ->
+            splitLegacyRecords(section, offset, normalized, boundaryIssues)
         }
-        if (starts.size <= 1) return ParsedClinicalRecordBatch(listOf(parse(normalized, referenceDate)), formatIssues)
-
-        val blocks = starts.mapIndexed { index, start ->
-            val blockStart = if (index == 0) 0 else start
-            val blockEnd = starts.getOrNull(index + 1) ?: normalized.length
-            normalized.substring(blockStart, blockEnd).trim()
-        }.filter { it.isNotBlank() }
         if (blocks.size > MAX_BATCH_RECORDS) {
             return ParsedClinicalRecordBatch(
                 records = emptyList(),
-                issues = formatIssues + listOf(
+                issues = formatIssues + boundaryIssues + listOf(
                     QuickEntryIssue(
                         IssueSeverity.ERROR,
                         null,
@@ -248,7 +249,108 @@ object ClinicalRecordQuickParser {
                 )
             )
         }
-        return ParsedClinicalRecordBatch(blocks.map { parse(it, referenceDate) }, formatIssues)
+        return ParsedClinicalRecordBatch(blocks.map { parse(it, referenceDate) }, formatIssues + boundaryIssues)
+    }
+
+    private fun splitExplicitRecords(
+        input: String,
+        issues: MutableList<QuickEntryIssue>
+    ): List<Pair<Int, String>> {
+        val boundaries = mutableListOf<RecordBoundary>()
+        Regex("(?m)^[\\t 　]*---[\\t 　]*$").findAll(input).forEach { separator ->
+            val afterLine = (separator.range.last + 1).let { if (input.getOrNull(it) == '\n') it + 1 else it }
+            val blankLines = Regex("^(?:[\\t 　]*\\n)*").find(input.substring(afterLine))!!.value.length
+            val headerStart = afterLine + blankLines
+            val following = input.substring(headerStart)
+            val markers = fieldMarkers(following)
+            val hasRecordHeader = markers.firstOrNull()?.let { first ->
+                first.start == 0 && first.field == Field.DATE && markers.getOrNull(1)?.field == Field.TITLE
+            } == true
+            val hasNarrativeHeader = narrativeStart.find(following)?.range?.first == 0
+            if (hasRecordHeader || hasNarrativeHeader) {
+                // Only the newline introducing the delimiter belongs to the framing.
+                // Earlier blank lines can be part of the original source and must survive.
+                val previousEnd = if (input.getOrNull(separator.range.first - 1) == '\n') {
+                    separator.range.first - 1
+                } else separator.range.first
+                // Skip blank lines only to recognize the header; they are still source content.
+                boundaries += RecordBoundary(afterLine, previousEnd)
+            } else {
+                ambiguousBoundary(input, separator.range.first, issues)
+            }
+        }
+        val sections = mutableListOf<Pair<Int, String>>()
+        var start = 0
+        boundaries.forEach { boundary ->
+            input.substring(start, boundary.previousEnd).takeIf(String::isNotBlank)?.let { sections += start to it }
+            start = boundary.start
+        }
+        input.substring(start).takeIf(String::isNotBlank)?.let { sections += start to it }
+        return sections
+    }
+
+    private fun splitLegacyRecords(
+        input: String,
+        offset: Int,
+        wholeInput: String,
+        issues: MutableList<QuickEntryIssue>
+    ): List<String> {
+        val markers = fieldMarkers(input)
+        val boundaries = mutableListOf<RecordBoundary>()
+        if (markers.any { it.field in structuredFields }) {
+            var seenDate = false
+            var seenStructuredField = false
+            var inNotes = false
+            markers.forEachIndexed { index, marker ->
+                if (marker.field == Field.DATE) {
+                    if (inNotes) {
+                        // A repeated, complete standard template separated by a blank line is the
+                        // legacy AI format. A date/title alone could be a quoted report: keep it,
+                        // and require an explicit separator rather than silently losing source.
+                        val layoutBefore = Regex("\\n[\\t 　]*\\n\\z").find(input.substring(0, marker.start))
+                        val completeTemplate = standardTemplateFields.indices.all { fieldIndex ->
+                            markers.getOrNull(index + fieldIndex)?.field == standardTemplateFields[fieldIndex]
+                        }
+                        if (layoutBefore != null && completeTemplate) {
+                            boundaries += RecordBoundary(marker.start, layoutBefore.range.first)
+                            inNotes = false
+                            seenDate = true
+                        } else if (markers.getOrNull(index + 1)?.field == Field.TITLE) {
+                            ambiguousBoundary(wholeInput, offset + marker.start, issues)
+                        }
+                    } else if (seenDate) {
+                        boundaries += RecordBoundary(marker.start, marker.start)
+                    } else {
+                        seenDate = true
+                    }
+                }
+                if (!inNotes) {
+                    if (marker.field == Field.NOTES && seenStructuredField) inNotes = true
+                    if (marker.field in structuredFields) seenStructuredField = true
+                }
+            }
+        } else {
+            narrativeStart.findAll(input).drop(1).forEach { match ->
+                boundaries += RecordBoundary(match.range.first, match.range.first)
+            }
+        }
+        val blocks = mutableListOf<String>()
+        var start = 0
+        boundaries.forEach { boundary ->
+            input.substring(start, boundary.previousEnd).takeIf(String::isNotBlank)?.let(blocks::add)
+            start = boundary.start
+        }
+        input.substring(start).takeIf(String::isNotBlank)?.let(blocks::add)
+        return blocks
+    }
+
+    private fun ambiguousBoundary(input: String, position: Int, issues: MutableList<QuickEntryIssue>) {
+        val line = input.take(position).count { it == '\n' } + 1
+        issues.error(
+            Field.DATE.label,
+            "AMBIGUOUS_RECORD_BOUNDARY",
+            "第 $line 行可能是原文内容或另一条记录，已保留原文且未拆分。请核对后在记录之间另起一行写 ---"
+        )
     }
 
     fun templateFor(date: LocalDate): String = template.replace(TEMPLATE_DATE_TOKEN, date.toString())
@@ -277,7 +379,9 @@ object ClinicalRecordQuickParser {
         values: Map<Field, List<String>>,
         issues: MutableList<QuickEntryIssue>
     ): String {
-        val entries = values[field].orEmpty().map(String::trim).filter(String::isNotEmpty)
+        val entries = values[field].orEmpty()
+            .map { if (field == Field.NOTES) it else it.trim() }
+            .filter(String::isNotBlank)
         if (entries.size > 1) {
             issues.warning(field.label, "MERGED_${field.name}", "${field.label}重复出现，已按原顺序合并")
         }
@@ -321,7 +425,8 @@ object ClinicalRecordQuickParser {
         referenceDate: LocalDate,
         issues: MutableList<QuickEntryIssue>
     ): ParsedClinicalRecordDraft {
-        val text = input.replace("\r\n", "\n").replace('\r', '\n').trim()
+        val originalText = normalizeNewlines(input)
+        val text = originalText.trim()
         val dateMatch = findNarrativeDate(text, referenceDate)
         if (dateMatch == null) {
             issues.error(Field.DATE.label, "MISSING_DATE", "未找到明确日期，请写成“2026年8月29日”或“8月29日”")
@@ -365,7 +470,7 @@ object ClinicalRecordQuickParser {
         validateLength(Field.DIAGNOSIS, diagnosisParts, MAX_NARRATIVE_LENGTH, issues)
         validateLength(Field.TREATMENT, treatment, MAX_NARRATIVE_LENGTH, issues)
         validateLength(Field.MEDICATION, medication, MAX_NARRATIVE_LENGTH, issues)
-        val sourceNotes = "$SOURCE_PREFIX\n$text"
+        val sourceNotes = "$SOURCE_PREFIX\n$originalText"
         validateLength(Field.NOTES, sourceNotes, MAX_NARRATIVE_LENGTH, issues)
         issues.warning(null, "NARRATIVE_MODE", "已按自然叙述自动整理，并在备注中保留原文；请核对后再保存")
 

@@ -335,4 +335,217 @@ class ClinicalRecordQuickParserTest {
             result.notes
         )
     }
+
+    @Test fun `batch entry preserves semicolons and dates inside terminal original notes`() {
+        val rawNotes = "原文记录：\n1）先检查；2）再复诊。\n日期：2026-10-01\n当天服药后鼻塞减轻。"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：$rawNotes"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(1, result.records.size)
+        assertEquals(LocalDate.of(2026, 10, 11), result.records.single().recordDate)
+        assertEquals(rawNotes, result.records.single().notes)
+    }
+
+    @Test fun `semicolon template treats other notes as raw terminal content`() {
+        val rawNotes = "原文记录：先检查；医生：原文医生;诊断：原文诊断；日期：2026-10-01"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11；标题：鼻窦炎复查;医生：李医生；诊断：鼻窦炎；其他备注：$rawNotes"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(1, result.records.size)
+        assertEquals("李医生", result.records.single().clinician)
+        assertEquals("鼻窦炎", result.records.single().diagnosis)
+        assertEquals(rawNotes, result.records.single().notes)
+    }
+
+    @Test fun `batch entry keeps natural narrative punctuation and only normalizes newlines`() {
+        val input = "8月29日复查鼻窦炎；医生建议先冲洗;再观察。\r\n1）疼痛减轻；2）继续复查。"
+        val result = ClinicalRecordQuickParser.parseMany(input, LocalDate.of(2026, 10, 11))
+
+        assertFalse(result.hasErrors)
+        assertEquals(1, result.records.size)
+        assertEquals("原文记录：\n${input.replace("\r\n", "\n")}", result.records.single().notes)
+    }
+
+    @Test fun `batch original source retains whitespace after newline normalization`() {
+        val rawNotes = "原文记录：\r\n  1）先检查；再复诊。  \r\n医生：原文内容  "
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\r\n标题：鼻窦炎复查\r\n其他备注：$rawNotes"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(rawNotes.replace("\r\n", "\n"), result.records.single().notes)
+    }
+
+    @Test fun `date and title pair inside raw notes without a boundary is a blocking ambiguity`() {
+        val rawNotes = "原文记录：\n先检查；再复诊。\n日期：2026-10-01\n标题：原检查标题\n医生：原文医生"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：$rawNotes"
+        )
+
+        assertTrue(result.hasErrors)
+        assertTrue(result.issues.any { it.code == "AMBIGUOUS_RECORD_BOUNDARY" })
+        assertEquals(1, result.records.size)
+        assertEquals(rawNotes, result.records.single().notes)
+    }
+
+    @Test fun `blank line and partial template inside raw notes does not discard source`() {
+        val rawNotes = "原文记录：\n先检查。\n\n日期：2026-10-01\n标题：原检查标题"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：$rawNotes"
+        )
+
+        assertTrue(result.hasErrors)
+        assertTrue(result.issues.any { it.code == "AMBIGUOUS_RECORD_BOUNDARY" })
+        assertEquals(1, result.records.size)
+        assertEquals(rawNotes, result.records.single().notes)
+    }
+
+    @Test fun `complete repeated AI templates retain embedded source labels and semicolons`() {
+        val firstNotes = "原文记录：\n1）先检查；2）再复诊。\n日期：2026-10-01\n医生：原文医生"
+        val secondNotes = "原文记录：\n同日先检查;后复诊。"
+        fun record(title: String, notes: String) = """
+            日期：2026-10-11
+            标题：$title
+            病情分类：鼻窦炎
+            记录类型：复查
+            症状/病情：
+            诊断：鼻窦炎
+            治疗方案：
+            就诊用药记录：
+            医院：
+            医生：李医生
+            其他备注：
+        """.trimIndent() + notes
+        val result = ClinicalRecordQuickParser.parseMany(
+            record("鼻窦炎先检查", firstNotes) + "\n\n" + record("鼻窦炎后复诊", secondNotes)
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals("鼻窦炎先检查", result.records[0].title)
+        assertEquals("鼻窦炎后复诊", result.records[1].title)
+        assertEquals(firstNotes, result.records[0].notes)
+        assertEquals(secondNotes, result.records[1].notes)
+    }
+
+    @Test fun `legacy template framing retains trailing original blank lines`() {
+        val original = "原文记录：\n先检查。  \n\n"
+        val first = ClinicalRecordQuickParser.templateFor(LocalDate.of(2026, 10, 11))
+            .replace("标题：", "标题：鼻窦炎先检查")
+            .replace("其他备注：", "其他备注：$original")
+        val second = ClinicalRecordQuickParser.templateFor(LocalDate.of(2026, 10, 12))
+            .replace("标题：", "标题：鼻窦炎后复诊")
+            .replace("其他备注：", "其他备注：原文记录：后复查。")
+        val result = ClinicalRecordQuickParser.parseMany(first + "\n\n" + second)
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals(original, result.records.first().notes)
+    }
+
+    @Test fun `semicolon dated natural events retain their raw punctuation in order`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            "8月29日复查鼻窦炎；9月3日再次复查鼻窦炎。",
+            LocalDate.of(2026, 10, 11)
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals("原文记录：\n8月29日复查鼻窦炎；", result.records[0].notes)
+        assertEquals("原文记录：\n9月3日再次复查鼻窦炎。", result.records[1].notes)
+    }
+
+    @Test fun `explicit separators support short templates with terminal source and keep order`() {
+        val firstNotes = "原文记录：\n10月11日先检查；医生：原文医生。"
+        val secondNotes = "原文记录：\n10月11日再复诊;诊断：原文诊断。"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎先检查\n其他备注：$firstNotes\n---\n" +
+                "日期：2026-10-11；标题：鼻窦炎后复诊；其他备注：$secondNotes"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals("鼻窦炎先检查", result.records[0].title)
+        assertEquals("鼻窦炎后复诊", result.records[1].title)
+        assertEquals(firstNotes, result.records[0].notes)
+        assertEquals(secondNotes, result.records[1].notes)
+    }
+
+    @Test fun `ambiguous source separators are kept and the repair instruction is explicit`() {
+        val rawNotes = "原文记录：\n先检查；后复诊。\n---\n医生：原文医生\n诊断：原文诊断"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：$rawNotes"
+        )
+
+        assertTrue(result.hasErrors)
+        assertEquals(1, result.records.size)
+        assertEquals(rawNotes, result.records.single().notes)
+        assertTrue(result.issues.any {
+            it.code == "AMBIGUOUS_RECORD_BOUNDARY" && it.message.contains("第 5 行") &&
+                it.message.contains("记录之间另起一行写 ---")
+        })
+    }
+
+    @Test fun `explicit separator removes framing only and retains trailing original blank lines`() {
+        val original = "原文记录：\n先检查；再复诊。  \n\n"
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：$original\n---\n" +
+                "日期：2026-10-12\n标题：鼻窦炎再复查\n其他备注：原文记录：后复查。"
+        )
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals(original, result.records.first().notes)
+    }
+
+    @Test fun `explicit separator followed by an invalid date retains the offending record`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11\n标题：鼻窦炎复查\n其他备注：原文记录：先检查。\n---\n" +
+                "日期：2026-02-30\n标题：鼻窦炎再复诊\n其他备注：原文记录：再复诊。"
+        )
+
+        assertTrue(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertFalse(result.records[0].hasErrors)
+        assertTrue(result.records[1].issues.any { it.code == "INVALID_DATE" })
+        assertEquals("原文记录：再复诊。", result.records[1].notes)
+    }
+
+    @Test fun `explicit separators accept dated natural records without rewriting source`() {
+        val first = "  10月11日复查鼻窦炎；先检查。  "
+        val second = "10月12日复查鼻窦炎;后复诊。"
+        val result = ClinicalRecordQuickParser.parseMany("$first\n---\n$second", LocalDate.of(2026, 10, 11))
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals("原文记录：\n$first", result.records[0].notes)
+        assertEquals("原文记录：\n$second", result.records[1].notes)
+    }
+
+    @Test fun `explicit separator keeps leading blank lines in following original narrative`() {
+        val first = "10月11日复查鼻窦炎。"
+        val second = "\n\n  10月12日复查鼻窦炎。"
+        val result = ClinicalRecordQuickParser.parseMany("$first\n---\n$second", LocalDate.of(2026, 10, 11))
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals("原文记录：\n$second", result.records[1].notes)
+    }
+
+    @Test fun `semicolon templates without terminal notes still split into multiple records`() {
+        val result = ClinicalRecordQuickParser.parseMany(
+            "日期：2026-10-11；标题：鼻窦炎先检查；医生：李医生；" +
+                "日期：2026-10-12;标题：鼻窦炎后复诊;医生：王医生"
+        )
+
+        assertFalse(result.hasErrors)
+        assertEquals(2, result.records.size)
+        assertEquals(LocalDate.of(2026, 10, 11), result.records[0].recordDate)
+        assertEquals(LocalDate.of(2026, 10, 12), result.records[1].recordDate)
+        assertEquals("李医生", result.records[0].clinician)
+        assertEquals("王医生", result.records[1].clinician)
+    }
 }

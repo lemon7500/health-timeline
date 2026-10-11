@@ -20,12 +20,16 @@ import com.healthtimeline.shared.PortableSnapshot
 import com.healthtimeline.shared.PortableFamilyMember
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.FileDescriptor
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -37,32 +41,35 @@ class PortableBackupService(
     private val context: Context,
     private val repository: HealthRepository,
     private val legacy: BackupService = BackupService(context, repository),
-    private val safetyStatusStore: SafetyStatusStore = SafetyStatusStore(context)
+    private val safetyStatusStore: SafetyStatusStore = SafetyStatusStore(context),
+    private val availableStorageBytes: () -> Long = { minOf(context.cacheDir.usableSpace, context.filesDir.usableSpace) },
+    private val availableDestinationStorageBytes: (FileDescriptor) -> Long? = BackupDestinationStorage::availableBytes
 ) {
     private val database = repository.database
 
     suspend fun export(destination: Uri, password: CharArray): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
                     require(password.size >= 8) { "备份密码至少需要 8 位" }
                     val zip = File.createTempFile("health-v5-", ".zip", context.cacheDir)
                     val encrypted = File.createTempFile("health-v5-", ".encrypted", context.cacheDir)
                     try {
                         val entities = loadEntities()
+                        val budget = resourceBudget()
                         val portable = PortableSnapshotMapper.toPortable(
                             entities,
                             InstallationIdentity.getOrCreate(context),
                             Instant.now().toString()
                         )
-                        writeZip(zip, portable, entities.attachments)
+                        writeZip(zip, portable, entities.attachments, budget)
                         FileInputStream(zip).use { input ->
                             FileOutputStream(encrypted).use { output ->
-                                BackupCrypto.encrypt(input, output, password)
+                                BackupCrypto.encrypt(input, output, password, budget)
                                 output.fd.sync()
                             }
                         }
-                        writeDestination(destination, encrypted)
+                        writeDestination(destination, encrypted, budget)
                         safetyStatusStore.recordSuccessfulBackup()
                     } finally {
                         zip.delete(); encrypted.delete()
@@ -75,7 +82,7 @@ class PortableBackupService(
     suspend fun previewImport(source: Uri, password: CharArray, targetMemberId: Long?): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
                     prepare(source, password).use { prepared ->
                         if (prepared.portable == null) {
                             BackupImportPreview(0, 0, 0, emptyList(), legacyReplacementOnly = true)
@@ -105,7 +112,7 @@ class PortableBackupService(
     ): Result<BackupImportPreview> = withContext(Dispatchers.IO) {
         try {
             repository.mutationMutex.withLock {
-                runCatching {
+                runBackupCatching {
                     prepare(source, password).use { prepared ->
                         val rawImported = requireNotNull(prepared.portable) { "旧版备份不能与现有数据自动合并，请选择安全替换" }
                         val currentEntities = loadEntities()
@@ -129,7 +136,7 @@ class PortableBackupService(
 
     suspend fun replaceFromBackup(source: Uri, password: CharArray, targetMemberId: Long?): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            runCatching {
+            runBackupCatching {
                 // Determine the manifest version only after authenticating and validating the archive.
                 prepare(source, password).use { prepared ->
                     if (prepared.portable == null) {
@@ -176,27 +183,36 @@ class PortableBackupService(
         )
     }
 
-    private fun writeZip(target: File, portable: PortableSnapshot, attachments: List<AttachmentEntity>) {
+    private suspend fun resourceBudget(): BackupResourceBudget {
+        val coroutineContext = currentCoroutineContext()
+        return BackupResourceBudget(availableStorageBytes, { coroutineContext.ensureActive() })
+    }
+
+    private fun writeZip(target: File, portable: PortableSnapshot, attachments: List<AttachmentEntity>, budget: BackupResourceBudget) {
         val files = attachments.associateBy { it.uuid.lowercase() }
-        ZipOutputStream(FileOutputStream(target)).use { zip ->
+        val manifest = PortableJson.encode(portable).toByteArray(Charsets.UTF_8)
+        require(manifest.size.toLong() <= BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单超过可恢复的大小，请分批整理资料" }
+        FileOutputStream(target).use { fileOutput ->
+        ZipOutputStream(budget.limitOutput(fileOutput)).use { zip ->
             zip.putNextEntry(ZipEntry("manifest.json"))
-            zip.write(PortableJson.encode(portable).toByteArray(Charsets.UTF_8))
+            zip.write(manifest)
             zip.closeEntry()
             portable.attachments.forEach { attachment ->
                 val entity = requireNotNull(files[attachment.uuid]) { "附件索引缺失：${attachment.displayName}" }
                 val file = repository.attachmentStore.file(entity)
                 require(file.isFile) { "附件缺失：${attachment.displayName}" }
-                require(file.length() == attachment.sizeBytes && sha256(file) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
+                require(file.length() == attachment.sizeBytes && sha256(file, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
                 zip.putNextEntry(ZipEntry(attachment.archivePath))
-                file.inputStream().use { it.copyTo(zip) }
+                file.inputStream().use { budget.copy(it, zip, attachment.sizeBytes) }
                 zip.closeEntry()
             }
+        }
         }
     }
 
     private suspend fun writeSafetyBackup(password: CharArray) = writeSafetyBackup(password, loadEntities())
 
-    private fun writeSafetyBackup(password: CharArray, entities: BackupSnapshot) {
+    private suspend fun writeSafetyBackup(password: CharArray, entities: BackupSnapshot) {
         val directory = File(context.filesDir, "safety_backups")
         require(directory.isDirectory || directory.mkdirs()) { "无法创建自动安全备份目录" }
         val stamp = System.currentTimeMillis()
@@ -204,13 +220,14 @@ class PortableBackupService(
         val temporary = File(directory, ".before-replace-$stamp.tmp")
         val destination = File(directory, "before-replace-$stamp.htbackup")
         try {
+            val budget = resourceBudget()
             val portable = PortableSnapshotMapper.toPortable(
                 entities, InstallationIdentity.getOrCreate(context), Instant.now().toString()
             )
-            writeZip(zip, portable, entities.attachments)
+            writeZip(zip, portable, entities.attachments, budget)
             zip.inputStream().use { input ->
                 FileOutputStream(temporary).use { output ->
-                    BackupCrypto.encrypt(input, output, password)
+                    BackupCrypto.encrypt(input, output, password, budget)
                     output.fd.sync()
                 }
             }
@@ -224,7 +241,8 @@ class PortableBackupService(
         }
     }
 
-    private fun prepare(source: Uri, password: CharArray): PreparedImport {
+    private suspend fun prepare(source: Uri, password: CharArray): PreparedImport {
+        val budget = resourceBudget()
         val root = File(context.cacheDir, "portable-restore-${UUID.randomUUID()}").apply {
             require(mkdirs()) { "无法创建恢复临时目录" }
         }
@@ -233,10 +251,12 @@ class PortableBackupService(
             try {
                 context.contentResolver.openInputStream(source)?.use { input ->
                     FileOutputStream(zipFile).use { output ->
-                        BackupCrypto.decrypt(input, output, password)
+                        BackupCrypto.decrypt(input, output, password, budget)
                         output.fd.sync()
                     }
                 } ?: error("无法读取备份文件")
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: IllegalArgumentException) {
                 throw error
             } catch (error: Throwable) {
@@ -244,24 +264,27 @@ class PortableBackupService(
             }
             ZipFile(zipFile).use { zip ->
                 val manifestEntry = zip.getEntry("manifest.json") ?: error("备份缺少清单")
-                require(manifestEntry.size in 1..10_000_000) { "备份清单大小异常" }
-                val json = zip.getInputStream(manifestEntry).bufferedReader().use { it.readText() }
+                require(manifestEntry.size in 1..BackupResourceBudget.MAX_MANIFEST_BYTES) { "备份清单大小异常" }
+                val json = zip.getInputStream(manifestEntry).use(budget::readManifest)
                 if (JSONObject(json).optInt("schemaVersion", -1) == 1) {
                     // The legacy service performs its own complete validation before replacement.
                     return PreparedImport(root, null)
                 }
                 val portable = PortableJson.decode(json)
-                val archiveEntries = zip.entries().asSequence().toList()
-                val entriesByPath = archiveEntries.associateBy { it.name.lowercase() }
-                require(entriesByPath.size == archiveEntries.size) { "备份包含重复文件路径" }
+                val entriesByPath = hashMapOf<String, ZipEntry>()
+                zip.entries().asSequence().forEach { entry ->
+                    budget.checkpoint()
+                    require(entriesByPath.size <= portable.attachments.size) { "备份包含多余文件" }
+                    require(entriesByPath.put(entry.name.lowercase(), entry) == null) { "备份包含重复文件路径" }
+                }
                 val totalSize = portable.attachments.fold(0L) { total, item -> Math.addExact(total, item.sizeBytes) }
-                require(context.filesDir.usableSpace > totalSize + 20L * 1024L * 1024L) { "手机存储空间不足" }
+                budget.requireSpace(totalSize)
                 val staged = File(root, "files").apply { require(mkdirs()) { "无法创建附件临时目录" } }
                 portable.attachments.forEach { attachment ->
                     val entry = entriesByPath[attachment.archivePath.lowercase()] ?: error("附件缺失：${attachment.displayName}")
                     require(entry.size in 0..AttachmentStore.MAX_FILE_BYTES) { "附件大小异常：${attachment.displayName}" }
                     val destination = File(staged, attachment.uuid)
-                    copyVerified(zip, entry.name, destination, attachment)
+                    copyVerified(zip, entry.name, destination, attachment, budget)
                 }
                 return PreparedImport(root, portable)
             }
@@ -271,23 +294,15 @@ class PortableBackupService(
         }
     }
 
-    private fun copyVerified(zip: ZipFile, entryName: String, destination: File, attachment: PortableAttachment) {
+    private fun copyVerified(zip: ZipFile, entryName: String, destination: File, attachment: PortableAttachment, budget: BackupResourceBudget) {
         val entry = requireNotNull(zip.getEntry(entryName))
         zip.getInputStream(entry).use { input ->
             FileOutputStream(destination).use { output ->
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                var copied = 0L
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    copied = Math.addExact(copied, read.toLong())
-                    require(copied <= attachment.sizeBytes && copied <= AttachmentStore.MAX_FILE_BYTES) { "附件大小校验失败：${attachment.displayName}" }
-                    output.write(buffer, 0, read)
-                }
+                budget.copy(input, budget.limitOutput(output), minOf(attachment.sizeBytes, AttachmentStore.MAX_FILE_BYTES))
                 output.fd.sync()
             }
         }
-        require(destination.length() == attachment.sizeBytes && sha256(destination) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
+        require(destination.length() == attachment.sizeBytes && sha256(destination, budget) == attachment.sha256) { "附件校验失败：${attachment.displayName}" }
     }
 
     private suspend fun installPortable(
@@ -296,6 +311,7 @@ class PortableBackupService(
         current: BackupSnapshot,
         preparedRoot: File
     ) {
+        val budget = resourceBudget()
         val importedById = imported.attachments.associateBy { it.uuid }
         val localById = current.attachments.associateBy { it.uuid.lowercase() }
         val installId = UUID.randomUUID().toString()
@@ -314,15 +330,22 @@ class PortableBackupService(
                     incoming.sizeBytes == attachment.sizeBytes
                 val localVerified = local != null && local.sha256 == attachment.sha256 &&
                     local.sizeBytes == attachment.sizeBytes &&
-                    runCatching { repository.attachmentStore.verifyStored(local) }.getOrDefault(false)
+                    runBackupCatching {
+                        val file = repository.attachmentStore.file(local)
+                        file.isFile && file.canRead() && file.length() == local.sizeBytes && sha256(file, budget) == local.sha256
+                    }.getOrDefault(false)
                 if (usesIncoming && !localVerified) {
                     val source = File(preparedRoot, "files/${attachment.uuid}")
                     require(source.isFile) { "附件临时文件缺失：${attachment.displayName}" }
                     val destination = File(installed, attachment.uuid)
+                    budget.requireSpace(attachment.sizeBytes)
                     source.inputStream().use { input ->
-                        FileOutputStream(destination).use { output -> input.copyTo(output); output.fd.sync() }
+                        FileOutputStream(destination).use { output ->
+                            budget.copy(input, budget.limitOutput(output), attachment.sizeBytes)
+                            output.fd.sync()
+                        }
                     }
-                    require(destination.length() == attachment.sizeBytes && sha256(destination) == attachment.sha256) {
+                    require(destination.length() == attachment.sizeBytes && sha256(destination, budget) == attachment.sha256) {
                         "安装附件校验失败：${attachment.displayName}"
                     }
                     importedPaths[attachment.uuid] = "$relativeRoot/${attachment.uuid}"
@@ -335,6 +358,7 @@ class PortableBackupService(
             }
             // Cancellation after a successful commit must never remove files
             // that the new database already references.
+            budget.checkpoint()
             withContext(NonCancellable) {
                 replaceDatabase(entities)
                 databaseCommitted = true
@@ -430,21 +454,31 @@ class PortableBackupService(
         ).also(com.healthtimeline.shared.PortableSnapshotValidator::validate)
     }
 
-    private fun writeDestination(destination: Uri, encrypted: File) {
-        val descriptor = context.contentResolver.openFileDescriptor(destination, "rwt") ?: error("无法创建备份文件")
-        descriptor.use {
-            FileOutputStream(it.fileDescriptor).use { output ->
-                encrypted.inputStream().use { input -> input.copyTo(output) }
-                output.fd.sync()
+    private fun writeDestination(destination: Uri, encrypted: File, budget: BackupResourceBudget) {
+        try {
+            val descriptor = context.contentResolver.openFileDescriptor(destination, "rwt") ?: error("无法创建备份文件")
+            descriptor.use {
+                val targetBudget = BackupDestinationStorage.budget(it.fileDescriptor,
+                    availableDestinationStorageBytes, availableStorageBytes, budget::checkpoint)
+                FileOutputStream(it.fileDescriptor).use { output ->
+                    encrypted.inputStream().use { input ->
+                        targetBudget.copy(input, targetBudget.limitOutput(output), encrypted.length())
+                    }
+                    output.fd.sync()
+                }
             }
+        } catch (error: Throwable) {
+            runCatching { context.contentResolver.openOutputStream(destination, "wt")?.close() }
+            throw error
         }
     }
 
-    private fun sha256(file: File): String {
+    private fun sha256(file: File, budget: BackupResourceBudget): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
             while (true) {
+                budget.checkpoint()
                 val read = input.read(buffer)
                 if (read < 0) break
                 digest.update(buffer, 0, read)

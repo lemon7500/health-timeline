@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.healthtimeline.app.data.*
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CancellationException
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -118,6 +119,136 @@ class PortableBackupRecoveryTest {
         assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
     }
 
+    @Test fun storageBudgetFailureDoesNotChangeDatabaseOrLeaveStagingFiles() = runBlocking {
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        val beforeStaging = stagingDirectories()
+        val limited = PortableBackupService(context, repository, availableStorageBytes = {
+            BackupResourceBudget.STORAGE_RESERVE_BYTES + 64
+        })
+        assertTrue(limited.mergeImport(Uri.fromFile(backup), password(), emptyMap(), memberId).isFailure)
+        assertEquals(beforeRecords, database.clinicalRecordDao().all())
+        assertEquals(beforeAttachments, database.attachmentDao().all())
+        assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+        assertEquals(beforeStaging, stagingDirectories())
+    }
+
+    @Test fun cancellationBeforeValidationPropagatesAndCleansStagingWithoutChangingData() = runBlocking {
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        val beforeStaging = stagingDirectories()
+        val cancellation = CancellationException("synthetic backup cancellation")
+        val cancelled = PortableBackupService(context, repository, availableStorageBytes = { throw cancellation })
+        try {
+            cancelled.mergeImport(Uri.fromFile(backup), password(), emptyMap(), memberId)
+            fail("Cancellation must not become a password error or a successful result")
+        } catch (error: CancellationException) {
+            assertSame(cancellation, error)
+        }
+        assertEquals(beforeRecords, database.clinicalRecordDao().all())
+        assertEquals(beforeAttachments, database.attachmentDao().all())
+        assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+        assertEquals(beforeStaging, stagingDirectories())
+    }
+
+    @Test fun tamperedAuthenticationTagNeverChangesDataAndRemovesUnauthenticatedStaging() = runBlocking {
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        val beforeStaging = stagingDirectories()
+        val bytes = backup.readBytes()
+        bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte()
+        backup.writeBytes(bytes)
+        assertTrue(service.mergeImport(Uri.fromFile(backup), password(), emptyMap(), memberId).isFailure)
+        assertEquals(beforeRecords, database.clinicalRecordDao().all())
+        assertEquals(beforeAttachments, database.attachmentDao().all())
+        assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+        assertEquals(beforeStaging, stagingDirectories())
+    }
+
+    @Test fun legacyRestoreStorageFailureKeepsAllExistingDataAndCleansTemporaryFiles() = runBlocking {
+        val legacyFile = File.createTempFile("audit-legacy-backup-", ".htbackup", context.cacheDir)
+        try {
+            BackupService(context, repository).export(Uri.fromFile(legacyFile), password()).getOrThrow()
+            val beforeRecords = database.clinicalRecordDao().all()
+            val beforeAttachments = database.attachmentDao().all()
+            val beforeTemporary = legacyTemporaryFiles()
+            val limited = BackupService(context, repository, availableStorageBytes = {
+                BackupResourceBudget.STORAGE_RESERVE_BYTES + 64
+            })
+            assertTrue(limited.restore(Uri.fromFile(legacyFile), password(), memberId).isFailure)
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+            assertEquals(beforeTemporary, legacyTemporaryFiles())
+        } finally { legacyFile.delete() }
+    }
+
+    @Test fun legacyImportCancellationKeepsAllExistingDataAndCleansTemporaryFiles() = runBlocking {
+        val legacyFile = File.createTempFile("audit-legacy-backup-", ".htbackup", context.cacheDir)
+        try {
+            BackupService(context, repository).export(Uri.fromFile(legacyFile), password()).getOrThrow()
+            val beforeRecords = database.clinicalRecordDao().all()
+            val beforeAttachments = database.attachmentDao().all()
+            val beforeTemporary = legacyTemporaryFiles()
+            val cancellation = CancellationException("synthetic legacy backup cancellation")
+            val cancelled = BackupService(context, repository, availableStorageBytes = { throw cancellation })
+            try {
+                cancelled.importAsNew(Uri.fromFile(legacyFile), password(), memberId)
+                fail("Legacy import cancellation must propagate")
+            } catch (error: CancellationException) { assertSame(cancellation, error) }
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(original, repository.attachmentStore.file(attachment).readBytes())
+            assertEquals(beforeTemporary, legacyTemporaryFiles())
+        } finally { legacyFile.delete() }
+    }
+
+    @Test fun portableDestinationSpaceFailureClearsPartialExportAndDoesNotMarkSuccess() = runBlocking {
+        assertDestinationSpaceFailure(legacyExport = false)
+    }
+
+    @Test fun legacyDestinationSpaceFailureClearsPartialExportAndKeepsSourceData() = runBlocking {
+        assertDestinationSpaceFailure(legacyExport = true)
+    }
+
+    private suspend fun assertDestinationSpaceFailure(legacyExport: Boolean) {
+        // Incompressible synthetic data forces several final-document writes, not just setup failure.
+        val bytes = ByteArray(192 * 1024).also(java.util.Random(73)::nextBytes)
+        repository.attachmentStore.file(attachment).writeBytes(bytes)
+        attachment = attachment.copy(sizeBytes = bytes.size.toLong(), sha256 = hash(bytes))
+        database.attachmentDao().insertAll(listOf(attachment))
+        val beforeRecords = database.clinicalRecordDao().all()
+        val beforeAttachments = database.attachmentDao().all()
+        val destination = File.createTempFile("audit-destination-", ".htbackup", context.cacheDir)
+        val preferenceName = "audit-export-status-${UUID.randomUUID()}"
+        val status = SafetyStatusStore(context, preferenceName)
+        var targetChecks = 0
+        val targetSpace: (java.io.FileDescriptor) -> Long? = {
+            targetChecks++
+            if (targetChecks <= 3) BackupResourceBudget.STORAGE_RESERVE_BYTES + 256 * 1024L else 0L
+        }
+        try {
+            val result = if (legacyExport) {
+                BackupService(context, repository, availableDestinationStorageBytes = targetSpace)
+                    .export(Uri.fromFile(destination), password())
+            } else {
+                PortableBackupService(context, repository, safetyStatusStore = status,
+                    availableDestinationStorageBytes = targetSpace)
+                    .export(Uri.fromFile(destination), password())
+            }
+            assertTrue(result.isFailure)
+            assertTrue("Expected failure after the first final-document block", targetChecks >= 4)
+            assertEquals(0L, destination.length())
+            assertNull(status.lastBackupAt.value)
+            assertEquals(beforeRecords, database.clinicalRecordDao().all())
+            assertEquals(beforeAttachments, database.attachmentDao().all())
+            assertArrayEquals(bytes, repository.attachmentStore.file(attachment).readBytes())
+        } finally {
+            destination.delete()
+            context.deleteSharedPreferences(preferenceName)
+        }
+    }
+
     @Test fun uppercaseLegacyManifestAndZipPathKeepIdentitiesDuringRepair() = runBlocking {
         rewriteFixtureWithUppercaseUuids()
         repository.attachmentStore.file(attachment).delete()
@@ -167,6 +298,12 @@ class PortableBackupRecoveryTest {
     }
 
     private fun password() = "test-password-only".toCharArray()
+    private fun stagingDirectories(): Set<String> = context.cacheDir.listFiles()
+        ?.filter { it.name.startsWith("portable-restore-") }?.mapTo(hashSetOf()) { it.name }.orEmpty()
+    private fun legacyTemporaryFiles(): Set<String> = context.cacheDir.listFiles()
+        ?.filter { it.name.startsWith("restore-") || it.name.startsWith("import-new-") ||
+            it.name.startsWith("health-restore-") || it.name.startsWith("health-import-new-") }
+        ?.mapTo(hashSetOf()) { it.name }.orEmpty()
     private fun hash(value: ByteArray) = MessageDigest.getInstance("SHA-256").digest(value)
         .joinToString("") { "%02x".format(it) }
 }

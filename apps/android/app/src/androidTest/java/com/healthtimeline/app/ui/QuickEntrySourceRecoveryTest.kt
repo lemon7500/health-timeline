@@ -77,7 +77,7 @@ class QuickEntrySourceRecoveryTest {
                 template("2026-09-03", "鼻窦炎第一次复查", "${ClinicalRecordQuickParser.SOURCE_PREFIX}\n$firstSource"),
                 template("2026-09-01", "牙龈炎复查", secondNotes),
                 template("2026-09-03", "鼻窦炎追加检查", "${ClinicalRecordQuickParser.SOURCE_PREFIX}\n$thirdSource")
-            ).joinToString("\n\n")
+            ).joinToString("\n---\n")
         )
 
         compose.onNodeWithTag("quick-source-repair-0").assertDoesNotExist()
@@ -104,6 +104,17 @@ class QuickEntrySourceRecoveryTest {
             assertTrue(records[1].notes.contains(secondNotes))
             assertFalse(records[1].notes.contains(firstSource))
             assertFalse(records[1].notes.contains(thirdSource))
+        }
+    }
+
+    @Test fun savingParsedTemplatePreservesOriginalTrailingWhitespaceAndEmbeddedLabels() {
+        showEditor()
+        val original = "先检查；日期：2026-08-29；医生：测试医生  \r\n1）讨论报告。\r\n\r\n"
+        parse(template("2026-09-04", "鼻窦炎复查", "${ClinicalRecordQuickParser.SOURCE_PREFIX}\r\n$original"))
+        compose.onNodeWithTag("record-save").performClick()
+        compose.runOnIdle {
+            assertEquals(1, savedRecords.size)
+            assertEquals("${ClinicalRecordQuickParser.SOURCE_PREFIX}\n" + original.replace("\r\n", "\n"), savedRecords.single().notes)
         }
     }
 

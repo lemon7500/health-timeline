@@ -16,6 +16,17 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+internal const val LEGACY_MEDICATION_HISTORY_NAME_PREFIX = "旧版历史副本 · "
+internal const val LEGACY_MEDICATION_HISTORY_MARKER = "[health-timeline:legacy-medication-log:v1]\n"
+
+/** A reserved two-part migration marker, not just a user-entered medication name. */
+internal fun isLegacyMedicationHistoryCopy(medication: MedicationEntity): Boolean =
+    isLegacyMedicationHistoryCopy(medication.name, medication.instructions)
+
+internal fun isLegacyMedicationHistoryCopy(name: String, instructions: String): Boolean =
+    name.startsWith(LEGACY_MEDICATION_HISTORY_NAME_PREFIX) &&
+        instructions.startsWith(LEGACY_MEDICATION_HISTORY_MARKER)
+
 @Database(
     entities = [
         ConditionEntity::class,
@@ -76,10 +87,66 @@ abstract class AppDatabase : RoomDatabase() {
 
         internal val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
+                // v1's nullable scheduleId let several different logs occupy the same slot.
+                // Deduplicate only byte-for-byte equal payloads, never different medical facts.
                 db.execSQL(
                     "DELETE FROM medication_logs WHERE id NOT IN " +
-                        "(SELECT MIN(id) FROM medication_logs GROUP BY medicationId, scheduledAt)"
+                        "(SELECT MIN(id) FROM medication_logs GROUP BY medicationId, scheduleId, scheduledAt, " +
+                        "actualAt, status, doseAmountSnapshot, doseUnitSnapshot, createdAt)"
                 )
+                val logCount = rowCount(db, "medication_logs")
+                val conflicts = mutableListOf<Triple<Long, Long, Long?>>()
+                db.query(
+                    "SELECT id, medicationId, scheduleId FROM medication_logs WHERE id NOT IN " +
+                        "(SELECT MIN(id) FROM medication_logs GROUP BY medicationId, scheduledAt) ORDER BY id"
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        conflicts += Triple(cursor.getLong(0), cursor.getLong(1),
+                            if (cursor.isNull(2)) null else cursor.getLong(2))
+                    }
+                }
+                val migratedAt = java.time.Instant.now().toString()
+                conflicts.forEach { (logId, medicationId, scheduleId) ->
+                    val originalName = db.query("SELECT name FROM medications WHERE id = ?", arrayOf<Any>(medicationId)).use { cursor ->
+                        check(cursor.moveToFirst()) { "旧版用药记录引用的药物不存在，已停止迁移以保护原始资料" }
+                        cursor.getString(0)
+                    }
+                    val name = LEGACY_MEDICATION_HISTORY_NAME_PREFIX +
+                        originalName.take(100 - LEGACY_MEDICATION_HISTORY_NAME_PREFIX.length)
+                    val description = LEGACY_MEDICATION_HISTORY_MARKER +
+                        "此项仅为旧版迁移保留的历史副本，不是新医嘱，不安排用药提醒。\n" +
+                        "原药物名称：$originalName\n原药物本机 ID：$medicationId\n" +
+                        "原服用说明仍完整保留在原药物疗程中。\n" +
+                        "原服药记录 ID：$logId；原时间表 ID：${scheduleId ?: "无"}。\n" +
+                        "实际停药时间未知；归档发生于本次升级迁移（$migratedAt），不是原实际停药时间。"
+                    db.execSQL(
+                        "INSERT INTO medications (conditionId,name,doseAmount,doseUnit,instructions,startDate,endDate,mode,archived,createdAt,updatedAt) " +
+                            "SELECT conditionId,?,doseAmount,doseUnit,?,startDate,NULL,mode,1,createdAt,? " +
+                            "FROM medications WHERE id = ?",
+                        arrayOf<Any>(name, description, migratedAt, medicationId)
+                    )
+                    val historyMedicationId = lastInsertedId(db)
+                    val historyScheduleId = scheduleId?.let { originalScheduleId ->
+                        db.execSQL(
+                            "INSERT INTO medication_schedules (medicationId,localTime,enabled) " +
+                                "SELECT ?,localTime,0 FROM medication_schedules WHERE id = ? AND medicationId = ?",
+                            arrayOf<Any>(historyMedicationId, originalScheduleId, medicationId)
+                        )
+                        db.query("SELECT changes()").use { cursor ->
+                            check(cursor.moveToFirst() && cursor.getLong(0) == 1L) {
+                                "旧版用药记录的时间表引用异常，已停止迁移以保护原始资料"
+                            }
+                        }
+                        lastInsertedId(db)
+                    }
+                    // Only the owning references change. All log IDs, timestamps, status,
+                    // dose snapshots and creation timestamps remain exactly as in v1.
+                    db.execSQL(
+                        "UPDATE medication_logs SET medicationId = ?, scheduleId = ? WHERE id = ?",
+                        arrayOf(historyMedicationId, historyScheduleId, logId)
+                    )
+                }
+                check(rowCount(db, "medication_logs") == logCount) { "旧版用药记录迁移数量不一致" }
                 db.execSQL("DROP INDEX IF EXISTS index_medication_logs_medicationId_scheduleId_scheduledAt")
                 db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS index_medication_logs_medicationId_scheduledAt " +
@@ -317,7 +384,9 @@ abstract class AppDatabase : RoomDatabase() {
                 // queryable by the medication calendar.
                 db.execSQL(
                     "UPDATE medications SET endedAt = updatedAt, " +
-                        "endDate = COALESCE(endDate, substr(updatedAt, 1, 10)) WHERE archived = 1"
+                        "endDate = COALESCE(endDate, substr(updatedAt, 1, 10)) WHERE archived = 1 " +
+                        "AND NOT (instr(name, ?) = 1 AND instr(instructions, ?) = 1)",
+                    arrayOf<Any>(LEGACY_MEDICATION_HISTORY_NAME_PREFIX, LEGACY_MEDICATION_HISTORY_MARKER)
                 )
 
                 oldCounts.forEach { (table, count) ->
@@ -462,6 +531,12 @@ abstract class AppDatabase : RoomDatabase() {
 
         private fun rowCount(db: SupportSQLiteDatabase, table: String): Long =
             db.query("SELECT COUNT(*) FROM $table").use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getLong(0)
+            }
+
+        private fun lastInsertedId(db: SupportSQLiteDatabase): Long =
+            db.query("SELECT last_insert_rowid()").use { cursor ->
                 check(cursor.moveToFirst())
                 cursor.getLong(0)
             }

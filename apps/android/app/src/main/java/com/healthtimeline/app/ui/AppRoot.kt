@@ -36,6 +36,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.reminders.NotificationReviewRequest
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.provider.DocumentsContract
+import java.time.LocalDate
 
 private enum class Tab(val label: String) {
     TODAY("今日"), CALENDAR("日历"), FOLLOW_UP("复查"), MEDICATION("用药"), SETTINGS("设置")
@@ -53,6 +60,13 @@ fun HealthTimelineRoot(
     var tab by rememberSaveable { mutableStateOf(Tab.TODAY) }
     var navigation by drafts.navigationState
     val snackbar = remember { SnackbarHostState() }
+    val uiScope = rememberCoroutineScope()
+    var lockWriteError by remember { mutableStateOf<String?>(null) }
+    fun reportLockWriteFailure() {
+        val message = "无法保存保护设置，本次更改未确认成功。请检查手机剩余空间后重试。"
+        lockWriteError = message
+        uiScope.launch { snackbar.showSnackbar(message) }
+    }
     val busy by viewModel.busy.collectAsState()
     val locked by appLockManager.locked.collectAsStateWithLifecycle()
     val appLockEnabled by appLockManager.enabled.collectAsStateWithLifecycle()
@@ -63,6 +77,69 @@ fun HealthTimelineRoot(
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
     val selectedMemberId by viewModel.selectedMemberId.collectAsStateWithLifecycle()
+    val backupFlow: BackupExportFlowViewModel = composeViewModel()
+    backupFlow.bindMember(selectedMemberId)
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        appLockManager.endExternalActivity()
+        backupFlow.receive(uri?.toString())
+    }
+    val safetyExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        appLockManager.endExternalActivity()
+        backupFlow.receive(uri?.toString())
+    }
+    fun beginBackupExport(kind: BackupExportKind, password: CharArray, source: Uri? = null) {
+        if (!backupFlow.begin(kind, viewModel.selectedMemberId.value, password, source?.toString())) {
+            uiScope.launch { snackbar.showSnackbar("已有备份选择操作，或尚未选择成员。请完成当前操作后重试。") }
+            return
+        }
+        appLockManager.beginExternalActivity()
+        runCatching {
+            if (kind == BackupExportKind.EXPORT) exportLauncher.launch("病程日历-${LocalDate.now()}.htbackup")
+            else safetyExportLauncher.launch("病程日历-替换前安全备份-${LocalDate.now()}.htbackup")
+        }.onFailure {
+            appLockManager.endExternalActivity()
+            backupFlow.cancelAfterLaunchFailure()
+            uiScope.launch { snackbar.showSnackbar("无法打开保存位置，备份操作未执行，请重试。") }
+        }
+    }
+    // Launchers remain registered while locked; a result waits for authentication before any operation.
+    LaunchedEffect(locked, backupFlow.abortMessage.value) {
+        if (!locked) backupFlow.abortMessage.value?.let { message ->
+            snackbar.showSnackbar(message)
+            // Cancellation on rotation/locking leaves the event pending for the next unlocked page.
+            backupFlow.acknowledgeAbort(message)
+        }
+    }
+    LaunchedEffect(locked, backupFlow.revision.value, selectedMemberId) {
+        if (!locked) when (val completion = backupFlow.takeCompletion(viewModel.selectedMemberId.value)) {
+            is BackupExportFlowViewModel.Completion.Ready -> {
+                if (completion.kind == BackupExportKind.EXPORT) {
+                    viewModel.exportBackup(Uri.parse(completion.destination), completion.password)
+                } else {
+                    viewModel.restoreBackupWithSafetyExport(
+                        Uri.parse(completion.destination), Uri.parse(requireNotNull(completion.source)), completion.password,
+                        completion.memberId
+                    )
+                }
+            }
+            is BackupExportFlowViewModel.Completion.Aborted -> {
+                // Delete only a provably empty document, never an existing valid backup.
+                withContext(Dispatchers.IO) {
+                    completion.destination?.let { destination ->
+                        runCatching {
+                            val uri = Uri.parse(destination)
+                            val empty = context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                                val column = cursor.getColumnIndex(OpenableColumns.SIZE)
+                                cursor.moveToFirst() && column >= 0 && !cursor.isNull(column) && cursor.getLong(column) == 0L
+                            } == true
+                            if (empty && DocumentsContract.isDocumentUri(context, uri)) DocumentsContract.deleteDocument(context.contentResolver, uri)
+                        }
+                    }
+                }
+            }
+            else -> Unit
+        }
+    }
     // Bind before composing forms; clearing afterward could discard a just-created draft on rotation.
     drafts.bindMember(selectedMemberId)
     LaunchedEffect(selectedMemberId) {
@@ -210,10 +287,13 @@ fun HealthTimelineRoot(
                     padding,
                     appLockEnabled = appLockEnabled,
                     onAppLockChange = { enabled ->
-                        authenticate { appLockManager.setEnabled(enabled) }
+                        authenticate { if (!appLockManager.setEnabled(enabled)) reportLockWriteFailure() }
                     },
                     navigation = navigation as? TodayNavigation.Safety,
-                    onNavigationConsumed = ::consumeNavigation
+                    onNavigationConsumed = ::consumeNavigation,
+                    backupPickerBusy = backupFlow.busy.value,
+                    onExportRequest = { beginBackupExport(BackupExportKind.EXPORT, it) },
+                    onSafetyExportRequest = { source, password -> beginBackupExport(BackupExportKind.SAFETY_BEFORE_REPLACE, password, source) }
                 )
             }
             if (busy) LinearProgressIndicator()
@@ -224,20 +304,25 @@ fun HealthTimelineRoot(
         AlertDialog(
             onDismissRequest = {},
             title = { Text("保护家庭病历") },
-            text = { Text("你可以使用手机指纹、面容或锁屏密码保护病程日历。此功能稍后也可在设置中更改。") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("你可以使用手机指纹、面容或锁屏密码保护病程日历。此功能稍后也可在设置中更改。")
+                    lockWriteError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
                     authenticate {
-                        appLockManager.setEnabled(true)
-                        appLockManager.markIntroductionShown()
-                        showLockIntroduction = false
+                        if (appLockManager.setEnabled(true) && appLockManager.markIntroductionShown()) {
+                            showLockIntroduction = false
+                        } else reportLockWriteFailure()
                     }
                 }) { Text("开启保护") }
             },
             dismissButton = {
                 TextButton(onClick = {
-                    appLockManager.markIntroductionShown()
-                    showLockIntroduction = false
+                    if (appLockManager.markIntroductionShown()) showLockIntroduction = false
+                    else reportLockWriteFailure()
                 }) { Text("稍后") }
             }
         )

@@ -64,6 +64,9 @@ android {
         getByName("androidTest").assets.srcDir("$projectDir/schemas")
     }
     packaging.resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
+    // Java 9 OSGi bundle metadata is unused on Android and collides across JVM libraries.
+    // Exclude only that manifest, retaining dependency licenses and notices.
+    packaging.resources.excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
 }
 
 kotlin {
@@ -97,6 +100,7 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.8")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     testImplementation("junit:junit:4.13.2")

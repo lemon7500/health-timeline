@@ -2,6 +2,7 @@ package com.healthtimeline.app
 
 import android.app.Application
 import com.healthtimeline.app.backup.PortableBackupService
+import com.healthtimeline.app.backup.BackupTemporaryStore
 import com.healthtimeline.app.data.AppDatabase
 import com.healthtimeline.app.data.AttachmentStore
 import com.healthtimeline.app.data.HealthRepository
@@ -10,6 +11,11 @@ import com.healthtimeline.app.data.SafetyCenterService
 import com.healthtimeline.app.data.SafetyStatusStore
 import com.healthtimeline.app.reminders.AlarmScheduler
 import com.healthtimeline.app.security.AppLockManager
+import com.healthtimeline.app.data.CameraCaptureStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class HealthTimelineApplication : Application() {
     val database by lazy { AppDatabase.get(this) }
@@ -27,5 +33,12 @@ class HealthTimelineApplication : Application() {
         super.onCreate()
         appLockManager.registerScreenOffReceiver()
         NotificationChannels.create(this)
+        // Capture only previous-process work before a UI/new backup can create temporary files.
+        val backupTemporaryStore = BackupTemporaryStore(this)
+        val abandonedBackups = runCatching { backupTemporaryStore.snapshot() }.getOrNull()
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            abandonedBackups?.let { runCatching { backupTemporaryStore.cleanup(it) } }
+            runCatching { CameraCaptureStore(this@HealthTimelineApplication).cleanupInterrupted() }
+        }
     }
 }

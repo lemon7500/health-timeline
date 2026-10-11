@@ -20,6 +20,8 @@ class AiRecordFormattingPromptBuilderTest {
         assertTrue(prompt.contains("原文事件在用户输入中的先后顺序"))
         assertTrue(prompt.contains("编号、项目和句子的先后顺序不得重排"))
         assertTrue(prompt.contains("必须以“原文记录：”开始"))
+        assertTrue(prompt.contains("---"))
+        assertTrue(prompt.contains("不能充当分隔符"))
         assertTrue(prompt.contains("删除姓名、身份证号、电话号码、住址"))
         assertTrue(prompt.trimEnd().endsWith("用户信息如下："))
         assertFalse(prompt.contains("患者真实原文占位内容"))

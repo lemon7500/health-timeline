@@ -34,7 +34,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel as composeViewModel
 import com.healthtimeline.app.data.*
@@ -44,7 +43,6 @@ import com.healthtimeline.app.domain.ClinicalRecordQuickParser
 import com.healthtimeline.app.domain.IssueSeverity
 import com.healthtimeline.app.domain.ParsedClinicalRecordDraft
 import com.healthtimeline.app.domain.QuickEntryIssue
-import java.io.File
 import java.time.Instant
 import java.time.LocalDate
 import java.time.YearMonth
@@ -1044,7 +1042,7 @@ internal fun RecordEditorDialog(
                             title = completedTitle,
                             stage = stage,
                             symptoms = symptoms.trim(), diagnosis = diagnosis.trim(), treatment = treatment.trim(),
-                            medicationNotes = medicationNotes.trim(), hospital = hospital.trim(), clinician = clinician.trim(), notes = notes.trim(),
+                            medicationNotes = medicationNotes.trim(), hospital = hospital.trim(), clinician = clinician.trim(), notes = notes,
                                 createdAt = record?.createdAt ?: now,
                                 updatedAt = now,
                                 uuid = record?.uuid ?: java.util.UUID.randomUUID().toString(),
@@ -1233,7 +1231,7 @@ internal fun prepareQuickBatchRequests(
             medicationNotes = draft.medicationNotes.trim(),
             hospital = draft.hospital.trim(),
             clinician = draft.clinician.trim(),
-            notes = notes.trim(),
+            notes = notes,
             createdAt = timestamp,
             updatedAt = timestamp,
             memberId = memberId
@@ -1277,7 +1275,13 @@ private fun RecordDetailDialog(
     }
     val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
         appLockManager.endExternalActivity()
-        if (success && viewModel.selectedMemberId.value == record.memberId) cameraUriText?.let { viewModel.importAttachments(record.id, listOf(Uri.parse(it))) }
+        cameraUriText?.let { text ->
+            val uri = Uri.parse(text)
+            val captures = com.healthtimeline.app.data.CameraCaptureStore(context.applicationContext)
+            if (success && viewModel.selectedMemberId.value == record.memberId) {
+                captures.discardAfter(viewModel.importAttachments(record.id, listOf(uri)), uri)
+            } else captures.discard(uri)
+        }
         cameraUriText = null
     }
     AlertDialog(
@@ -1298,11 +1302,19 @@ private fun RecordDetailDialog(
                     }) {
                         Icon(Icons.Outlined.AttachFile, null); Text("选择文件")
                     }
-                    OutlinedButton(onClick = {
-                        val uri = createCameraUri(context)
-                        cameraUriText = uri.toString()
-                        appLockManager.beginExternalActivity()
-                        camera.launch(uri)
+                    OutlinedButton(enabled = cameraUriText == null, onClick = {
+                        val captures = com.healthtimeline.app.data.CameraCaptureStore(context.applicationContext)
+                        runCatching {
+                            val uri = captures.createUri()
+                            cameraUriText = uri.toString()
+                            appLockManager.beginExternalActivity()
+                            camera.launch(uri)
+                        }.onFailure {
+                            appLockManager.endExternalActivity()
+                            cameraUriText?.let { captures.discard(Uri.parse(it)) }
+                            cameraUriText = null
+                            android.widget.Toast.makeText(context, "无法打开相机，请检查可用相机及手机剩余空间。", android.widget.Toast.LENGTH_LONG).show()
+                        }
                     }) { Icon(Icons.Outlined.CameraAlt, null); Text("拍照") }
                 }
                 attachments.forEach { attachment ->
@@ -1388,10 +1400,4 @@ private fun ConditionManagerDialog(conditions: List<ConditionEntity>, memberId: 
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } }
     )
-}
-
-private fun createCameraUri(context: Context): Uri {
-    val dir = File(context.cacheDir, "camera").apply { mkdirs() }
-    val file = File(dir, "report-${System.currentTimeMillis()}.jpg")
-    return FileProvider.getUriForFile(context, "${context.packageName}.files", file)
 }

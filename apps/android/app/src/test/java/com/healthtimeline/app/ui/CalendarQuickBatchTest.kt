@@ -26,7 +26,7 @@ class CalendarQuickBatchTest {
 
     @Test fun `formatted AI records without originals are parseable but require source completion`() {
         val parsed = com.healthtimeline.app.domain.ClinicalRecordQuickParser.parseMany(
-            "日期：2026-09-03\n标题：鼻窦炎复查\n其他备注：待核对报告\n\n" +
+            "日期：2026-09-03\n标题：鼻窦炎复查\n其他备注：待核对报告\n---\n" +
                 "日期：2026-09-04\n标题：牙龈炎复查\n其他备注：",
             java.time.LocalDate.of(2026, 9, 4)
         )
@@ -46,6 +46,17 @@ class CalendarQuickBatchTest {
         assertEquals("", initialSourceRecordText("待核对报告"))
     }
 
+    @Test fun `batch save preserves terminal source whitespace dates and semicolons`() {
+        val input = "日期：2026-09-03\r\n标题：鼻窦炎复查\r\n其他备注：原文记录：\r\n" +
+            "先拍片；日期：2026-08-29；医生：测试医生  \r\n1）讨论报告。\r\n\r\n"
+        val parsed = com.healthtimeline.app.domain.ClinicalRecordQuickParser.parseMany(input, java.time.LocalDate.of(2026, 9, 4))
+        assertFalse(parsed.hasErrors)
+        val request = prepareQuickBatchRequests(
+            parsed.records.map { it.toEditableQuickDraft() }, emptyList(), 3, false, "2026-09-07T00:00:00Z"
+        ).single()
+        assertEquals("原文记录：\n先拍片；日期：2026-08-29；医生：测试医生  \n1）讨论报告。\n\n", request.record.notes)
+    }
+
     @Test fun `source completion rejects empty or label only text`() {
         listOf("", "  ", "原文记录：\n", "原文记录:  ").forEach { source ->
             assertTrue(runCatching { completeSourceRecordNotes("已有备注", source) }.isFailure)
@@ -58,6 +69,27 @@ class CalendarQuickBatchTest {
         assertEquals("原文记录：\n第一步\n第二步", completeSourceRecordNotes("原文记录：", "原文记录:\r\n第一步\r第二步"))
         val once = completeSourceRecordNotes("", "真实原文")
         assertEquals(once, completeSourceRecordNotes(once, "真实原文"))
+    }
+
+    @Test fun `source completion preserves source and existing notes whitespace after normalizing newlines`() {
+        val original = "\r\n  9月3日先检查；再复诊。  \r\n\r\n"
+        val existing = "  待核对报告。  \r\n\r\n"
+        val normalizedOriginal = "\n  9月3日先检查；再复诊。  \n\n"
+        val normalizedExisting = "  待核对报告。  \n\n"
+        val completed = completeSourceRecordNotes(existing, original)
+        assertEquals("原文记录：\n$normalizedOriginal\n\n补充备注：\n$normalizedExisting", completed)
+        assertTrue(hasSourceRecord(completed))
+        assertEquals(normalizedOriginal, initialSourceRecordText("原文记录：\r\n$original"))
+    }
+
+    @Test fun `source prefill and labelled completion remove only one structural label newline`() {
+        val original = "\n  第一步。  \n\n第二步；保留顺序。  \n\n"
+        val prefixed = "原文记录：\n$original"
+        assertEquals(original, initialSourceRecordText(prefixed))
+        assertEquals(prefixed, completeSourceRecordNotes("", "原文记录:\r\n" + original.replace("\n", "\r\n")))
+        assertEquals(prefixed, completeSourceRecordNotes(prefixed, original))
+        assertEquals("原文记录：\n  第一步。  ", completeSourceRecordNotes("", "原文记录:  第一步。  "))
+        assertTrue(runCatching { completeSourceRecordNotes("", "  原文记录:\n  ") }.isFailure)
     }
 
     @Test fun `combined source and existing notes length is checked without truncation`() {

@@ -22,6 +22,7 @@ import java.time.Instant
 import android.net.Uri
 import android.content.Context
 import com.healthtimeline.app.backup.BackupService
+import com.healthtimeline.app.ui.medicationActiveOn
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
@@ -85,6 +86,85 @@ class RepositoryIntegrityTest {
         assertTrue(repository.markDose(medicationId, null, scheduledAt, MedicationLogStatus.TAKEN))
         assertFalse(repository.markDose(medicationId, null, scheduledAt, MedicationLogStatus.TAKEN))
         assertEquals(1, database.medicationDao().allLogs().size)
+    }
+
+    @Test fun legacyHistoryCannotBeEditedIntoActiveCourseByRemovingItsMarkers() = runBlocking {
+        val (history, _) = createLegacyMedicationHistory()
+        val beforeMedications = database.medicationDao().allMedications()
+        val beforeSchedules = database.medicationDao().allSchedules()
+        val beforeLogs = database.medicationDao().allLogs()
+
+        val failure = runCatching {
+            repository.saveMedication(
+                history.copy(name = "看似普通的药物", instructions = "已移除旧版标记", archived = false),
+                listOf(LocalTime.of(9, 5)), LocalDate.now().plusDays(1)
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalArgumentException)
+        assertTrue(failure?.message?.contains("历史副本") == true)
+        assertEquals(beforeMedications, database.medicationDao().allMedications())
+        assertEquals(beforeSchedules, database.medicationDao().allSchedules())
+        assertEquals(beforeLogs, database.medicationDao().allLogs())
+        assertFalse(medicationActiveOn(history, LocalDate.now()))
+        assertTrue(repository.enabledMedicationSchedules().isEmpty())
+    }
+
+    @Test fun legacyHistoryRejectsNewDoseButAllowsExplicitCorrectionOfExistingLog() = runBlocking {
+        val (history, schedule) = createLegacyMedicationHistory()
+        val oldDate = LocalDate.now().minusDays(1)
+        val log = MedicationLogEntity(
+            medicationId = history.id, scheduleId = schedule.id, scheduledAt = oldDate.atTime(8, 0).toString(),
+            actualAt = oldDate.atTime(8, 5).toString(), status = MedicationLogStatus.TAKEN.name,
+            doseAmountSnapshot = "3", doseUnitSnapshot = "粒", createdAt = NOW
+        )
+        val logId = database.medicationDao().insertLog(log)
+        val original = requireNotNull(database.medicationDao().logById(logId))
+        val before = database.medicationDao().allLogs()
+        val today = LocalDate.now()
+
+        assertFalse(repository.recordDose(history.id, null, today.atTime(8, 0), today.atTime(8, 5), MedicationLogStatus.TAKEN))
+        assertFalse(repository.recordDose(history.id, schedule.id, today.atTime(20, 0), null, MedicationLogStatus.SKIPPED))
+        assertEquals(before, database.medicationDao().allLogs())
+
+        assertTrue(repository.correctDose(logId, MedicationLogStatus.SKIPPED, null))
+        val skipped = requireNotNull(database.medicationDao().logById(logId))
+        assertEquals(MedicationLogStatus.SKIPPED.name, skipped.status)
+        assertEquals(null, skipped.actualAt)
+        assertTrue(repository.correctDose(logId, MedicationLogStatus.TAKEN, oldDate.atTime(8, 10)))
+        val corrected = requireNotNull(database.medicationDao().logById(logId))
+        assertEquals(original.uuid, corrected.uuid)
+        assertEquals(original.createdAt, corrected.createdAt)
+        assertEquals(original.medicationId, corrected.medicationId)
+        assertEquals(original.scheduleId, corrected.scheduleId)
+        assertEquals(original.scheduledAt, corrected.scheduledAt)
+        assertEquals(original.doseAmountSnapshot, corrected.doseAmountSnapshot)
+        assertEquals(original.doseUnitSnapshot, corrected.doseUnitSnapshot)
+        assertEquals(oldDate.atTime(8, 10).toString(), corrected.actualAt)
+        assertEquals(1, database.medicationDao().allLogs().size)
+        assertEquals(history, database.medicationDao().medicationById(history.id))
+        assertTrue(repository.enabledMedicationSchedules().isEmpty())
+    }
+
+    @Test fun ordinaryEndedCourseStillAllowsPastAsNeededRecordDespiteHistoryLikeName() = runBlocking {
+        val member = repository.ensureDefaultMember()
+        val today = LocalDate.now()
+        val id = repository.saveMedication(
+            MedicationEntity(
+                name = LEGACY_MEDICATION_HISTORY_NAME_PREFIX + "普通用户自行命名", instructions = "普通服用说明",
+                doseAmount = "1", doseUnit = "片", startDate = today.minusDays(10).toString(),
+                mode = MedicationMode.AS_NEEDED.name, createdAt = NOW, updatedAt = NOW, memberId = member.id
+            ), emptyList()
+        ).medicationId
+        repository.archiveMedication(id)
+        val ended = requireNotNull(database.medicationDao().medicationById(id))
+        val past = today.minusDays(1)
+        assertTrue(ended.archived)
+        assertFalse(isLegacyMedicationHistoryCopy(ended))
+        assertTrue(medicationActiveOn(ended, past))
+        assertTrue(repository.recordDose(id, null, past.atTime(8, 0), past.atTime(8, 5), MedicationLogStatus.TAKEN))
+        assertEquals(1, database.medicationDao().allLogs().size)
+        assertEquals(ended, database.medicationDao().medicationById(id))
     }
 
     @Test fun medicationLogCannotReferenceAnotherMedicationsSchedule() = runBlocking {
@@ -1122,6 +1202,24 @@ class RepositoryIntegrityTest {
             collector.cancel()
             updates.close()
         }
+    }
+
+    private suspend fun createLegacyMedicationHistory(): Pair<MedicationEntity, MedicationScheduleEntity> {
+        val member = repository.ensureDefaultMember()
+        val medication = MedicationEntity(
+            name = LEGACY_MEDICATION_HISTORY_NAME_PREFIX + "历史药物", doseAmount = "1", doseUnit = "片",
+            instructions = LEGACY_MEDICATION_HISTORY_MARKER + "仅保留旧版历史记录，不是新医嘱。",
+            startDate = LocalDate.now().minusDays(10).toString(), endDate = null, archived = true,
+            createdAt = NOW, updatedAt = NOW, memberId = member.id, endedAt = null
+        )
+        val id = database.medicationDao().insertMedication(medication)
+        val history = medication.copy(id = id)
+        val schedule = MedicationScheduleEntity(
+            medicationId = id, localTime = "08:00", enabled = false, effectiveFrom = history.startDate,
+            doseAmountSnapshot = "1", doseUnitSnapshot = "片", updatedAt = NOW
+        )
+        val scheduleId = database.medicationDao().insertSchedule(schedule)
+        return history to schedule.copy(id = scheduleId)
     }
 
     private suspend fun createOverviewFollowUp(memberId: Long, due: LocalDate): Long = repository.saveFollowUp(

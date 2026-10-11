@@ -60,7 +60,10 @@ fun SettingsScreen(
     appLockEnabled: Boolean,
     onAppLockChange: (Boolean) -> Unit,
     navigation: TodayNavigation.Safety? = null,
-    onNavigationConsumed: (String) -> Unit = {}
+    onNavigationConsumed: (String) -> Unit = {},
+    backupPickerBusy: Boolean = false,
+    onExportRequest: (CharArray) -> Unit,
+    onSafetyExportRequest: (Uri, CharArray) -> Unit
 ) {
     val context = LocalContext.current
     val appLockManager = (context.applicationContext as HealthTimelineApplication).appLockManager
@@ -92,21 +95,16 @@ fun SettingsScreen(
     var editingMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
     var archiveMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
     var deleteMember by remember(selectedMemberId) { mutableStateOf<FamilyMemberEntity?>(null) }
-    var exportPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
     var passwordMode by remember(selectedMemberId) { mutableStateOf<String?>(null) }
     var restoreUri by remember(selectedMemberId) { mutableStateOf<Uri?>(null) }
     var confirmRestore by remember(selectedMemberId) { mutableStateOf(false) }
     var importPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
     var importPreview by remember(selectedMemberId) { mutableStateOf<BackupImportPreview?>(null) }
-    var replacementSource by remember(selectedMemberId) { mutableStateOf<Uri?>(null) }
-    var replacementPassword by remember(selectedMemberId) { mutableStateOf<CharArray?>(null) }
     var importPickerMemberId by remember { mutableStateOf<Long?>(null) }
     val importedChoices = remember(selectedMemberId) { mutableStateMapOf<String, Boolean>() }
     DisposableEffect(selectedMemberId) {
         onDispose {
-            exportPassword?.fill('\u0000')
             importPassword?.fill('\u0000')
-            replacementPassword?.fill('\u0000')
         }
     }
 
@@ -118,36 +116,12 @@ fun SettingsScreen(
         importedChoices.clear()
     }
 
-    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
-        appLockManager.endExternalActivity()
-        val password = exportPassword
-        if (uri != null && password != null) {
-            viewModel.exportBackup(uri, password)
-        } else {
-            password?.fill('\u0000')
-        }
-        exportPassword = null
-    }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         appLockManager.endExternalActivity()
         if (uri != null && importPickerMemberId != null && importPickerMemberId == viewModel.selectedMemberId.value) {
             restoreUri = uri; passwordMode = "restore"
         }
         importPickerMemberId = null
-    }
-    val safetyExportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/octet-stream")
-    ) { uri ->
-        appLockManager.endExternalActivity()
-        val source = replacementSource
-        val password = replacementPassword
-        replacementSource = null
-        replacementPassword = null
-        if (uri != null && source != null && password != null) {
-            viewModel.restoreBackupWithSafetyExport(uri, source, password)
-        } else {
-            password?.fill('\u0000')
-        }
     }
 
     Column(
@@ -233,10 +207,10 @@ fun SettingsScreen(
         HorizontalDivider()
         Text("加密备份", style = MaterialTheme.typography.titleMedium)
         Text("备份包含全部病历、提醒、用药记录和检查报告。密码无法找回，请妥善保存。整体替换前会在应用私有目录自动保留最近 3 份安全备份。", style = MaterialTheme.typography.bodyMedium)
-        Button(onClick = { passwordMode = "export" }) {
+        Button(onClick = { passwordMode = "export" }, enabled = !backupPickerBusy) {
             Icon(Icons.Outlined.Download, null); Spacer(Modifier.width(8.dp)); Text("导出加密备份")
         }
-        OutlinedButton(onClick = {
+        OutlinedButton(enabled = !backupPickerBusy, onClick = {
             importPickerMemberId = viewModel.selectedMemberId.value
             appLockManager.beginExternalActivity()
             importLauncher.launch(arrayOf("application/octet-stream", "*/*"))
@@ -257,9 +231,7 @@ fun SettingsScreen(
             confirmLabel = if (passwordMode == "export") "选择保存位置" else "验证备份",
             onConfirm = { password ->
                 if (passwordMode == "export") {
-                    exportPassword = password
-                    appLockManager.beginExternalActivity()
-                    exportLauncher.launch("病程日历-${LocalDate.now()}.htbackup")
+                    onExportRequest(password)
                 } else {
                     importPassword?.fill('\u0000')
                     importPassword = password.copyOf()
@@ -343,10 +315,7 @@ fun SettingsScreen(
                 val password = importPassword?.copyOf()
                 clearPendingImport()
                 if (uri != null && password != null) {
-                    replacementSource = uri
-                    replacementPassword = password
-                    appLockManager.beginExternalActivity()
-                    safetyExportLauncher.launch("病程日历-替换前安全备份-${LocalDate.now()}.htbackup")
+                    onSafetyExportRequest(uri, password)
                 } else {
                     password?.fill('\u0000')
                 }

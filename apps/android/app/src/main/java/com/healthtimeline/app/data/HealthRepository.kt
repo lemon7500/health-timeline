@@ -442,6 +442,7 @@ class HealthRepository(
                 require(existing.deletedAt == null) { "药物已在回收站，请先恢复" }
                 require(existing.memberId == value.memberId) { "不能更改药物所属成员" }
                 require(existing.uuid == value.uuid) { "不能更改药物永久标识" }
+                require(!isLegacyMedicationHistoryCopy(existing)) { "旧版历史副本只保留已有记录，不能修改为用药疗程" }
                 medications.updateMedication(value); value.id
             }
             val now = Instant.now().toString()
@@ -581,6 +582,7 @@ class HealthRepository(
             val now = Instant.now().toString()
             val medication = requireNotNull(medications.medicationById(id)) { "药物不存在" }
             require(medication.deletedAt == null) { "药物已在回收站，请先恢复" }
+            require(!isLegacyMedicationHistoryCopy(medication)) { "旧版历史副本不是新医嘱，不能恢复为用药疗程" }
             if (!medication.archived) return@withTransaction
             val restoredEnd = medication.archivedPreviousEndDate?.let(LocalDate::parse)
             val canContinue = restoredEnd == null || !restoredEnd.isBefore(today)
@@ -633,6 +635,7 @@ class HealthRepository(
     ): Boolean = mutationMutex.withLock {
         val medication = medications.medicationById(medicationId) ?: return@withLock false
         if (medication.deletedAt != null) return@withLock false
+        if (isLegacyMedicationHistoryCopy(medication)) return@withLock false
         if (members.byId(medication.memberId)?.archived != false) return@withLock false
         require(!scheduledAt.toLocalDate().isAfter(LocalDate.now())) { "未来日期不能提前记录用药" }
         require(status != MedicationLogStatus.TAKEN || actualAt != null) { "已服记录必须填写实际服药时间" }
@@ -951,6 +954,9 @@ private fun projectMedicationPeriod(
 
     schedules.forEach { schedule ->
         val medication = medicinesById[schedule.medicationId] ?: return@forEach
+        // A legacy conflict copy contains evidence of an old log, not another prescription.
+        // Render its preserved log below without inventing unrecorded daily plans.
+        if (isLegacyMedicationHistoryCopy(medication)) return@forEach
         var date = maxOf(firstDate, LocalDate.parse(schedule.effectiveFrom), LocalDate.parse(medication.startDate))
         val scheduleEnd = schedule.effectiveTo?.let(LocalDate::parse)
         val medicationEnd = medication.endDate?.let(LocalDate::parse)
