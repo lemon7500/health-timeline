@@ -186,7 +186,8 @@ class AttachmentImportCancellationTest {
         assertEquals(listOf(imported), database.attachmentDao().all())
         assertTrue(store.verifyStored(imported))
         assertArrayEquals(source.readBytes(), store.file(imported).readBytes())
-        assertEquals(listOf(store.file(imported)), attachmentFiles())
+        // Android's /data/data alias and /data/user/0 are the same private directory.
+        assertEquals(listOf(store.file(imported).canonicalFile), attachmentFiles().map { it.canonicalFile })
     }
 
     @Test fun cancellationDuringTheSecondCopyReadStopsBeforeWritingTheCancelledChunk() = runBlocking {
