@@ -39,7 +39,7 @@ jobs:
             exit 1
           fi
           grep -F 'has an incremental APT worker cache directory' "$RUNNER_TEMP/kapt-negative.log"
-      - run: ./gradlew :androidApp:verifyBuildToolchain :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintRelease :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
+      - run: ./gradlew :androidApp:verifyBuildToolchain :androidApp:verifyRuntimeCrypto :shared:core:testDebugUnitTest :androidApp:testDebugUnitTest :androidApp:lintRelease :androidApp:assembleDebug :androidApp:assembleDebugAndroidTest :androidApp:assembleRelease --stacktrace
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: android-debug-apk
@@ -57,7 +57,11 @@ jobs:
 
   android-instrumentation:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [26, 35]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
@@ -71,15 +75,15 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Run Room migration, integrity and Today UI tests
+      - name: Test old encrypted databases, legacy backups and Android regression
         id: android-instrumentation
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
-          api-level: 35
+          api-level: ${{ matrix.api-level }}
           arch: x86_64
           profile: pixel_2
           disable-animations: true
-          script: bash -o pipefail -c './gradlew :androidApp:verifyBuildToolchain :androidApp:connectedDebugAndroidTest --stacktrace 2>&1 | tee "$RUNNER_TEMP/android-instrumentation.log"'
+          script: bash scripts/test-android-instrumentation.sh ${{ matrix.api-level }}
       - name: Publish Android instrumentation errors
         if: failure() && steps.android-instrumentation.outcome == 'failure'
         shell: bash
@@ -99,10 +103,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: android-instrumentation-report
+          name: android-instrumentation-report-api-${{ matrix.api-level }}
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/android-instrumentation.log
+            ${{ runner.temp }}/sqlcipher-compatibility.log
+            .tooling/sqlcipher-compat-fixtures/*.snapshot.json
+            .tooling/sqlcipher-compat-fixtures/seed-ready.json
+            .tooling/sqlcipher-compat-fixtures/probe-instrumentation.log
             apps/android/app/build/reports/androidTests/connected/
             apps/android/app/build/outputs/androidTest-results/connected/
 

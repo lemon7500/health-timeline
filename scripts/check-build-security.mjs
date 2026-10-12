@@ -52,6 +52,11 @@ function check(configuration) {
   if (!/^kapt\.incremental\.apt=false\s*$/m.test(configuration.gradleProperties)) {
     errors.push('KAPT incremental cache defense must remain enabled');
   }
+  for (const coordinate of ['net.zetetic:sqlcipher-android:4.19.1', 'org.bouncycastle:bcprov-jdk18on:1.86']) {
+    if (!configuration.androidBuild.includes(`implementation("${coordinate}")`)) {
+      errors.push(`Android runtime must retain reviewed ${coordinate}`);
+    }
+  }
   const uses = [...configuration.workflow.matchAll(/^[ \t]*(?:-[ \t]+)?uses:[ \t]+([^\s#]+)[ \t]*(?:#.*)?$/gm)];
   if (!uses.length) errors.push('No CI actions found');
   for (const [, action] of uses) {
@@ -76,7 +81,7 @@ function selfTest() {
     rootBuild: ['android', 'multiplatform', 'plugin.serialization', 'kapt', 'plugin.compose']
       .map(name => `id("org.jetbrains.kotlin.${name}") version "${kotlinVersion}" apply false`).join('\n'),
     settingsBuild: `dependencies { classpath("com.android.tools:r8:${r8Version}") }`,
-    androidBuild: 'coreLibrariesVersion = "2.2.10"\nlanguageVersion.set(KotlinVersion.KOTLIN_2_2)\napiVersion.set(KotlinVersion.KOTLIN_2_2)\nimplementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")',
+    androidBuild: 'coreLibrariesVersion = "2.2.10"\nlanguageVersion.set(KotlinVersion.KOTLIN_2_2)\napiVersion.set(KotlinVersion.KOTLIN_2_2)\nimplementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")\nimplementation("net.zetetic:sqlcipher-android:4.19.1")\nimplementation("org.bouncycastle:bcprov-jdk18on:1.86")',
     sharedBuild: 'coreLibrariesVersion = "2.2.10"\nlanguageVersion.set(KotlinVersion.KOTLIN_2_2)\napiVersion.set(KotlinVersion.KOTLIN_2_2)\nimplementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")',
     gradleProperties: 'kapt.incremental.apt=false\n',
     workflow: `permissions:\n  contents: read\njobs:\n  check:\n    steps:\n${[...actionCommits].map(([name, sha]) => `      - uses: ${name}@${sha} # reviewed`).join('\n')}\n`,
@@ -97,6 +102,8 @@ function selfTest() {
     { ...valid, androidBuild: valid.androidBuild.replace('coreLibrariesVersion = "2.2.10"', '') },
     { ...valid, sharedBuild: valid.sharedBuild.replace('coreLibrariesVersion = "2.2.10"', '') },
     { ...valid, gradleProperties: 'kapt.incremental.apt=true\n' },
+    { ...valid, androidBuild: valid.androidBuild.replace('sqlcipher-android:4.19.1', 'sqlcipher-android:4.18.0') },
+    { ...valid, androidBuild: valid.androidBuild.replace('bcprov-jdk18on:1.86', 'bcprov-jdk18on:1.83') },
     { ...valid, workflow: valid.workflow.replace(actionCommits.get('actions/checkout'), 'v5') },
     { ...valid, workflow: `${valid.workflow}      - name: Upload report\n        uses: actions/upload-artifact@v5\n` },
     { ...valid, workflow: valid.workflow.replace('contents: read', 'contents: write') },

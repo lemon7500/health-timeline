@@ -6,12 +6,20 @@ import org.jetbrains.kotlin.gradle.tasks.BaseKapt
 import org.jetbrains.kotlin.gradle.tasks.Kapt
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
 import java.util.Properties
+import java.security.MessageDigest
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.kapt")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Used only by an isolated legacy-compatibility test JVM, never packaged in the app.
+val legacyBackupCrypto by configurations.creating {
+    isCanBeConsumed = false
+    isTransitive = false
 }
 
 android {
@@ -68,6 +76,9 @@ android {
     }
     sourceSets {
         getByName("androidTest").assets.srcDir("$projectDir/schemas")
+        getByName("androidTest").assets.srcDir("$projectDir/src/test/resources/backup-compat")
+        // Generated exclusively by the genuine 4.18.0 synthetic seed APK in CI.
+        getByName("androidTest").assets.srcDir(rootProject.file(".tooling/sqlcipher-compat-fixtures"))
     }
     packaging.resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
     // Java 9 OSGi bundle metadata is unused on Android and collides across JVM libraries.
@@ -111,12 +122,13 @@ dependencies {
     implementation("androidx.room:room-runtime:2.7.2")
     implementation("androidx.room:room-ktx:2.7.2")
     kapt("androidx.room:room-compiler:2.7.2")
-    implementation("net.zetetic:sqlcipher-android:4.18.0")
+    implementation("net.zetetic:sqlcipher-android:4.19.1")
     implementation("androidx.sqlite:sqlite-ktx:2.5.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment-ktx:1.8.8")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.86")
+    add(legacyBackupCrypto.name, "org.bouncycastle:bcprov-jdk18on:1.83")
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     testImplementation("junit:junit:4.13.2")
@@ -126,6 +138,56 @@ dependencies {
     androidTestImplementation("androidx.room:room-testing:2.7.2")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
+
+tasks.withType<Test>().configureEach {
+    inputs.files(legacyBackupCrypto).withPropertyName("legacyBackupCrypto")
+    doFirst {
+        systemProperty("healthtimeline.legacyBcJar", legacyBackupCrypto.singleFile.absolutePath)
+    }
+}
+
+tasks.register("verifyRuntimeCrypto") {
+    group = "verification"
+    description = "Check selected Android crypto libraries and reviewed artifact digests."
+    doLast {
+        val expected = mapOf(
+            "net.zetetic:sqlcipher-android" to ("4.19.1" to "43fc10cae8f1f1059f0933e8942a1eb328989d13426378597cd4add1b34a34fd"),
+            "org.bouncycastle:bcprov-jdk18on" to ("1.86" to "2af190b300cbb0b35e248ccf5f4a06b6072030aeb3da7a98ec73abe5b4cb371f")
+        )
+        for (configurationName in listOf("debugRuntimeClasspath", "releaseRuntimeClasspath")) {
+            // Filter external components before artifact selection. Resolving every
+            // artifact directly is ambiguous for the shared KMP project's AAR variants.
+            val artifacts = configurations.getByName(configurationName).incoming.artifactView {
+                componentFilter { component ->
+                    component is ModuleComponentIdentifier && "${component.group}:${component.module}" in expected
+                }
+            }.artifacts.artifacts
+            for ((coordinate, reviewed) in expected) {
+                val selected = artifacts.filter {
+                    val component = it.id.componentIdentifier as ModuleComponentIdentifier
+                    "${component.group}:${component.module}" == coordinate
+                }
+                val artifact = selected.singleOrNull()
+                check(artifact != null && (artifact.id.componentIdentifier as ModuleComponentIdentifier).version == reviewed.first) {
+                    "$configurationName selected unexpected $coordinate: ${selected.map { it.id.componentIdentifier }}"
+                }
+                val digest = MessageDigest.getInstance("SHA-256")
+                artifact.file.inputStream().use { stream ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = stream.read(buffer)
+                        if (read < 0) break
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                val hash = digest.digest().joinToString("") { "%02x".format(it) }
+                check(hash == reviewed.second) { "$coordinate artifact does not match the reviewed SHA-256" }
+                logger.lifecycle("Runtime crypto: $configurationName $coordinate:${reviewed.first} SHA-256 $hash")
+            }
+        }
+        logger.lifecycle("Scope: checks these two reviewed runtime artifacts, not all transitive dependencies or independent publisher signatures.")
+    }
 }
 
 kapt {

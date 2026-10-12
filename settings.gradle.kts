@@ -24,3 +24,6 @@ rootProject.name = "HealthTimeline"
 include(":androidApp")
 project(":androidApp").projectDir = file("apps/android/app")
 include(":shared:core")
+// Disposable synthetic-data compatibility probe; never shipped as the medical app.
+include(":sqlcipherCompat")
+project(":sqlcipherCompat").projectDir = file("tools/sqlcipher-compat")

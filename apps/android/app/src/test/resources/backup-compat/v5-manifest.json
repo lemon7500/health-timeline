@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 5,
+  "exportedAt": "2026-09-14T10:00:00Z",
+  "sourcePlatform": "test",
+  "sourceInstallationId": "00000000-0000-4000-8000-000000000001",
+  "members": [
+    {
+      "uuid": "10000000-0000-4000-8000-000000000001",
+      "name": "虚构兼容成员",
+      "nickname": "测试关系",
+      "relationship": "测试关系",
+      "archived": false,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "conditions": [
+    {
+      "uuid": "20000000-0000-4000-8000-000000000001",
+      "name": "虚构鼻窦炎",
+      "color": 4281305942,
+      "notes": "合成测试分类",
+      "archived": false,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "memberUuid": "10000000-0000-4000-8000-000000000001"
+    }
+  ],
+  "records": [
+    {
+      "uuid": "30000000-0000-4000-8000-000000000001",
+      "conditionUuid": "20000000-0000-4000-8000-000000000001",
+      "recordDate": "2026-09-06",
+      "title": "虚构鼻窦炎首次复查",
+      "stage": "CHECKUP",
+      "symptoms": "虚构鼻塞减轻",
+      "diagnosis": "虚构鼻窦炎",
+      "treatment": "虚构治疗描述",
+      "medicationNotes": "虚构用药说明，不构成医嘱",
+      "hospital": "虚构测试医院",
+      "clinician": "虚构测试医生",
+      "notes": "原文记录：\n2026年9月6日虚构鼻窦炎第一次复查。",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "memberUuid": "10000000-0000-4000-8000-000000000001",
+      "dayOrder": 7
+    },
+    {
+      "uuid": "30000000-0000-4000-8000-000000000002",
+      "conditionUuid": "20000000-0000-4000-8000-000000000001",
+      "recordDate": "2026-09-06",
+      "title": "虚构鼻窦炎第二事件",
+      "stage": "AFTER_VISIT",
+      "symptoms": "虚构第二事件",
+      "diagnosis": "虚构鼻窦炎",
+      "treatment": "虚构第二治疗描述",
+      "medicationNotes": "",
+      "hospital": "虚构测试医院",
+      "clinician": "虚构测试医生",
+      "notes": "原文记录：\n随后发生虚构的第二次咨询。",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "memberUuid": "10000000-0000-4000-8000-000000000001",
+      "dayOrder": 8,
+      "deletedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "attachments": [
+    {
+      "uuid": "31000000-0000-4000-8000-000000000001",
+      "recordUuid": "30000000-0000-4000-8000-000000000001",
+      "kind": "PDF",
+      "displayName": "虚构兼容报告.pdf",
+      "mimeType": "application/pdf",
+      "archivePath": "files/31000000-0000-4000-8000-000000000001",
+      "sizeBytes": 142,
+      "sha256": "384677d2fc97d14c48747cdac8664032937e82b9ffdacde6b5ecf51e040b5232",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    },
+    {
+      "uuid": "31000000-0000-4000-8000-000000000002",
+      "recordUuid": "30000000-0000-4000-8000-000000000002",
+      "kind": "IMAGE",
+      "displayName": "虚构兼容图片.png",
+      "mimeType": "image/png",
+      "archivePath": "files/31000000-0000-4000-8000-000000000002",
+      "sizeBytes": 70,
+      "sha256": "2640059609118b695c139804676372eca75c30d30e5906775902d13e44f5356c",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "deletedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "followUps": [
+    {
+      "uuid": "40000000-0000-4000-8000-000000000001",
+      "conditionUuid": "20000000-0000-4000-8000-000000000001",
+      "title": "虚构鼻窦炎三个月复查",
+      "recurrenceType": "EVERY_N_MONTHS",
+      "interval": 3,
+      "anchorDate": "2026-07-09",
+      "anchorDayOfMonth": 9,
+      "reminderTime": "09:05",
+      "leadDays": 3,
+      "nextDueDate": "2026-10-09",
+      "enabled": true,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "memberUuid": "10000000-0000-4000-8000-000000000001"
+    }
+  ],
+  "occurrences": [
+    {
+      "uuid": "41000000-0000-4000-8000-000000000001",
+      "scheduleUuid": "40000000-0000-4000-8000-000000000001",
+      "dueDate": "2026-07-09",
+      "status": "DONE",
+      "completedAt": "2026-07-09T10:00:00Z",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "medications": [
+    {
+      "uuid": "50000000-0000-4000-8000-000000000001",
+      "conditionUuid": "20000000-0000-4000-8000-000000000001",
+      "name": "虚构兼容药物",
+      "doseAmount": "5",
+      "doseUnit": "mg",
+      "instructions": "全部为虚构资料，请勿用于治疗。",
+      "startDate": "2026-09-01",
+      "endDate": "2026-09-14",
+      "mode": "SCHEDULED",
+      "archived": true,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "memberUuid": "10000000-0000-4000-8000-000000000001",
+      "endedAt": "2026-09-14T10:00:00Z",
+      "archivedPreviousEndDate": "2026-09-30"
+    }
+  ],
+  "medicationSchedules": [
+    {
+      "uuid": "51000000-0000-4000-8000-000000000001",
+      "medicationUuid": "50000000-0000-4000-8000-000000000001",
+      "localTime": "08:05",
+      "enabled": false,
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "effectiveFrom": "2026-09-01",
+      "effectiveTo": "2026-09-07",
+      "doseAmountSnapshot": "2",
+      "doseUnitSnapshot": "mg",
+      "pausedByCourseEnd": true
+    },
+    {
+      "uuid": "51000000-0000-4000-8000-000000000002",
+      "medicationUuid": "50000000-0000-4000-8000-000000000001",
+      "localTime": "20:10",
+      "enabled": false,
+      "updatedAt": "2026-09-14T10:00:00Z",
+      "effectiveFrom": "2026-09-08",
+      "effectiveTo": "2026-09-14",
+      "doseAmountSnapshot": "3",
+      "doseUnitSnapshot": "mg",
+      "pausedByCourseEnd": true
+    }
+  ],
+  "medicationLogs": [
+    {
+      "uuid": "52000000-0000-4000-8000-000000000001",
+      "medicationUuid": "50000000-0000-4000-8000-000000000001",
+      "scheduleUuid": "51000000-0000-4000-8000-000000000001",
+      "scheduledAt": "2026-09-06T08:05:00",
+      "actualAt": "2026-09-06T08:10:00",
+      "status": "TAKEN",
+      "doseAmountSnapshot": "2",
+      "doseUnitSnapshot": "mg",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    },
+    {
+      "uuid": "52000000-0000-4000-8000-000000000002",
+      "medicationUuid": "50000000-0000-4000-8000-000000000001",
+      "scheduleUuid": "51000000-0000-4000-8000-000000000002",
+      "scheduledAt": "2026-09-09T20:10:00",
+      "status": "SKIPPED",
+      "doseAmountSnapshot": "3",
+      "doseUnitSnapshot": "mg",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ]
+}

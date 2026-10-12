@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-09-14T10:00:00Z",
+  "conditions": [
+    {
+      "id": 20,
+      "name": "虚构鼻窦炎",
+      "color": 4281305942,
+      "notes": "合成测试分类",
+      "archived": false,
+      "createdAt": "2026-09-01T00:00:00Z"
+    }
+  ],
+  "records": [
+    {
+      "id": 30,
+      "conditionId": 20,
+      "recordDate": "2026-09-06",
+      "title": "虚构鼻窦炎首次复查",
+      "stage": "CHECKUP",
+      "symptoms": "虚构鼻塞减轻",
+      "diagnosis": "虚构鼻窦炎",
+      "treatment": "虚构治疗描述",
+      "medicationNotes": "虚构用药说明，不构成医嘱",
+      "hospital": "虚构测试医院",
+      "clinician": "虚构测试医生",
+      "notes": "原文记录：\n2026年9月6日虚构鼻窦炎第一次复查。",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    },
+    {
+      "id": 31,
+      "conditionId": 20,
+      "recordDate": "2026-09-06",
+      "title": "虚构鼻窦炎第二事件",
+      "stage": "AFTER_VISIT",
+      "symptoms": "虚构第二事件",
+      "diagnosis": "虚构鼻窦炎",
+      "treatment": "虚构第二治疗描述",
+      "medicationNotes": "",
+      "hospital": "虚构测试医院",
+      "clinician": "虚构测试医生",
+      "notes": "原文记录：\n随后发生虚构的第二次咨询。",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "attachments": [
+    {
+      "id": 31,
+      "recordId": 30,
+      "kind": "PDF",
+      "displayName": "虚构兼容报告.pdf",
+      "mimeType": "application/pdf",
+      "relativePath": "attachments/30/report.pdf",
+      "sizeBytes": 142,
+      "sha256": "384677d2fc97d14c48747cdac8664032937e82b9ffdacde6b5ecf51e040b5232",
+      "createdAt": "2026-09-01T00:00:00Z"
+    },
+    {
+      "id": 32,
+      "recordId": 31,
+      "kind": "IMAGE",
+      "displayName": "虚构兼容图片.png",
+      "mimeType": "image/png",
+      "relativePath": "attachments/31/report.png",
+      "sizeBytes": 70,
+      "sha256": "2640059609118b695c139804676372eca75c30d30e5906775902d13e44f5356c",
+      "createdAt": "2026-09-01T00:00:00Z"
+    }
+  ],
+  "followUps": [
+    {
+      "id": 40,
+      "conditionId": 20,
+      "title": "虚构鼻窦炎三个月复查",
+      "recurrenceType": "EVERY_N_MONTHS",
+      "interval": 3,
+      "anchorDate": "2026-07-09",
+      "anchorDayOfMonth": 9,
+      "weekday": null,
+      "reminderTime": "09:05",
+      "leadDays": 3,
+      "nextDueDate": "2026-10-09",
+      "enabled": true,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "occurrences": [
+    {
+      "id": 41,
+      "scheduleId": 40,
+      "dueDate": "2026-07-09",
+      "status": "DONE",
+      "completedAt": "2026-07-09T10:00:00Z",
+      "createdAt": "2026-09-01T00:00:00Z"
+    }
+  ],
+  "medications": [
+    {
+      "id": 50,
+      "conditionId": 20,
+      "name": "虚构兼容药物",
+      "doseAmount": "5",
+      "doseUnit": "mg",
+      "instructions": "全部为虚构资料，请勿用于治疗。",
+      "startDate": "2026-09-01",
+      "endDate": "2026-09-30",
+      "mode": "SCHEDULED",
+      "archived": false,
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-14T10:00:00Z"
+    }
+  ],
+  "medicationSchedules": [
+    {
+      "id": 51,
+      "medicationId": 50,
+      "localTime": "08:05",
+      "enabled": true
+    }
+  ],
+  "medicationLogs": [
+    {
+      "id": 52,
+      "medicationId": 50,
+      "scheduleId": 51,
+      "scheduledAt": "2026-09-06T08:05:00",
+      "actualAt": "2026-09-06T08:10:00",
+      "status": "TAKEN",
+      "doseAmountSnapshot": "2",
+      "doseUnitSnapshot": "mg",
+      "createdAt": "2026-09-01T00:00:00Z"
+    },
+    {
+      "id": 53,
+      "medicationId": 50,
+      "scheduleId": 51,
+      "scheduledAt": "2026-09-09T20:10:00",
+      "actualAt": null,
+      "status": "SKIPPED",
+      "doseAmountSnapshot": "3",
+      "doseUnitSnapshot": "mg",
+      "createdAt": "2026-09-01T00:00:00Z"
+    }
+  ]
+}
