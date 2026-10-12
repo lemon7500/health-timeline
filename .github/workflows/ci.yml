@@ -88,7 +88,7 @@ jobs:
         if: failure() && steps.android-instrumentation.outcome == 'failure'
         shell: bash
         run: |
-          error_lines="$(grep -E 'FAILED|FAILURES|AssertionError|Exception|There (was|were) [0-9]+ failure' "$RUNNER_TEMP/android-instrumentation.log" | tail -n 50 || true)"
+          error_lines="$(grep -hE 'FAILED|FAILURES|AssertionError|Exception|There (was|were) [0-9]+ failure' "$RUNNER_TEMP/android-instrumentation.log" "$RUNNER_TEMP/sqlcipher-compatibility.log" 2>/dev/null | tail -n 50 || true)"
           if [[ -z "$error_lines" ]]; then
             echo '::error::Android instrumentation failed without a matched test error; inspect the uploaded report and log.'
           else

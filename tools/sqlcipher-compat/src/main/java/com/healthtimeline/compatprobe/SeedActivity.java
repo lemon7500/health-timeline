@@ -9,6 +9,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
 import androidx.sqlite.db.SupportSQLiteOpenHelper;
 
 import java.io.File;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 
 /** Keeps the old engine's WAL connection alive until the host kills this disposable process. */
 public final class SeedActivity extends Activity {
@@ -47,7 +49,13 @@ public final class SeedActivity extends Activity {
             retainedWalHelper.setWriteAheadLoggingEnabled(true);
             SupportSQLiteDatabase wal = retainedWalHelper.getWritableDatabase();
             requireOldEngine(wal);
-            wal.execSQL("PRAGMA wal_autocheckpoint=0");
+            // This setter returns a row. SQLCipher rejects result-bearing SQL via
+            // execSQL; consume it through query and verify the actual setting.
+            String disabledAutoCheckpoint = ProbeData.scalar(wal, "PRAGMA wal_autocheckpoint=0");
+            if (!"0".equals(disabledAutoCheckpoint)
+                    || !"0".equals(ProbeData.scalar(wal, "PRAGMA wal_autocheckpoint"))) {
+                throw new IllegalStateException("Old WAL auto-checkpoint could not be disabled");
+            }
             ProbeData.seed(this, wal, "committed-only-in-old-WAL");
             ProbeData.write(new File(getFilesDir(), "wal.snapshot.json"), ProbeData.snapshot(this, wal).toString(2));
             File walFile = new File(getDatabasePath("wal.db").getPath() + "-wal");
@@ -57,7 +65,9 @@ public final class SeedActivity extends Activity {
             runOnUiThread(() -> label.setText("PUBLIC SYNTHETIC fixture ready. Host must force-stop without closing WAL."));
         } catch (Exception failure) {
             Log.e("SyntheticSQLCompat", "Synthetic seed failed", failure);
-            try { ProbeData.write(new File(getFilesDir(), "seed-error.txt"), failure.toString()); }
+            StringWriter trace = new StringWriter();
+            failure.printStackTrace(new PrintWriter(trace));
+            try { ProbeData.write(new File(getFilesDir(), "seed-error.txt"), trace.toString()); }
             catch (Exception ignored) { }
             runOnUiThread(() -> label.setText("Synthetic seed failed: " + failure));
         }

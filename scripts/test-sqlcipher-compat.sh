@@ -15,6 +15,11 @@ if [[ -e "$export_dir/closed.db" || -e "$export_dir/wal.db" ]]; then
   echo 'Refusing to overwrite previously generated encrypted compatibility fixtures.' >&2; exit 1
 fi
 package='com.healthtimeline.compatprobe'
+dump_seed_failure() {
+  adb shell run-as "$package" cat files/seed-error.txt 2>/dev/null || true
+  # This tag is restricted to public synthetic fixture setup, not production logs.
+  adb logcat -d -s 'SyntheticSQLCompat:E' '*:S' || true
+}
 if adb shell pm path "$package" | tr -d '\r' | grep -q '^package:'; then
   echo 'Probe already installed: use a fresh disposable emulator, do not clear production or probe data.' >&2; exit 1
 fi
@@ -24,13 +29,16 @@ adb install -r tools/sqlcipher-compat/build/outputs/apk/baseline/debug/sqlcipher
 adb shell am start -W -n "$package/.SeedActivity"
 ready=false
 for attempt in $(seq 1 90); do
-  if adb shell run-as "$package" test -f files/seed-error.txt 2>/dev/null; then
-    adb shell run-as "$package" cat files/seed-error.txt; exit 1
+  # `test` is a shell builtin without a standalone binary on API 26. Use the
+  # universally available Android ls executable, not run-as ... test.
+  if adb shell run-as "$package" /system/bin/ls files/seed-error.txt >/dev/null 2>&1; then
+    dump_seed_failure
+    exit 1
   fi
-  if adb shell run-as "$package" test -f files/seed-ready.json 2>/dev/null; then ready=true; break; fi
+  if adb shell run-as "$package" /system/bin/ls files/seed-ready.json >/dev/null 2>&1; then ready=true; break; fi
   sleep 1
 done
-if [[ "$ready" != true ]]; then echo 'Old-engine seed timed out.' >&2; adb logcat -d -s SyntheticSQLCompat; exit 1; fi
+if [[ "$ready" != true ]]; then echo 'Old-engine seed timed out.' >&2; dump_seed_failure; exit 1; fi
 adb shell run-as "$package" cat files/seed-ready.json
 # Killing, rather than helper.close(), preserves old committed WAL for candidate recovery.
 adb shell am force-stop "$package"
@@ -45,7 +53,7 @@ done
 for name in synthetic-live.png synthetic-recycled.pdf; do
   adb exec-out run-as "$package" cat "files/attachments/$name" > "$export_dir/attachments/$name"
 done
-if adb shell run-as "$package" test -f databases/wal.db-shm 2>/dev/null; then
+if adb shell run-as "$package" /system/bin/ls databases/wal.db-shm >/dev/null 2>&1; then
   adb exec-out run-as "$package" cat databases/wal.db-shm > "$export_dir/wal.db-shm"
 fi
 # install -r is the actual old-to-new binary replacement: never uninstall or pm clear.
